@@ -878,8 +878,13 @@ export class McBot extends EventEmitter {
    * 现在按 mineflayer 的约定分流（`lib/plugins/chat.js` 里两种包的 emit 签名）：
    *    · `position === 'chat'`  → 来自 playerChat（签名）→ 由下面的 `player_chat` handler 处理，
    *      这里**直接跳过**（否则同一条进两遍）
-   *    · `position === undefined`→ 来自 systemChat 的 **positionId 0 = 聊天**（未签名）→ 当玩家说话
-   *    · 其余（'system' / 'game_info'）→ 仍然是系统消息
+   *    · `position === undefined`→ 来自 systemChat 的 **positionId 0 = 聊天**（未签名）
+   *    · `position === 'system'` → 来自 systemChat 的 **positionId 1**：**也要按"内容"再判一次**
+   *      —— 有的服务端（LAN 开放世界 / 某些插件）把玩家聊天塞进 system 位置，渲染出来仍是
+   *      `<名字> 正文`。实验体 2026-09-16 的证据就是这样：事件队列里全是 `kind: system`、
+   *      文本形如 `<<user>> tp我，ds。`，而看门狗只对 `chat` 判定 ⇒ mention 永远打不中。
+   *    · `position === 'game_info'`（动作栏）→ 一律 system（动作栏刷屏不该唤醒）
+   *    · 其余 → 系统消息
    *
    * ⚠️ 这是**公开方法**（不放在 connect 里内联）：自检要能用假 bot 走同一条代码路径 ——
    *    "喊我能不能醒"这种链路，断言必须落在真实实现上，不能只 grep 源码。
@@ -888,8 +893,8 @@ export class McBot extends EventEmitter {
   wireChatEvents (b) {
     b.on('message', (msg, position) => {
       const text = this.#plain(msg)
-      if (position === 'chat') return
-      if (position === undefined) {
+      if (position === 'chat') return                    // 签名聊天：player_chat 那条路已处理
+      if (position !== 'game_info') {                    // 动作栏除外，其余都按内容再判一次
         const parsed = this.#playerChatFrom(msg, text)
         if (parsed) {
           this.#emitPlayerChat(parsed.who, parsed.text, b.username)
@@ -937,7 +942,11 @@ export class McBot extends EventEmitter {
    *    · `chat.type.text`                    —— 普通公屏（渲染成 `<名字> 正文`）
    *    · `chat.type.team.text` / `.team.*`    —— 队伍聊天（with = [队伍, 发送者, 正文]）
    *    · `commands.message.display.incoming` —— 别人私聊我（with = [发送者, 正文]）
-   * 其它一律返回 null（服务器公告、加入/离开、成就…都还是 system）。
+   * ④ 兜底看**渲染出来的形状**：`<名字> 正文`。
+   *    🔴 这条是从实验体的证据里补的（2026-09-16）：有的服务端把玩家聊天发在 **system 位置**
+   *    （positionId 1），translate 也可能是它自己那套；但渲染出来就是 `<<user>> tp我，ds。`。
+   *    只按 positionId / translate 判的话，这类消息会永远停在 system 桶里，mention 一辈子打不中。
+   *    宁可偶尔把"看起来像聊天的系统消息"算成聊天（最多多醒一次），也不能漏掉真人喊话。
    * @returns {{who:string, text:string}|null}
    */
   #playerChatFrom (msg, plain) {

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * whale_craft —— DSH 原生 Minecraft Agent 插件（host 半端）
  * ============================================================================
  * 目标：把"我"接进 MC 做成**一等公民**，而不是外挂一个 MCP 子进程。
@@ -29,7 +29,7 @@ import { homedir } from 'node:os'
 import { McBot, lossless, logLine, libraryInfo } from './src/core.mjs'
 import { Watchdog, WATCH_DEFAULTS } from './src/watchdog.mjs'
 import { MemoryStore } from './src/memory.mjs'
-import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction, patchPersonaInComposition, disableShellInComposition, patchPresentIntoComposition } from './src/config.mjs'
+import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction, patchPersonaInComposition, disableShellInComposition, patchToolGroupsIntoComposition, MC_PRESET_TOOL_GROUPS } from './src/config.mjs'
 import { AccountStore, parseAuthlibCard, normalizeServerUrl, dashUuid } from './src/accounts.mjs'
 import { DEFAULT_AGENTS_MD, agentsMdPath, readAgentsMd, writeAgentsMd, resetAgentsMd, isAgentsMdPath } from './src/agentsmd.mjs'
 import { encodePng } from './src/png.mjs'
@@ -2340,10 +2340,10 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 复制完官方 preset 之后，把**我们自己的三处**覆盖上去：
+   * 复制完官方 preset 之后，把**我们自己的几处**覆盖上去：
    *   ① persona（官方那句 "You are a helpful software engineer assistant." + `complete: true` 都不要）
    *   ② 关掉那个持久 shell（MC 模式的指导写着"本模式没有 shell"，两边必须一致）
-   *   ③ 补上 `present`（显式文件交付）组 —— 删掉 mc_kit_share 之后，"让用户看到文件"走宿主自带机制
+   *   ③ 补齐 MC 模式需要的工具组（tool-fs / tool-jobs / present）—— 官方 `minimal` 里一个都没有
    * @returns {boolean} 是否改动过（false = 结构不认识 / 无需改动，日志里说明）
    */
   const patchMcPresetComposition = (svc, id) => {
@@ -2356,51 +2356,54 @@ export function apply(ctx, config) {
       const withPersona = patchPersonaInComposition(cur, MC_PERSONA_TEXT)
       if (withPersona === null) { logLine('MC 模式 preset：composition 里没找到 persona 行 → 保持原样（人设还是官方那句）'); return false }
       let finalText = disableShellInComposition(withPersona) ?? withPersona
-      if (presentToolAvailable()) finalText = patchPresentIntoComposition(finalText) ?? finalText
+      finalText = patchToolGroupsIntoComposition(finalText, availableToolGroups()) ?? finalText
       if (finalText === cur) return false
       writeFileSync(p, finalText, 'utf8')
       return true
-    } catch (e) { logLine(`改 preset 的 persona/shell/present 失败（不影响挂载）：${e.message}`); return false }
+    } catch (e) { logLine(`改 preset 的 persona/shell/工具组失败（不影响挂载）：${e.message}`); return false }
   }
 
   /**
-   * 这份部署里**有没有 `@deepseek-ai/dsh-tool-present`**？
+   * 这份部署里**能加载哪些** MC 模式需要的工具组？
    *
-   * 为什么要探一下：`present` 是按 preset 挂载的，而"这个包在不在"取决于 DSH 版本与随附 bundle。
-   * 给一份**装不到这个包**的 preset 加组 = 让那份 preset 直接挂不起来（MC 模式整个坏掉）——
-   * 比"少一个交付工具"糟得多。判据很直接：**随附的 preset 里有没有人引用它**
-   * （随附 Web 的 standard/ptc/cordis 有，minimal 没有）。
+   * 为什么要探：这些包是按 preset 挂载的，"在不在"取决于 DSH 版本与随附 bundle。
+   * 给一份**装不到某个包**的 preset 加组 = 让那份 preset 直接挂不起来（MC 模式整个坏掉）——
+   * 比"少一个工具"糟得多。判据很直接：**随附的 preset 里有没有人引用它**
+   * （随附 Web 的 standard/ptc/cordis 有 tool-fs/tool-jobs/present，minimal 一个都没有）。
    */
-  let presentAvailable = null
-  const presentToolAvailable = () => {
-    if (presentAvailable !== null) return presentAvailable
-    presentAvailable = false
+  let availableGroups = null
+  const availableToolGroups = () => {
+    if (availableGroups) return availableGroups
+    const shipped = []
     try {
-      const svc = agentPresetsSvc
-      for (const row of svc?.list?.() ?? []) {
+      for (const row of agentPresetsSvc?.list?.() ?? []) {
         const text = compositionOf(row)
-        if (text && /@deepseek-ai\/dsh-tool-present/.test(text)) { presentAvailable = true; break }
+        if (text) shipped.push(text)
       }
     } catch { /* 读不到就当没有 */ }
-    if (!presentAvailable) logLine('没在随附 preset 里看到 @deepseek-ai/dsh-tool-present → 不给 MC 模式的 preset 加 present 组（免得那份 preset 挂不起来）')
-    return presentAvailable
+    const all = shipped.join('\n')
+    availableGroups = MC_PRESET_TOOL_GROUPS.filter((g) => all.includes(g.pkg))
+    const missing = MC_PRESET_TOOL_GROUPS.filter((g) => !all.includes(g.pkg)).map((g) => g.pkg)
+    if (missing.length) logLine(`这些工具包在本部署的 preset 里没人引用 → 不往 MC 模式 preset 里加：${missing.join(', ')}`)
+    return availableGroups
   }
 
-  /** 给**已存在**的 preset 补 present 组（用 `leave`/`meta` 分支时用；不动别的行） */
-  const ensurePresentGroupInPreset = (svc, id) => {
+  /** 给**已存在**的 preset 补工具组（用 `leave`/`meta` 分支时用；不动别的行） */
+  const ensureToolGroupsInPreset = (svc, id) => {
     try {
-      if (!presentToolAvailable()) return false
+      const groups = availableToolGroups()
+      if (!groups.length) return false
       const dir = mcPresetDir(svc, id)
       if (!dir) return false
       const p = join(dir, 'agent.cordis.yml')
       if (!existsSync(p)) return false
       const cur = readFileSync(p, 'utf8')
-      const next = patchPresentIntoComposition(cur)
+      const next = patchToolGroupsIntoComposition(cur, groups)
       if (next === null) return false
       writeFileSync(p, next, 'utf8')
-      logLine(`已给 MC 模式 preset（${id}）补上 present 组（显式文件交付）`)
+      logLine(`已给 MC 模式 preset（${id}）补上工具组：${groups.filter((g) => !cur.includes(g.pkg)).map((g) => g.pkg).join(', ')}`)
       return true
-    } catch (e) { logLine(`补 present 组失败（不影响挂载）：${e.message}`); return false }
+    } catch (e) { logLine(`补 preset 工具组失败（不影响挂载）：${e.message}`); return false }
   }
 
   /** preset 目录（用户可写根下那个），拿不到就 null */
@@ -2531,7 +2534,7 @@ export function apply(ctx, config) {
           logLine(`MC 模式 preset「${existingId}」检查通过，不动它（${plan.reason}）`)
           // 只有一件例外：**补 present 组**（显式文件交付）—— 删掉 mc_kit_share 之后，这是
           // "让本地用户看到产出文件"的唯一正路；只做"没有才加"，不动别的行。
-          ensurePresentGroupInPreset(svc, existingId)
+          ensureToolGroupsInPreset(svc, existingId)
           return
         }
         if (plan.action === 'meta') {
@@ -2557,7 +2560,7 @@ export function apply(ctx, config) {
               composition: compositionOf(rows.get(existingId)) ?? composition,
             })
           }
-          ensurePresentGroupInPreset(svc, existingId)
+          ensureToolGroupsInPreset(svc, existingId)
           return
         }
         // plan.action === 'rebuild'：先备份整个目录，再用官方接口重新复制一遍

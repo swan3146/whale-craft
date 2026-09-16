@@ -139,9 +139,11 @@ export function isCopiedPresetDescription (desc, shippedDescriptions) {
  *      （复制 minimal 会把"极简模式"的 persona（You are a helpful software engineer assistant.）
  *      和它的持久 shell 一起带过来，而 MC 模式的指导里明写"本模式没有 shell" —— 自相矛盾）；
  *      **3 = persona 换成用户定稿的那一句**（"你在一台真实的 Minecraft Java 版服务器里扮演一名玩家…"）；
- *      **4 = 补上 `present`（显式文件交付）组** —— 删掉 mc_kit_share 之后，"让用户看到文件"改走宿主自带机制。
+ *      **4 = 补上 `present`（显式文件交付）组** —— 删掉 mc_kit_share 之后，"让用户看到文件"改走宿主自带机制；
+ *      **5 = 补齐 MC 模式需要的**那几组工具（tool-fs / tool-jobs / present）—— 官方 minimal 里一个都没有，
+ *      不补的话复制出来的 preset 既没有文件工具、也没有 job controller（看门狗只能降级成"无 job 模式"）。
  */
-export const MC_PRESET_SPEC = 4
+export const MC_PRESET_SPEC = 5
 
 /**
  * 把 composition 里的 **persona 行**换成我们自己的（纯函数，好测）。
@@ -198,27 +200,40 @@ export function disableShellInComposition (text) {
 }
 
 /**
- * 给 MC 模式的 preset 补上 **`present` 交付工具**那一组（纯函数，好测）。
+ * MC 模式 preset 需要**具备**的几组工具（宿主注册、preset 按需挂载）。
  *
- * 🔴 2026-09-16 用户定的：删掉 `mc_kit_share`（它其实在调宿主另装的 dsh-file-host，
- *    插件本身没有文件服务器），改用 DSH 自带的交付机制 —— `present` 会写 `deliverables/presented`，
- *    Web 端在该轮末尾渲染**产出文件卡片**（可预览、可打开）。
- *    但它是**按 preset 挂载**的：随附 Web 的 `standard`/`ptc`/`cordis` 有，`minimal` 没有
- *    （官方明说 minimal 保持固定的双工具配置），而我们自动建的那份就是复制 `minimal` 来的。
+ * 🔴 为什么必须由我们补：官方 `minimal` 只有 persona + 一个持久 shell（别的什么都没有），
+ *    而我们自动建的「MC模式」正是复制它 —— 于是那份 preset 里的 agent：
+ *      · 没有 `read`/`write`/`edit`（我们的记忆-jail 与白名单就落空）；
+ *      · 没有 `present`（发不了产出文件）；
+ *      · **没有 `tool-jobs`** ⇒ 宿主没有 job controller ⇒ 看门狗只能降级成"无 job 模式"
+ *        （实验体 2026-09-16 的日志：`no job controller … load @deepseek-ai/dsh-tool-jobs`，
+ *         `jobId: null`。降级后仍能唤醒，但 UI 看不到这个任务、强制停止也管不到它）。
+ */
+export const MC_PRESET_TOOL_GROUPS = [
+  { id: 'tool-fs', pkg: '@deepseek-ai/dsh-tool-fs', note: '文件工具（read/write/edit/read_image）' },
+  { id: 'tool-jobs', pkg: '@deepseek-ai/dsh-tool-jobs', note: '后台任务 controller（看门狗要挂 job）' },
+  { id: 'present', pkg: '@deepseek-ai/dsh-tool-present', note: '显式文件交付（轮末文件卡片）' },
+]
+
+/**
+ * 把缺的工具组补进 composition（纯函数，好测）。
  *
- * 只做"没有才加"，不动别的行；已经在（不管是哪来的）就返回 null。
+ * 只做"没有才加"：`pkg` 已经在文件里（不管是哪来的、哪个 id）就跳过；一个都不用加 → 返回 null。
  * @param {string} text composition 文本（`agent.cordis.yml`）
+ * @param {Array<{id:string, pkg:string, note?:string}>} [groups] 要确保存在的组（默认 MC_PRESET_TOOL_GROUPS）
  * @returns {string|null} 改好的文本；无需改动 → null
  */
-export function patchPresentIntoComposition (text) {
+export function patchToolGroupsIntoComposition (text, groups = MC_PRESET_TOOL_GROUPS) {
   const src = String(text ?? '')
-  if (/@deepseek-ai\/dsh-tool-present/.test(src)) return null
-  const body = src.endsWith('\n') ? src : src + '\n'
-  return body
-    + '\n# ── 显式文件交付（whale_craft 2026-09-16 加）：present 让 AI 把产出文件交给用户 ──\n'
-    + '# Web 端会把它渲染成该轮末尾的文件卡片（可预览、可打开）。\n'
-    + '\n- id: present\n'
-    + "  name: '@deepseek-ai/dsh-tool-present'\n"
+  const missing = (groups ?? []).filter((g) => g?.pkg && !src.includes(g.pkg))
+  if (!missing.length) return null
+  let out = src.endsWith('\n') ? src : src + '\n'
+  for (const g of missing) {
+    out += `\n# ── ${g.note ?? g.pkg}（whale_craft 2026-09-16 加）──\n`
+      + `\n- id: ${g.id}\n  name: '${g.pkg}'\n`
+  }
+  return out
 }
 
 /**

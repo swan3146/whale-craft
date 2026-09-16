@@ -1,4 +1,4 @@
-// -*- coding: utf-8 -*-
+﻿// -*- coding: utf-8 -*-
 /**
  * 插件自检：用假 ctx 加载 whale_craft 的 apply()，检查
  *   - Config schema 能否解析
@@ -224,9 +224,9 @@ console.log('\n--- 工具面（share 移除 / present 接入）---')
   console.log(`  ${!/uploadToFileHost|dsh-file-host|\/serve\/file-host|mc_kit_share/.test(codeOnly) ? '✅' : '❌'} 源码里没有上传/文件服务器残留（注释里保留"为什么删"的说明）`)
   console.log(`  ${tools.has('mc_kit_image') && tools.has('mc_kit_memory') ? '✅' : '❌'} mc_kit_image / mc_kit_memory 仍在（一个渲染 PNG、一个记忆语义层）`)
   console.log(`  ${/MC_PRESENT_TOOL = 'present'/.test(idx) && /^\s+MC_PRESENT_TOOL,$/m.test(idx) ? '✅' : '❌'} present 已进 MC 模式白名单`)
-  console.log(`  ${/patchPresentIntoComposition/.test(idx) && /if \(presentToolAvailable\(\)\) finalText = patchPresentIntoComposition/.test(idx) ? '✅' : '❌'} 新建/重建 preset 时会补 present 组`)
-  console.log(`  ${/const ensurePresentGroupInPreset/.test(idx) && /ensurePresentGroupInPreset\(svc, existingId\)/.test(idx) ? '✅' : '❌'} 🔴 **已存在的** preset（含本机手写那份）也会被补上 present 组`)
-  console.log(`  ${/没在随附 preset 里看到 @deepseek-ai\/dsh-tool-present/.test(idx) ? '✅' : '❌'} 加组之前先探"这个部署里有没有那个包"（免得把 preset 弄挂）`)
+  console.log(`  ${/MC_PRESET_TOOL_GROUPS/.test(idx) && /availableToolGroups\(\)/.test(idx) ? '✅' : '❌'} 复制/重建 preset 时会补齐 MC 模式需要的工具组（tool-fs / tool-jobs / present）`)
+  console.log(`  ${/const ensureToolGroupsInPreset/.test(idx) && /ensureToolGroupsInPreset\(svc, existingId\)/.test(idx) ? '✅' : '❌'} 🔴 **已存在的** preset（含本机手写那份）也会被补齐那几组（不动别的行）`)
+  console.log(`  ${/这些工具包在本部署的 preset 里没人引用/.test(idx) ? '✅' : '❌'} 加组之前先探"这个部署里有没有那个包"（免得把 preset 弄挂）`)
 }
 
 /** 造一个假的 exec（带会话身份），工具靠它路由到各自的实例 */
@@ -575,6 +575,15 @@ console.log('\n--- 聊天识别（未签名 system_chat 也要算玩家说话）
     }
     return [msg, undefined]
   }
+  /**
+   * 🔴 实验体 2026-09-16 的证据：有的服务端把玩家聊天发在 **system 位置**（positionId 1），
+   * translate 也可能是它自己那套；但渲染出来就是 `<<user>> tp我，ds。`。
+   * 只按 position/translate 判会永远漏掉这类消息（事件队列里 kind 全是 system）。
+   */
+  const systemSlotChat = (who, body) => {
+    const msg = { translate: 'chat.type.text', with: [{ text: who }, { text: body }], toString: () => `<${who}> ${body}` }
+    return [msg, 'system']
+  }
 
   const chats = []
   const systems = []
@@ -584,10 +593,10 @@ console.log('\n--- 聊天识别（未签名 system_chat 也要算玩家说话）
   b1.on('chat', (c) => chats.push(c))
   b1.on('system', (s) => systems.push(s))
 
-  fake.emit('message', ...sysChat('<user>', '来我这。'))
-  console.log(`  ${chats.length === 1 && chats[0].who === '<user>' && chats[0].text === '来我这。' ? '✅' : '❌'} 🔴 未签名聊天（system_chat）被认成玩家说话：${JSON.stringify(chats[0] ?? null)}`)
+  fake.emit('message', ...sysChat('Tester', '来我这。'))
+  console.log(`  ${chats.length === 1 && chats[0].who === 'Tester' && chats[0].text === '来我这。' ? '✅' : '❌'} 🔴 未签名聊天（system_chat）被认成玩家说话：${JSON.stringify(chats[0] ?? null)}`)
   console.log(`  ${b1.stats.chats === 1 ? '✅' : '❌'} stats.chats 也涨了（以前这里是 0 —— 就是"喊我不应"的判据）`)
-  fake.emit('message', ...sysChat('<user>', '来我这。'))
+  fake.emit('message', ...sysChat('Tester', '来我这。'))
   console.log(`  ${chats.length === 1 ? '✅' : '❌'} 同一句短时间内重复只算一次（1.5s 去重）`)
 
   chats.length = 0
@@ -595,12 +604,21 @@ console.log('\n--- 聊天识别（未签名 system_chat 也要算玩家说话）
   console.log(`  ${chats.length === 0 ? '✅' : '❌'} 自己说的话不触发 chat（不当成别人喊我）`)
 
   chats.length = 0
-  fake.emit('message', ...sysText('<user> joined the game'))
+  fake.emit('message', ...sysText('Tester joined the game'))
   console.log(`  ${chats.length === 0 && systems.length === 1 ? '✅' : '❌'} 服务器系统消息仍然走 system（不会误当玩家说话）`)
 
   chats.length = 0
-  fake.emit('message', ...whisper('<user>', '在吗'))
-  console.log(`  ${chats.length === 1 && chats[0].who === '<user>' && chats[0].text === '在吗' ? '✅' : '❌'} 私聊（/tell）也认（未签名时同样走这条路）`)
+  fake.emit('message', ...whisper('Tester', '在吗'))
+  console.log(`  ${chats.length === 1 && chats[0].who === 'Tester' && chats[0].text === '在吗' ? '✅' : '❌'} 私聊（/tell）也认（未签名时同样走这条路）`)
+
+  // 🔴 实验体报的那一种：聊天被塞进 **system 位置**，渲染成 `<<user>> …`（kind 全是 system 的那个症状）
+  chats.length = 0
+  const sysBefore = systems.length
+  fake.emit('message', ...systemSlotChat('Tester', 'tp我，ds。'))
+  console.log(`  ${chats.length === 1 && chats[0].who === 'Tester' && /ds/.test(chats[0].text) ? '✅' : '❌'} 🔴 system 位置里的玩家聊天也认（"<Tester> tp我，ds。" → chat 事件，看门狗 mention 才打得中）`)
+  console.log(`  ${systems.length === sysBefore ? '✅' : '❌'} 它**不会**同时进 system 桶（分类唯一）`)
+  const bare = /^<([^<>]{1,32})>/.test('<Tester> tp我，ds。')
+  console.log(`  ${bare ? '✅' : '❌'} 形状判据（"<名字> 正文"）就是实验体证据里那种文本`)
 
   // 签名聊天（player_chat）：走另一条路，且**不会**被 message 再算一遍
   chats.length = 0
@@ -913,12 +931,18 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     console.log(`  ${C.disableShellInComposition('# 没有 shell 组\n') === null ? '✅' : '❌'} 没有 shell 组 → 返回 null`)
     const twice = C.disableShellInComposition(C.disableShellInComposition('- id: persistent-shell\n  group: true\n', '') ?? '')
     console.log(`  ${(twice.match(/disabled: true/g) ?? []).length === 1 ? '✅' : '❌'} 关 shell 是幂等的（不会写两遍 disabled）`)
-    // present 组（2026-09-16：删掉 mc_kit_share 之后，"让用户看到文件"改走宿主自带交付）
-    const added = C.patchPresentIntoComposition('- id: tool-fs\n  name: x\n')
-    console.log(`  ${added && /- id: present\n  name: '@deepseek-ai\/dsh-tool-present'\n$/.test(added) ? '✅' : '❌'} 补 present 组：追加在 composition 末尾（组写法与随附 preset 一致）`)
-    console.log(`  ${added && C.patchPresentIntoComposition(added) === null ? '✅' : '❌'} 已经有 present 组 → 返回 null（幂等，不会加两遍）`)
-    console.log(`  ${C.patchPresentIntoComposition("- id: present\n  name: '@deepseek-ai/dsh-tool-present'\n") === null ? '✅' : '❌'} 随附 preset 那种写法也认得（不重复加）`)
-    console.log(`  ${C.MC_PRESET_SPEC === 4 ? '✅' : '❌'} MC_PRESET_SPEC=4（自建 preset 下次启动会重建 → 带上 present 组）`)
+    // 工具组补丁（2026-09-16：MC 模式必须有 tool-fs / tool-jobs / present —— 官方 minimal 里一个都没有）
+    const mini = "- id: persona\n  name: '@deepseek-ai/dsh-persona'\n"
+    const added = C.patchToolGroupsIntoComposition(mini)
+    console.log(`  ${added && C.MC_PRESET_TOOL_GROUPS.every((g) => added.includes(g.pkg)) ? '✅' : '❌'} 空壳 preset（像官方 minimal）→ 三组全补齐：${C.MC_PRESET_TOOL_GROUPS.map((g) => g.pkg.replace('@deepseek-ai/dsh-', '')).join(' / ')}`)
+    console.log(`  ${added && /- id: tool-jobs\n  name: '@deepseek-ai\/dsh-tool-jobs'\n/.test(added) ? '✅' : '❌'} 🔴 其中含 tool-jobs（没有它，宿主就没有 job controller → 看门狗只能降级成"无 job 模式"）`)
+    console.log(`  ${added && /- id: tool-fs\n  name: '@deepseek-ai\/dsh-tool-fs'\n/.test(added) ? '✅' : '❌'} 其中含 tool-fs（文件工具；官方 minimal 没有 → 不补的话 jail/白名单全落空）`)
+    console.log(`  ${added && C.patchToolGroupsIntoComposition(added) === null ? '✅' : '❌'} 幂等：再跑一次返回 null（不会加两遍）`)
+    const partial = C.patchToolGroupsIntoComposition("- id: tool-fs\n  name: '@deepseek-ai/dsh-tool-fs'\n")
+    console.log(`  ${partial && (partial.match(/dsh-tool-fs/g) ?? []).length === 1 && partial.includes('dsh-tool-jobs') ? '✅' : '❌'} 已经有的那组不会被重复加（只补缺的）`)
+    const oneOnly = C.patchToolGroupsIntoComposition(mini, [C.MC_PRESET_TOOL_GROUPS[0]])
+    console.log(`  ${oneOnly && oneOnly.includes('dsh-tool-fs') && !oneOnly.includes('dsh-tool-jobs') ? '✅' : '❌'} 只把"部署里真的有的"那几组传进来时，只补那几组`)
+    console.log(`  ${C.MC_PRESET_SPEC === 5 ? '✅' : '❌'} MC_PRESET_SPEC=5（自建 preset 下次启动会重建 → 带上这几组）`)
   }
   // 🔴 **已经建好的**那份也要能修（用户那台测试机上就是旧版建出来的）：
   //    只在"简介恰好等于某个官方 preset 的简介"（明显是复制残留）时才动，用户自己写的不碰。
