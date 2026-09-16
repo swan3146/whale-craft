@@ -748,6 +748,13 @@ export function apply(ctx, config) {
     //    E2E 实测踩过：早先按 "GET/DELETE 都不读体" 写，两个删除接口全废。
     const body = req.method === 'GET' ? {} : await readJsonBody(req)
 
+    /* 前端**门控**要的那份名单（哪些 preset 算 MC 模式）：极小、只读、不需要 sessionId / 工作区。
+     * 绝不能挂在 `settingsGate` 后面 —— 否则浏览器拿不到名单就静默退回兜底值，
+     * 按钮显示与否会和服务端口径不一致（2026-09-16 自查出来的自伤）。 */
+    if (path === '/api/mc/presets' && req.method === 'GET') {
+      return ok({ mcModePresets: pluginConfig.mcModePresets })
+    }
+
     /**
      * 「MC设置」这组接口的**工作区闸门**（用户 2026-09-16）：
      *   · **没有选中工作区 → 拒绝**（400），不猜、也不落到 `$DSH_HOME` 兜底目录；
@@ -901,6 +908,8 @@ export function apply(ctx, config) {
           defaultText: DEFAULT_AGENTS_MD,
           workspacePath: wsPath,
           workspaceExists: existsSync(wsPath),
+          // 「提示词」页要能直接告诉用户"这几段到底会不会进模型"（省得靠猜）
+          injection: promptInjectionStatus(safeAgentById(sessionId)),
         })
       }
       if (req.method === 'PUT') return ok({ ...writeAgentsMd(promptDir, body.text), source: 'custom' })
@@ -2122,6 +2131,8 @@ export function apply(ctx, config) {
    * 这样无论 preset 什么时候选上，下一轮装配就带上了；也不可能再"漏注册"。
    */
   const promptsInstalled = new WeakSet()
+  /** 注入日志去重（段名:会话id）：每会话每段只往日志里写一次 */
+  const injectLogged = new Set()
   const installAgentPrompts = (agent) => {
     if (!agent?.ctx || promptsInstalled.has(agent)) return
     let sp = null
@@ -2157,7 +2168,13 @@ export function apply(ctx, config) {
         if (ensureAgentsMdFile(dir)) logLine(`行事准则文件缺失 → 已重建并注入默认：${agentsMdPath(dir)}`)
         const cur = readAgentsMd(dir)
         const tag = cur.source === 'custom' ? 'Master 自定义版' : '默认版'
-        return `【Whale Craft 行事准则 · .whale-craft/AGENTS.md（${tag}）】\n\n${cur.text.trim()}`
+        const body = `【Whale Craft 行事准则 · .whale-craft/AGENTS.md（${tag}）】\n\n${cur.text.trim()}`
+        // 🔴 注入时留一行日志（每会话只记一次）：真机排查"到底注没注入"全靠它
+        if (body.length && !injectLogged.has('agents-md:' + agent.id)) {
+          injectLogged.add('agents-md:' + agent.id)
+          logLine(`提示词已注入：.whale-craft/AGENTS.md（${cur.source === 'custom' ? '自定义' : '默认'} ${body.length} 字）`)
+        }
+        return body
       },
     })
 
@@ -2172,7 +2189,13 @@ export function apply(ctx, config) {
           const p = join(workspaceRootFor(agent), 'AGENTS.md')
           if (!existsSync(p)) return ''
           const t = readFileSync(p, 'utf8').trim()
-          return t ? `【工作区 AGENTS.md（Master 打开了"注入工作区 AGENTS.md"）】\n\n${t}` : ''
+          if (!t) return ''
+          const body = `【工作区 AGENTS.md（Master 打开了"注入工作区 AGENTS.md"）】\n\n${t}`
+          if (!injectLogged.has('workspace-agents-md:' + agent.id)) {
+            injectLogged.add('workspace-agents-md:' + agent.id)
+            logLine(`提示词已注入：工作区 AGENTS.md（${body.length} 字）`)
+          }
+          return body
         } catch { return '' }
       },
     })
@@ -2197,6 +2220,53 @@ export function apply(ctx, config) {
       writeFileSync(p, DEFAULT_AGENTS_MD, 'utf8')
       return true
     } catch (e) { logLine(`重建行事准则失败（${p}）：${e.message}`); return false }
+  }
+
+  /**
+   * **提示词注入状态**（给 UI / `mc_diag` 看）：三段各自"会不会注入、为什么不会"。
+   *
+   * 2026-09-16 加：用户在真机上反复报"没有任何我们的提示词"，而这件事**极难从外面判断**
+   * （是没进 MC 模式？开关关了？文件不在？段没注册？）。与其让人猜，不如把判据摆出来：
+   * `segments` 是最终结论，`notes` 是人话版原因。
+   */
+  const promptInjectionStatus = (agent) => {
+    const cwd = workspaceOf(agent)
+    const root = cwd ? memoryRootFor(cwd) : null
+    const mcMode = Boolean(agent) && isMcModeAgent(agent)
+    const wsAgents = agent ? join(workspaceRootFor(agent), 'AGENTS.md') : null
+    const cur = root ? readAgentsMd(root) : null
+    const agentsFile = root ? agentsMdPath(root) : null
+    const injectWc = pluginConfig.get('injectWhaleCraftAgentsMd') === true
+    const injectWs = pluginConfig.get('injectWorkspaceAgentsMd') === true
+    const wsExists = Boolean(wsAgents) && existsSync(wsAgents)
+    const presetId = (agent && lastPresetSeen.get(agent)) ?? null
+    return {
+      mcMode,
+      presetId,
+      workspace: cwd ?? null,
+      promptsInstalled: Boolean(agent && promptsInstalled.has(agent)),
+      switches: { injectWhaleCraftAgentsMd: injectWc, injectWorkspaceAgentsMd: injectWs },
+      files: {
+        agentsMd: agentsFile
+          ? { path: agentsFile, exists: existsSync(agentsFile), source: cur?.source ?? null, bytes: cur ? Buffer.byteLength(cur.text) : 0 }
+          : null,
+        workspaceAgentsMd: wsAgents ? { path: wsAgents, exists: wsExists } : null,
+      },
+      segments: {
+        'memory-index': Boolean(root),
+        'mode-guidance': mcMode,
+        'agents-md': mcMode && injectWc && Boolean(agentsFile),
+        'workspace-agents-md': mcMode && injectWs && wsExists,
+      },
+      notes: [
+        ...(agent ? [] : ['拿不到当前会话（没有 agent 上下文）']),
+        ...(agent && !cwd ? ['这个会话没有选中工作区 → 提示词没地方放，插件不会注入'] : []),
+        ...(agent && cwd && !mcMode ? [`这个会话不是 MC 模式（preset=${presetId ?? '未知'} 不在 mcModePresets 里）→ 不注入专属提示词`] : []),
+        ...(mcMode && !injectWc ? ['「注入本提示词」是关的'] : []),
+        ...(mcMode && !injectWs ? ['「注入工作区 AGENTS.md」是关的'] : []),
+        ...(mcMode && injectWs && !wsExists ? ['工作区根目录里没有 AGENTS.md 这个文件'] : []),
+      ],
+    }
   }
 
   /**
@@ -2680,13 +2750,15 @@ export function apply(ctx, config) {
 
   ctx.tools.register(asTool({
     name: 'mc_diag',
-    description: '诊断：当前会话的机器人内部状态（物理/控制位/收包/事件队列）——排查"走不动/收不到消息"用。',
+    description: '诊断：当前会话的机器人内部状态（物理/控制位/收包/事件队列）——排查"走不动/收不到消息"用。'
+      + '同时报**提示词注入状态**（`promptInjection`：三段提示词各自会不会注入、为什么不会）。',
     parameters: {},
     output: text(),
     async execute(args, exec) {
       const sess = getSession(exec)
+      const injection = promptInjectionStatus(exec?.agent)
       const b = sess.bot.bot
-      if (!b?.entity) return { online: false, lastError: sess.bot.lastError, mode: sess.mode }
+      if (!b?.entity) return { online: false, lastError: sess.bot.lastError, mode: sess.mode, promptInjection: injection }
       return {
         online: true, version: b.version, physicsEnabled: b.physicsEnabled,
         controlState: { forward: b.controlState?.forward, jump: b.controlState?.jump, sneak: b.controlState?.sneak },
@@ -2695,6 +2767,7 @@ export function apply(ctx, config) {
         pendingEvents: sess.events.length, mode: sess.mode, stats: sess.bot.stats,
         connection: sess.bot._connectionProfile ?? null,
         watching: sess.watchdog?.status() ?? null,
+        promptInjection: injection,
       }
     },
   }))

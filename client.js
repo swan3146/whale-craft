@@ -139,6 +139,9 @@ window.__ModuleLoader__.load({
 [data-wc-acctname]{font-size:13px;line-height:18px;min-width:0;overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap;color:var(--dsw-alias-label-primary);}
 /* 第三方账户的服务器名（小字号灰字；没有名字就显示 url） */
+/* 「提示词」页顶部的注入状态（2026-09-16）：一眼看出会不会注入、为什么不会 */
+[data-wc-injectstatus]{font-size:12px;line-height:18px;color:var(--dsh-text-2,#9aa0a6);margin:0 0 8px;}
+[data-wc-injectstatus] [data-wc-note]{font-size:11px;line-height:16px;color:var(--dsh-text-3,#7a8085);margin-top:2px;}
 [data-wc-acctsub]{font-size:11px;line-height:16px;min-width:0;overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap;color:var(--dsw-alias-label-tertiary);}
 [data-wc-acctacts]{flex:none;display:flex;align-items:center;gap:2px;}
@@ -404,7 +407,8 @@ select[data-wc-in]{appearance:none;padding-right:22px;
      *    组件把它当成"不是 MC 模式"，而且**只问一次、再不重试** ⇒ 重启之后
      *    MC 模式里也永远没有按钮（非得刷新页面）。**门控不许依赖一次性网络请求。**
      *
-     * 名单（哪些 preset 算 MC 模式）优先取服务端 `/api/mc/config` 的 `mcModePresets`；
+     * 名单（哪些 preset 算 MC 模式）取服务端 **`/api/mc/presets`**（专门给门控用的极小接口，
+     * 不需要 sessionId / 工作区 —— `/api/mc/config` 现在要工作区，用它会被拒而静默退回兜底名单）；
      * 没回来之前先用插件默认值 `['minecraft','whale_craft']`（与后端默认一致）。
      * 服务端 `/api/mc/mode` 仍保留，供排查与测试用，前端不再依赖它。
      * ================================================================== */
@@ -416,7 +420,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       if (mcPresetIdsAsked) return
       mcPresetIdsAsked = true
       try {
-        fetch('/api/mc/config', { headers: { accept: 'application/json' } })
+        fetch('/api/mc/presets', { headers: { accept: 'application/json' } })
           .then((r) => (r.ok ? r.json() : null))
           .then((j) => {
             const list = Array.isArray(j?.mcModePresets) ? j.mcModePresets.map(String).filter(Boolean) : []
@@ -1081,19 +1085,31 @@ select[data-wc-in]{appearance:none;padding-right:22px;
 
     function PromptPane(props) {
       const {
-        mdText, wsExists,
+        mdText, wsExists, injectStatus,
         injectWc, injectWs, busyKey, onMdText, onSave, onReset, onInjectWc, onInjectWs,
       } = props
       const busy = busyKey !== null
       const [confirmReset, setConfirmReset] = React.useState(false)
       const saveBusy = busyKey === 'md:save'
       const resetBusy = busyKey === 'md:reset'
+      const seg = injectStatus?.segments ?? {}
+      const mark = (on) => (on ? '✓' : '✗')
 
       return React.createElement(
         'div',
         { 'data-wc-pane-page': 'prompt' },
         React.createElement('div', { 'data-wc-sec': '' },
           React.createElement('div', { 'data-wc-h': '' }, '提示词'),
+          // 🔴 把"到底会不会注入"直接摆给用户看（2026-09-16：真机上反复出现"没注入"，
+          //    原因可能有一堆 —— 不是 MC 模式 / 开关关了 / 文件不在 —— 与其让人猜，不如显示判据）
+          injectStatus
+            ? React.createElement('div', { 'data-wc-injectstatus': '' },
+              `本会话注入：MC模式 ${mark(injectStatus.mcMode)} ｜ 本提示词 ${mark(seg['agents-md'])} ｜ 工作区 AGENTS.md ${mark(seg['workspace-agents-md'])}`,
+              injectStatus.notes?.length
+                ? React.createElement('div', { 'data-wc-note': '' }, injectStatus.notes.join(' ｜ '))
+                : null,
+            )
+            : null,
           React.createElement('textarea', {
             'data-wc-textarea': '', 'data-wc-tall': '', value: mdText, spellCheck: false,
             disabled: busy,
@@ -1181,6 +1197,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const [injectWs, setInjectWs] = React.useState(false)
       const [wsPath, setWsPath] = React.useState('')
       const [wsExists, setWsExists] = React.useState(false)
+      const [injectStatus, setInjectStatus] = React.useState(null)
       const [loading, setLoading] = React.useState(false)
       const [loaded, setLoaded] = React.useState(false)
       const [loadError, setLoadError] = React.useState('')
@@ -1222,6 +1239,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             setMdPath(String(m.path ?? ''))
             setWsPath(String(m.workspacePath ?? ''))
             setWsExists(m.workspaceExists === true)
+            setInjectStatus(m.injection ?? null)
           }).catch((e) => { setError(errorText(e)) }),
         ])
           .then(() => { setLoaded(true) })
@@ -1341,7 +1359,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         : (tab === 'prompt'
           ? React.createElement(PromptPane, {
             key: 'prompt:' + mdSource + ':' + wsExists,
-            mdText, mdSource, mdPath, wsPath, wsExists, injectWc, injectWs, busyKey,
+            mdText, mdSource, mdPath, wsPath, wsExists, injectStatus, injectWc, injectWs, busyKey,
             onMdText: setMdText, onSave: saveAgentsMd, onReset: resetAgentsMd,
             onInjectWc: toggleInjectWc, onInjectWs: toggleInjectWs,
           })
