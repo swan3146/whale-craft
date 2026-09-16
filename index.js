@@ -26,7 +26,7 @@ import { resolve, sep, join } from 'node:path'
 import { McBot, lossless, logLine, libraryInfo } from './src/core.mjs'
 import { Watchdog, WATCH_DEFAULTS } from './src/watchdog.mjs'
 import { MemoryStore } from './src/memory.mjs'
-import { PluginConfig, DEFAULT_CONFIG, resolveStateDir } from './src/config.mjs'
+import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource } from './src/config.mjs'
 import { AccountStore, parseAuthlibCard, normalizeServerUrl, dashUuid } from './src/accounts.mjs'
 import { DEFAULT_AGENTS_MD, agentsMdPath, readAgentsMd, writeAgentsMd, resetAgentsMd, isAgentsMdPath } from './src/agentsmd.mjs'
 import { encodePng } from './src/png.mjs'
@@ -2133,9 +2133,63 @@ export function apply(ctx, config) {
    *   ③ 提示词：注入 whale_craft 专属指导（宿主的 AGENTS.md 注入之外，另加这一段）
    * ------------------------------------------------------------------------ */
 
+  /** 自动创建 preset 时的显示名（preset.yml 里的 `name:`） */
+  const MC_PRESET_NAME = 'MC模式'
+
   /** 宿主 agentPresets 服务（可能晚就绪 → 必须走 inject 等，别用 apply 时的 ctx.get） */
   let agentPresetsSvc = null
-  ctx.inject(['agentPresets'], (scope) => { agentPresetsSvc = scope.get('agentPresets') ?? null })
+  ctx.inject(['agentPresets'], (scope) => {
+    agentPresetsSvc = scope.get('agentPresets') ?? null
+    void ensureMcPresetIfMissing()
+  })
+
+  /**
+   * **没有 MC 模式 preset 就自动建一个**（用户 2026-09-16 定）。
+   *
+   * 起因：preset 属于用户的 `$DSH_HOME/.agent-presets/`，插件不塞目录 → 新机器上没人建过 →
+   * `mcModePresets` 一个都匹配不上 → "装了插件也没有 MC模式"（没有按钮、没有隔离、没有专属提示词）。
+   *
+   * 🔴 **只能用宿主官方接口 `agentPresets.copy(源, 新id, 显示名)`**：
+   *    官方 authoring 明令"只允许整目录复制一个已有 preset，调用方不得提供 composition 文本"
+   *    （`agent-presets/src/authoring.ts` 头注释）。所以我们是**复制**官方 `minimal`，不是手搓 YAML。
+   * 🔴 **已存在就绝不动**；`ensureMcPreset:false` 可关；没有可写根（`authorable:false`）就跳过并说明。
+   */
+  let presetEnsureTried = false
+  const ensureMcPresetIfMissing = async () => {
+    if (presetEnsureTried) return
+    if (pluginConfig.get('ensureMcPreset') !== true) return
+    const svc = agentPresetsSvc
+    if (!svc || typeof svc.list !== 'function' || typeof svc.copy !== 'function') return
+    presetEnsureTried = true
+    try {
+      if (svc.authorable === false) {
+        logLine('没找到 MC 模式 preset，但这份部署没有"用户可写的 preset 根"→ 跳过自动创建（请手动建一个）')
+        return
+      }
+      const list = await svc.list()
+      const ids = new Set((list ?? []).map((p) => String(p?.id ?? '')).filter(Boolean))
+      const wanted = pluginConfig.mcModePresets
+      if (wanted.some((id) => ids.has(id))) return                       // 已经有了，什么都不做
+
+      // preset id 必须是目录名（宿主 `PRESET_ID = /^[a-z0-9][a-z0-9-]*$/`）——
+      // 所以默认名单里的 `whale_craft`（下划线）**永远不可能是 preset id**，只能建 `minecraft` 这种。
+      const target = pickPresetTarget(wanted)
+      if (!target) {
+        logLine(`没找到 MC 模式 preset，而 mcModePresets 里没有**合法**的 preset id（${wanted.join(' / ')}）→ 跳过`)
+        return
+      }
+      const source = pickPresetSource([...ids], svc.defaultId)
+      if (!source) {
+        logLine(`没找到 MC 模式 preset，且找不到可复制的官方 preset 源（现有：${[...ids].join(' / ') || '（空）'}）→ 跳过`)
+        return
+      }
+      await svc.copy(source, target, MC_PRESET_NAME)
+      logLine(`已自动创建「${MC_PRESET_NAME}」preset：复制官方 ${source} → ${target}`
+        + `（id=${target}；想改就编辑 $DSH_HOME/.agent-presets/${target}/，想关掉自动创建设 ensureMcPreset=false）`)
+    } catch (e) {
+      logLine(`自动创建 MC 模式 preset 失败（不影响其它功能）：${e?.message ?? e}`)
+    }
+  }
 
   /** 诊断用：每个 agent 最近一次看到的 preset id（`/api/mc/mode` 会报出来） */
   const lastPresetSeen = new WeakMap()
@@ -2167,8 +2221,7 @@ export function apply(ctx, config) {
     return null
   }
 
-  /** MC 模式专属指导（用户要求："我们也加上我们这个模式的专门提示词注入、指导之类"） */
-  const MC_MODE_GUIDANCE = [
+  /** MC 模式专属指导（用户要求："我们也加上我们这个模式的专门提示词注入、指导之类"） */  const MC_MODE_GUIDANCE = [
     '【whale_craft · 麦块模式专属指导】',
     '',
     '你现在是"进游戏玩"的那个 Agent。约定如下：',

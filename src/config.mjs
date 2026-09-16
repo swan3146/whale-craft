@@ -84,6 +84,41 @@ export const DEFAULT_CONFIG = {
    * "我们插件再补一份"，打开即恢复"工作区 AGENTS.md 也在场"。
    */
   injectWorkspaceAgentsMd: false,
+  /**
+   * 启动时若 `mcModePresets` 里**一个都不存在**，就自动建一个「MC模式」preset。
+   *
+   * 2026-09-16 用户定的：插件**不塞** preset 目录，但"没有 preset 就没有 MC 模式"这件事必须自己解决
+   * —— preset 属于用户的 `$DSH_HOME/.agent-presets/`，新机器上没人建过，插件就永远认不出 MC 会话。
+   *
+   * 做法**只能用宿主官方接口**：`agentPresets.copy(源, 新id, 显示名)`（官方 authoring 明令
+   * "只允许整目录复制已有 preset、调用方不得提供 composition 文本"）。默认复制官方的 `minimal`
+   * （极简工具面）；**已存在就绝不动**。关掉它就回到"要自己建 preset"。
+   */
+  ensureMcPreset: true,
+}
+
+/**
+ * preset id 必须是**目录名**：与宿主 `agent-presets/src/preset.ts` 的 `PRESET_ID` 同规则。
+ * 🔴 这条很要命：默认名单里的 `whale_craft` **带下划线，永远不可能是 preset id**
+ * （所以"自动建 MC 模式 preset"只能建 `minecraft` 那种）。
+ */
+export const PRESET_ID_RE = /^[a-z0-9][a-z0-9-]*$/
+
+/** 从 `mcModePresets` 里挑一个**能当目录名**的 id；都不合法就 null */
+export function pickPresetTarget (wanted) {
+  const list = Array.isArray(wanted) ? wanted : []
+  return list.map((x) => String(x ?? '').trim()).find((id) => PRESET_ID_RE.test(id)) ?? null
+}
+
+/** 复制源的优先级：越简的工具面越适合 MC 模式（MC 的 persona/指导由插件注入） */
+export const PREFERRED_PRESET_SOURCES = ['minimal', 'standard', 'ptc']
+
+/** 从现有 preset 里挑复制源：先按优先级，再退到宿主的默认 preset；都没有就 null */
+export function pickPresetSource (ids, defaultId = null) {
+  const set = new Set((ids ?? []).map((x) => String(x ?? '')))
+  for (const id of PREFERRED_PRESET_SOURCES) if (set.has(id)) return id
+  const d = String(defaultId ?? '')
+  return set.has(d) ? d : null
 }
 
 const TOP_KEYS = new Set(Object.keys(DEFAULT_CONFIG))
@@ -236,7 +271,7 @@ function validate (top, rest, value) {
     if (value !== null && typeof value !== 'string') throw new Error('memoryDir 必须是字符串（绝对路径）或 null')
     return
   }
-  if (top === 'allowAllCommands' || top === 'injectWhaleCraftAgentsMd' || top === 'injectWorkspaceAgentsMd') {
+  if (top === 'allowAllCommands' || top === 'injectWhaleCraftAgentsMd' || top === 'injectWorkspaceAgentsMd' || top === 'ensureMcPreset') {
     if (typeof value !== 'boolean') throw new Error(`${top} 必须是 true/false`)
     return
   }

@@ -30,6 +30,8 @@ const injectedFibers = []
 const guards = []              // ctx.tools.guard 注册的守卫（MC 模式硬拦截靠它）
 const eventHandlers = []       // ctx.on 注册的事件（agent/created 等）
 const presetByCtx = new Map()  // 模拟宿主 agentPresets：agent.ctx → preset id
+const presetRows = ['minimal', 'standard', 'ptc']   // 模拟"现有哪些 preset"（官方随包那三个）
+const presetCopyCalls = []     // 自动建 preset 时对宿主 copy() 的调用
 
 // ── 超时保护单元验证（"停不下来"根因修复的核心机制）──
 console.log('--- withTimeout / raceAbort 单元验证 ---')
@@ -87,8 +89,14 @@ const fakeCtx = {
     register: (def) => { tools.set(def.name, def); return () => {} },
     guard: (fn) => { guards.push(fn); return () => {} },
   },
-  // 宿主 agentPresets 服务：判断"是不是 MC 模式"要用它
-  agentPresets: { composedPreset: (agentCtx) => presetByCtx.get(agentCtx) },
+  // 宿主 agentPresets 服务：判断"是不是 MC 模式"要用它；自动建 preset 也走它
+  agentPresets: {
+    composedPreset: (agentCtx) => presetByCtx.get(agentCtx),
+    authorable: true,
+    defaultId: 'standard',
+    list: async () => presetRows.map((id) => ({ id, trust: 'shipped', path: `/presets/${id}/agent.cordis.yml` })),
+    copy: async (from, id, name) => { presetCopyCalls.push([from, id, name]); presetRows.push(id) },
+  },
   webServer: { register: (route) => { registeredRoutes.push(route); return () => {} } },
   // 必须在 apply 之前就在，否则归档保护的包装装不上
   workspaceRegistry: { archiveSession: async (sid) => { archivedSessions.push(String(sid)) } },
@@ -654,7 +662,31 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   }
 
   // ① 配置存储本身
-  const { PluginConfig } = await import('./src/config.mjs')
+  const { PluginConfig, pickPresetTarget, pickPresetSource } = await import('./src/config.mjs')
+
+  /* 🔴 2026-09-16 用户定：**没有 MC 模式 preset 就自动建一个**。
+   * 起因：preset 属于用户的 $DSH_HOME/.agent-presets/，插件不塞目录 → 新机器上没人建过
+   * → mcModePresets 一个都匹配不上 → "装了插件也没有 MC模式"。
+   * 做法只能用宿主官方接口 `agentPresets.copy(源, 新id, 显示名)`
+   * （官方 authoring 明令"只允许整目录复制已有 preset，调用方不得提供 composition 文本"）。 */
+  await new Promise((r) => setTimeout(r, 0))          // ensureMcPresetIfMissing 是 async
+  const cp = presetCopyCalls[0]
+  console.log(`  ${cp?.[0] === 'minimal' && cp?.[1] === 'minecraft' && cp?.[2] === 'MC模式' ? '✅' : '❌'} 没有 MC 模式 preset → 自动建：复制 minimal → id=minecraft，名字「MC模式」（${JSON.stringify(presetCopyCalls)}）`)
+  if (apFiber) {
+    // 再触发一次：必须**不会**重复建（一次性）
+    apFiber.cb({ get: (k) => (k === 'agentPresets' ? fakeCtx.agentPresets : undefined), effect: (fn) => { try { fn() } catch {} } })
+    await new Promise((r) => setTimeout(r, 0))
+  }
+  console.log(`  ${presetCopyCalls.length === 1 ? '✅' : '❌'} 只建一次（重复触发不再复制）`)
+  console.log(`  ${pickPresetTarget(['minecraft', 'whale_craft']) === 'minecraft' ? '✅' : '❌'} 目标 id 取的是**合法目录名**（minecraft）`)
+  console.log(`  ${pickPresetTarget(['whale_craft']) === null ? '✅' : '❌'} 🔴 \`whale_craft\` 带下划线、**不可能是 preset id** → 宁可不建也不硬来（null）`)
+  console.log(`  ${pickPresetSource(['minimal', 'standard']) === 'minimal' && pickPresetSource(['ptc'], 'ptc') === 'ptc' && pickPresetSource([], 'standard') === null ? '✅' : '❌'} 复制源优先 minimal → standard → ptc，再退到宿主默认，都没有就 null`)
+  {
+    const { readFileSync } = await import('node:fs')
+    const src = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+    console.log(`  ${/svc\.copy\(source, target, MC_PRESET_NAME\)/.test(src) ? '✅' : '❌'} 用的是宿主官方 \`copy()\`（不手搓 composition —— 官方 authoring 不允许）`)
+    console.log(`  ${/svc\.authorable === false/.test(src) ? '✅' : '❌'} 这份部署没有可写 preset 根时优雅跳过（不是崩）`)
+  }
   const { mkdtempSync } = await import('node:fs')
   const { tmpdir } = await import('node:os')
   const { join } = await import('node:path')

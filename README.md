@@ -25,6 +25,12 @@
 > 想让 AI 进**局域网房间**？直接说"找个局域网服务器"——它用 `mc_lan` 听广播 + 扫本机网段，
 > 拿到地址后用 `mc_connect` 进去（对方要先在游戏里「对局域网开放」）。
 
+> **第一次装好没有「MC模式」？** 插件会**自己建一个**：启动时发现 `mcModePresets`
+> （默认 `minecraft` / `whale_craft`）里一个都不存在，就调用 DSH 官方接口
+> `agentPresets.copy('minimal', 'minecraft', 'MC模式')` —— **整目录复制官方极简模式**，不是手搓配置
+> （DSH 的 authoring 只允许这样建）。**已经有一个就绝不动它**；不想要这个行为就把
+> `ensureMcPreset` 关掉。
+
 ---
 
 ## 要求
@@ -96,6 +102,7 @@ dsh plugin --profile web add whale_craft
 | `injectWhaleCraftAgentsMd` | 是否把 `.whale-craft/AGENTS.md` 注入 MC 模式会话 | `true` |
 | `injectWorkspaceAgentsMd` | 是否**额外**注入工作区的 `AGENTS.md` | `false` |
 | `memoryDir` | 记忆根目录（`null` = 会话工作区的 `.whale-craft/`） | `null` |
+| `ensureMcPreset` | 启动时若 `mcModePresets` 里**一个 preset 都不存在**，就复制官方 `minimal` 建一个「MC模式」（已存在则绝不动） | `true` |
 
 ---
 
