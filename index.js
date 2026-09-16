@@ -426,7 +426,10 @@ export function apply(ctx, config) {
     let store = memoryCache.get(root)
     if (!store) {
       migrateWorkspaceState(cwd)
-      store = new MemoryStore(root)
+      // 🔴 `create:false`：**读**记忆不该顺手把 `.whale-craft/` 建出来。
+      //    建目录/建 AGENTS.md 只发生在"首次发起 MC 模式会话"与"点开 MC设置"这两个时机
+      //    （用户 2026-09-16 定），由 `ensureMemoryRoot` 显式做。
+      store = new MemoryStore(root, { create: false })
       memoryCache.set(root, store)
     }
     return store
@@ -437,6 +440,27 @@ export function apply(ctx, config) {
   const memory = memoryFor(null)
   /** 这个会话的工作区根（mc_kit_share / mc_kit_image / 地图落盘用）；拿不到就给个兜底目录 */
   const workspaceRootFor = (agent) => workspaceOf(agent) ?? join(stateDir, 'workspace')
+
+  /**
+   * 按 sessionId 找**这个会话选中的工作区**：
+   *   ① 活着的 agent（`agent.session.header.cwd`，首选，最准）；
+   *   ② 冷会话 → 问宿主的 `sessionQuery.listSessions()`（header 里有 cwd）。
+   * 都没有 = 这个会话没选工作区（用户 2026-09-16：那种情况要**拒绝** MC 模式与 MC设置）。
+   */
+  const workspaceOfSession = async (sessionId) => {
+    const sid = String(sessionId ?? '').trim()
+    if (!sid) return null
+    const live = workspaceOf(safeAgentById(sid))
+
+    if (live) return live
+    try {
+      const q = ctx.get('sessionQuery')
+      const records = await q?.listSessions?.()
+      const rec = (records ?? []).find((r) => String(r?.header?.id ?? r?.id ?? '') === sid)
+      const cwd = rec?.header?.cwd ?? rec?.cwd ?? null
+      return typeof cwd === 'string' && cwd.trim() ? cwd : null
+    } catch { return null }
+  }
 
   /** 按 sessionId 找 agent（HTTP 那几个接口用；拿不到就 null） */
   const safeAgentById = (sessionId) => {
@@ -722,7 +746,28 @@ export function apply(ctx, config) {
     //    E2E 实测踩过：早先按 "GET/DELETE 都不读体" 写，两个删除接口全废。
     const body = req.method === 'GET' ? {} : await readJsonBody(req)
 
+    /**
+     * 「MC设置」这组接口的**工作区闸门**（用户 2026-09-16）：
+     *   · **没有选中工作区 → 拒绝**（400），不猜、也不落到 `$DSH_HOME` 兜底目录；
+     *   · 顺带承担"**点开 MC设置**"这个时机：把该工作区的 `.whale-craft/`（README.md / AGENTS.md）备好。
+     */
+    const settingsGate = async (sessionId) => {
+      const sid = String(sessionId ?? '').trim()
+      if (!sid) {
+        return { ok: false, error: '缺少 sessionId：这组接口只在某个会话里可用（要用它的工作区放记忆与提示词）。' }
+      }
+      const cwd = await workspaceOfSession(sid)
+      if (!cwd) {
+        return { ok: false, error: '这个会话**没有选中工作区**，「MC设置」不可用：请先在会话里选定一个工作区（记忆与提示词都放在那里）。' }
+      }
+      ensureMemoryRootForCwd(cwd)
+      return { ok: true, cwd }
+    }
+    const gateOf = (b) => settingsGate(url.searchParams.get('sessionId') ?? b?.sessionId)
+
     if (path === '/api/mc/accounts' && req.method === 'GET') {
+      const gate = await gateOf()
+      if (!gate.ok) return sendJson(res, 400, { ok: false, error: gate.error })
       return ok({
         defaultAccount: accounts.resolve()?.innerID ?? null,
         authServers: accounts.listAuthServers(),
@@ -731,6 +776,8 @@ export function apply(ctx, config) {
       })
     }
     if (path === '/api/mc/accounts' && req.method === 'POST') {
+      const gate = await gateOf(body)
+      if (!gate.ok) return sendJson(res, 400, { ok: false, error: gate.error })
       // 第三方账户：允许**顺手把认证服务器记住**——前端「新建第三方账户」就是"先填服务器、再填账号密码"，
       // 只给一个地址，这里负责 resolve-or-create（免得前端要发两次请求、也不怕重复地址）。
       let serverId = body.serverId ? String(body.serverId) : null
@@ -756,14 +803,20 @@ export function apply(ctx, config) {
       return ok({ account: accounts.view(accounts.get(acc.innerID)) })
     }
     if (path === '/api/mc/accounts' && req.method === 'PATCH') {
+      const gate = await gateOf(body)
+      if (!gate.ok) return sendJson(res, 400, { ok: false, error: gate.error })
       const patch = { ...body }
       delete patch.innerID
       return ok({ account: accounts.update(String(body.innerID ?? ''), patch) })
     }
     if (path === '/api/mc/accounts' && req.method === 'DELETE') {
+      const gate = await gateOf(body)
+      if (!gate.ok) return sendJson(res, 400, { ok: false, error: gate.error })
       return ok(await accounts.remove(String(body.innerID ?? '')))
     }
     if (path === '/api/mc/accounts/refresh' && req.method === 'POST') {
+      const gate = await gateOf(body)
+      if (!gate.ok) return sendJson(res, 400, { ok: false, error: gate.error })
       const innerID = String(body.innerID ?? '')
       const resolved = await resolveAuth(innerID)
       if (resolved.auth.mode === 'offline') {
@@ -775,6 +828,8 @@ export function apply(ctx, config) {
       return ok({ account: accounts.view(accounts.get(innerID)) })
     }
     if (path === '/api/mc/authservers' && req.method === 'POST') {
+      const gate = await gateOf(body)
+      if (!gate.ok) return sendJson(res, 400, { ok: false, error: gate.error })
       let url = body.url ? String(body.url) : null
       if (!url && body.card) {
         url = parseAuthlibCard(body.card)
@@ -784,12 +839,18 @@ export function apply(ctx, config) {
       return ok({ server: accounts.addAuthServer({ name: body.name ? String(body.name) : null, url }) })
     }
     if (path === '/api/mc/authservers' && req.method === 'DELETE') {
+      const gate = await gateOf(body)
+      if (!gate.ok) return sendJson(res, 400, { ok: false, error: gate.error })
       return ok(accounts.removeAuthServer(String(body.id ?? '')))
     }
     if (path === '/api/mc/config' && req.method === 'GET') {
+      const gate = await gateOf()
+      if (!gate.ok) return sendJson(res, 400, { ok: false, error: gate.error })
       return ok(configView())
     }
     if (path === '/api/mc/config' && req.method === 'PATCH') {
+      const gate = await gateOf(body)
+      if (!gate.ok) return sendJson(res, 400, { ok: false, error: gate.error })
       for (const k of ['commandWhitelist', 'allowAllCommands', 'injectWhaleCraftAgentsMd', 'injectWorkspaceAgentsMd']) {
         if (body[k] !== undefined) pluginConfig.set(k, body[k])
       }
@@ -797,10 +858,13 @@ export function apply(ctx, config) {
     }
 
     /* ── 提示词 AGENTS.md（「MC设置 → 提示词」页）：读 / 存 / 恢复默认 ──
-     * 🔴 它是**按会话工作区**的（`<工作区>/.whale-craft/AGENTS.md`），所以前端要带 sessionId。 */
+     * 🔴 它是**按会话工作区**的（`<工作区>/.whale-craft/AGENTS.md`），所以前端要带 sessionId。
+     * 🔴 没有选中工作区 → **拒绝**（用户 2026-09-16）；有工作区则顺带把文件备好（点开设置即建）。 */
     if (path === '/api/mc/agents-md') {
+      const gate = await gateOf(body)
+      if (!gate.ok) return sendJson(res, 400, { ok: false, error: gate.error })
       const sessionId = String(body.sessionId ?? url?.searchParams?.get('sessionId') ?? '')
-      const cwd = workspaceOf(safeAgentById(sessionId))
+      const cwd = gate.cwd
       const promptDir = memoryRootFor(cwd)
       const wsPath = join(workspaceRootFor(safeAgentById(sessionId)), 'AGENTS.md')
       if (req.method === 'GET') {
@@ -856,6 +920,7 @@ export function apply(ctx, config) {
       const sessionId = url.searchParams.get('sessionId') ?? ''
       let mcMode = false
       let agent = null
+      let reason = null
       if (sessionId) {
         try {
           agent = ctx.get('agents')?.get?.(sessionId) ?? null
@@ -863,29 +928,35 @@ export function apply(ctx, config) {
         } catch {
           mcMode = mcModeAgentIds.has(sessionId)
         }
+        // 🔴 没选中工作区 = 拒绝 MC 模式（用户 2026-09-16）：前端据此**隐藏「MC设置」入口**
+        if (agent && !workspaceOf(agent) && isMcModeAgent(agent)) { mcMode = false; reason = 'no-workspace' }
+        else if (!agent && noWorkspaceRefused.has(sessionId)) { reason = 'no-workspace' }
       }
       // 诊断：把"判定依据"和"各段实际长度"一并报出来。
       // 2026-09-16 事故的教训：只回一个 false，谁都查不出是 preset 没认出来还是段没注册。
       let diag = null
       if (sessionId) {
         try {
-          const root = memoryRootFor(workspaceOf(agent))
-          const cur = readAgentsMd(root)
+          const cwd = workspaceOf(agent)
+          const root = cwd ? memoryRootFor(cwd) : null
+          const cur = root ? readAgentsMd(root) : { path: null, source: null, text: '' }
           const on = mcMode && pluginConfig.get('injectWhaleCraftAgentsMd') === true
           diag = {
+            reason,
+            workspace: cwd,
             presetId: (agent && lastPresetSeen.get(agent)) ?? null,
             agentFound: Boolean(agent),
             promptsInstalled: Boolean(agent && promptsInstalled.has(agent)),
             serviceReady: Boolean(agentPresetsSvc) || (() => { try { return Boolean(ctx.get('agentPresets')) } catch { return false } })(),
             memoryRoot: root,
-            agentsMd: { path: cur.path, exists: existsSync(cur.path), source: cur.source, bytes: Buffer.byteLength(cur.text) },
+            agentsMd: { path: cur.path, exists: cur.path ? existsSync(cur.path) : false, source: cur.source, bytes: Buffer.byteLength(cur.text) },
             segments: {
-              'memory-index': memoryIndexText(memoryFor(workspaceOf(agent))).length,
+              'memory-index': root ? memoryIndexText(memoryFor(cwd)).length : 0,
               'mode-guidance': mcMode ? MC_MODE_GUIDANCE.length : 0,
               'agents-md': on ? cur.text.length : 0,
             },
           }
-        } catch (e) { diag = { error: String(e.message) } }
+        } catch (e) { diag = { reason, error: String(e.message) } }
       }
       return sendJson(res, 200, { ok: true, sessionId, mcMode, diag })
     }
@@ -2105,25 +2176,34 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 只建一次的工作区骨架。用户 2026-09-16："插件初始化就要检查 `.whale-craft` 是否存在，不存在则建立；
-   * README.md 是否存在，不存在则写入默认值。" —— 不能指望 AI 自己把它长出来，
-   * 尤其「MC设置 → 提示词」页编辑的就是这个文件：**文件必须先在**。
+   * 在**选中工作区**里备好 `.whale-craft/`（缺 README.md / AGENTS.md 就补默认）。
+   *
+   * 🔴 用户 2026-09-16 定的**时机**：**不是**启动时对每个会话建，只在两个时刻建：
+   *    ① **首次发起 MC 模式会话**（`applyMcModePolicy` 跑的时候）
+   *    ② **点开「MC设置」**（那组 /api/mc/* 接口进来的时候）
+   * 🔴 **没有选中工作区就拒绝**（不再退到 `$DSH_HOME` 兜底目录去建）。
+   *
+   * @returns {boolean} 备好了吗（false = 没工作区 / 建失败）
    */
   const seededRoots = new Set()
-  const ensureMemoryRoot = (agent) => {
-    const cwd = workspaceOf(agent)
+  const ensureMemoryRootForCwd = (cwd) => {
+    if (!cwd) return false
     const root = memoryRootFor(cwd)
-    if (seededRoots.has(root)) return
+    if (seededRoots.has(root)) return true
     seededRoots.add(root)
     try {
       if (!existsSync(root)) {
         mkdirSync(root, { recursive: true })
-        logLine(`已建立记忆目录：${root}`)
+        logLine(`已在工作区建立记忆目录：${root}`)
       }
       try { if (memoryFor(cwd).ensureReadme()) logLine(`已写入默认记忆索引：${join(root, 'README.md')}`) } catch (e) { logLine(`写默认索引失败：${e.message}`) }
       if (ensureAgentsMdFile(root)) logLine(`已写入默认行事准则：${agentsMdPath(root)}`)
-    } catch (e) { logLine(`初始化记忆目录失败（${root}）：${e.message}`) }
+      return true
+    } catch (e) { logLine(`初始化记忆目录失败（${root}）：${e.message}`); return false }
   }
+
+  /** 同上，但按 agent 取工作区（活 agent 路径：首次发起 MC 模式会话时用） */
+  const ensureMemoryRoot = (agent) => ensureMemoryRootForCwd(workspaceOf(agent))
 
   /* ─────────── MC 模式：权限隔离 + 专属指导（用户 2026-09-16 要求）───────────
    * 判定"是不是 MC 模式"：`agentPresets.composedPreset(agent.ctx)` 落在配置的
@@ -2245,12 +2325,23 @@ export function apply(ctx, config) {
    * 这里只是"agent 已经不在了 / 拿不到 agentPresets"时的退路。
    */
   const mcModeAgentIds = new Set()
+  /** 因为"没选中工作区"被拒绝进入 MC 模式的会话（`/api/mc/mode` 用它报原因） */
+  const noWorkspaceRefused = new Set()
 
   const applyMcModePolicy = (agent) => {
     if (!agent || mcPolicyApplied.has(agent)) return
     if (!isMcModeAgent(agent)) return
+    // 🔴 用户 2026-09-16："如果没有选中工作区，则拒绝发起 MC 模式会话和设置。"
+    //    没有工作区 → `.whale-craft/`（记忆 + 提示词）无处安放 → 不当成 MC 会话：
+    //    不套隔离、不注入专属提示词、前端也会隐藏「MC设置」入口（/api/mc/mode 会带 reason）。
+    if (!workspaceOf(agent)) {
+      if (agent.id) noWorkspaceRefused.add(String(agent.id))
+      logLine(`拒绝启用 MC 模式：这个会话没有选中工作区（.whale-craft 与提示词要建在工作区里）`)
+      return
+    }
     mcPolicyApplied.add(agent)
     if (agent.id) mcModeAgentIds.add(String(agent.id))
+    ensureMemoryRoot(agent)        // ← 首次发起 MC 模式会话 = 建 `.whale-craft/`（README / AGENTS.md）的时机
 
     // ① 提示词段**不在这里注册** —— 它们在 `installAgentPrompts` 里对每个 agent 无条件注册，
     //    由 `text()` 在装配时判断模式（见那段的注释：2026-09-16 真机事故）。
@@ -2327,7 +2418,8 @@ export function apply(ctx, config) {
     const handlers = []
     const touch = (agent) => {
       if (!agent?.ctx) return
-      try { ensureMemoryRoot(agent) } catch (e) { logLine(`初始化记忆目录失败：${e.message}`) }
+      // ⚠️ 这里**不再**建 `.whale-craft/` —— 建文件只发生在"首次发起 MC 模式会话"
+      //    （applyMcModePolicy 里）和"点开 MC设置"（HTTP 接口里）这两个时机（用户 2026-09-16 定）。
       try { installAgentPrompts(agent) } catch (e) { logLine(`提示词段注册失败：${e.message}`) }
       try { applyMcModePolicy(agent) } catch (e) { logLine(`MC 模式策略失败：${e.message}`) }
     }

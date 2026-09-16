@@ -55,11 +55,14 @@ const MIME_BY_EXT = {
 export class MemoryStore {
   /**
    * @param {string} root 记忆根目录（绝对路径，通常是 <工作区>/.whale-craft）
+   * @param {{create?: boolean}} [opts] `create:false` = **只读**，不在构造时建目录。
+   *   用户 2026-09-16：`.whale-craft/` 不该被"顺手建出来"——建它只发生在
+   *   "首次发起 MC 模式会话"与"点开「MC设置」"这两个时机（见 index.js `ensureMemoryRoot`）。
    */
-  constructor (root) {
+  constructor (root, { create = true } = {}) {
     this.root = resolve(root)
     this._textCache = { text: '', at: 0 }
-    this.ensureRoot()
+    if (create) this.ensureRoot()
   }
 
   ensureRoot () {

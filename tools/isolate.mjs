@@ -108,8 +108,10 @@ if (cmd === 'start') {
     detached: true,
     stdio: ['ignore', out, err],
     windowsHide: true,
-    // 🔴 隔离实例有**自己的**状态目录：配置/账户改动只落副本，绝不碰生产
-    env: { ...process.env, WHALE_CRAFT_STATE_DIR: stateDir },
+    // 🔴 隔离实例有**自己的**状态目录：配置/账户改动只落副本，绝不碰生产。
+    // 🔴 记忆根也钉在副本里：否则"进 MC 模式会话 / 点开 MC设置"会按会话工作区去建 `.whale-craft/`，
+    //    而那些会话的工作区是**生产工作区** → 隔离实例会往生产里写文件。
+    env: { ...process.env, WHALE_CRAFT_STATE_DIR: stateDir, WHALE_CRAFT_MEMORY_DIR: join(stateDir, 'memory') },
   })
   child.unref()
   writeFileSync(PIDFILE, JSON.stringify({ pid: child.pid, port, stateDir, at: new Date().toISOString() }, null, 2))

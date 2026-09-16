@@ -310,6 +310,8 @@ console.log('\n--- 强制停止：UI 路径的真实顺序（停LLM → 退游�
   const tools2 = new Map()
   let route2 = null
   const fakeAgent2 = { id: 'sess-STOP', status: 'running' }
+  // 这第二套 ctx 的 agents 服务要**可替换**：下面的「MC设置」接口测试需要换成"带工作区的会话"
+  let agents2 = { get: () => fakeAgent2 }
   const jobs2 = { list: () => [{ id: 'job-watch' }, { id: 'job-other' }], kill: (id) => side.push(`kill:${id}`) }
   const sc2 = { cancel: ({ sessionId }) => side.push(`cancel:${sessionId}`) }
   const ctx2 = {
@@ -323,7 +325,7 @@ console.log('\n--- 强制停止：UI 路径的真实顺序（停LLM → 退游�
     on: () => () => {},
     get: (k) => (k === 'jobs' ? jobs2
       : k === 'sessionController' ? sc2
-        : k === 'agents' ? { get: () => fakeAgent2 }
+        : k === 'agents' ? agents2
           : undefined),
   }
   mod.apply(ctx2, mod.Config ? mod.Config({}) : {})
@@ -353,10 +355,15 @@ console.log('\n--- 强制停止：UI 路径的真实顺序（停LLM → 退游�
   console.log(`  ${side.join(' → ') === sideWant.join(' → ') ? '✅' : '❌'} 副作用真实顺序 = 先停LLM → 清任务 → 再停LLM：${side.join(' → ')}`)
 
   // ── 「MC设置」HTTP 接口（锁住 E2E 抓到的真 bug：**DELETE 也带 body，必须读**）──
+  // 🔴 2026-09-16：这组接口现在**必须有带工作区的 sessionId**（用户："没有选中工作区就拒绝设置"）。
+  //    造一个带工作区的会话，下面所有设置调用都自动带上它。
+  const apiWs = (await import('node:fs')).mkdtempSync((await import('node:path')).join((await import('node:os')).tmpdir(), 'whale-apiws-'))
+  const apiAgent = { id: 'sess-API', session: { header: { cwd: apiWs } } }
+  agents2 = { get: (id) => (id === 'sess-API' ? apiAgent : undefined) }   // ⚠️ 这是**第二套** ctx 的服务（route2 属于它）
   const callApi = async (method, url, payload) => {
     const rq = new EventEmitter()
     rq.method = method
-    rq.url = url
+    rq.url = url + (url.includes('?') ? '&' : '?') + 'sessionId=sess-API'
     rq.headers = { host: '127.0.0.1:39999' }
     const rs = { writeHead: () => {}, end: (b) => { rs.body = String(b ?? '') } }
     const p = route2.handler(rq, rs)
@@ -365,7 +372,16 @@ console.log('\n--- 强制停止：UI 路径的真实顺序（停LLM → 退游�
     await p
     try { return JSON.parse(rs.body || '{}') } catch { return {} }
   }
+  const noSidApi = await (async () => {
+    const rq = new EventEmitter()
+    rq.method = 'GET'; rq.url = '/api/mc/config'; rq.headers = { host: '127.0.0.1:39999' }
+    const rs = { writeHead: () => {}, end: (b) => { rs.body = String(b ?? '') } }
+    const p = route2.handler(rq, rs); rq.emit('end'); await p
+    try { return JSON.parse(rs.body || '{}') } catch { return {} }
+  })()
+  console.log(`  ${noSidApi.ok === false && /缺少 sessionId/.test(String(noSidApi.error)) ? '✅' : '❌'} 🔴 设置接口不带 sessionId → 拒绝（不猜工作区）`)
   const accApi = await callApi('GET', '/api/mc/accounts')
+  if (!accApi.ok) console.log('    [debug] GET /accounts 返回：', JSON.stringify(accApi).slice(0, 240), '| agents 服务：', typeof fakeCtx.agents?.get, '| apiAgent.cwd =', apiAgent.session.header.cwd)
   console.log(`  ${accApi.ok && accApi.accounts?.some((a) => a.name === 'DeepSeek') && accApi.authServers?.some((s) => s.id === 'littleskin') ? '✅' : '❌'} 设置接口 GET /accounts（默认离线账户 + 内置认证服）`)
   const srvApi = await callApi('POST', '/api/mc/authservers', { card: 'authlib-injector:yggdrasil-server:https%3A%2F%2Fself.example%2Fyggdrasil' })
   const srvDel = await callApi('DELETE', '/api/mc/authservers', { id: srvApi.server?.id })
@@ -788,8 +804,8 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   }
   const fire = (ev, agent) => eventHandlers.filter((h) => h.ev === ev).forEach((h) => h.fn({ agent }))
 
-  const mcAgent = { id: 'sess-MC2', ctx: makeAgentCtx('minecraft') }
-  const plainAgent = { id: 'sess-P2', ctx: makeAgentCtx('standard') }
+  const mcAgent = { id: 'sess-MC2', session: { header: { cwd: mkdtempSync(join(tmpdir(), 'whale-mc-')) } }, ctx: makeAgentCtx('minecraft') }
+  const plainAgent = { id: 'sess-P2', session: { header: { cwd: mkdtempSync(join(tmpdir(), 'whale-pl-')) } }, ctx: makeAgentCtx('standard') }
   fire('agent/created', mcAgent)
   fire('agent/created', plainAgent)
 
@@ -819,7 +835,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
    *    宿主为此专门发 `agent-preset/selected`）。那一刻 isMcModeAgent=false → 直接 return
    *    → **段永远不注册** → 提示词永远不出现，但按钮（前端按本地 preset）照样显示。
    *    这条断言在旧代码上必挂：preset 后选上时必须立刻有内容。 */
-  const lateAgent = { id: 'sess-LATE', ctx: makeAgentCtx(undefined) }
+  const lateAgent = { id: 'sess-LATE', session: { header: { cwd: mkdtempSync(join(tmpdir(), 'whale-late-')) } }, ctx: makeAgentCtx(undefined) }
   fire('agent/created', lateAgent)                                  // 建的时候还没选 mode
   const lateMd = guidanceCtxs.find((x) => x.preset === undefined && x.c?.name === 'whale_craft:agents-md')
   console.log(`  ${lateMd && String(lateMd.c?.text?.() ?? '') === '' ? '✅' : '❌'} preset 未知时就已注册好提示词段（内容为空，不误注入）`)
@@ -864,6 +880,20 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     const afterDelete = String(seedMeta?.c?.text?.() ?? '')
     console.log(`  ${!existsSync(wsAgents) ? '❌' : '✅'} 注入要求还在、文件却没了 → 装配时**重建**了文件`)
     console.log(`  ${/Whale Craft 行事准则/.test(afterDelete) ? '✅' : '❌'} 同时注入默认全文（${afterDelete.length} 字）—— 不允许"要求注入却什么都没有"`)
+
+    // 🔴 用户 2026-09-16 改的**时机**：不是"启动时对每个会话建"，而是
+    //    ① 首次发起 MC 模式会话 ② 点开「MC设置」——**别的时候（比如普通会话）不许建**。
+    const ws2 = mkdtempSync(join(tmpdir(), 'whale-ws2-'))
+    const plainWithWs = { id: 'sess-PLAINWS', session: { header: { cwd: ws2 } }, ctx: makeAgentCtx('standard') }
+    fire('agent/created', plainWithWs)
+    fire('agent/session-start', plainWithWs)
+    console.log(`  ${!existsSync(join(ws2, '.whale-craft')) ? '✅' : '❌'} 🔴 普通会话**不会**被建 .whale-craft/（时机：只在 MC 模式会话/点开设置）`)
+
+    // 🔴 没有选中工作区 → **拒绝发起 MC 模式会话**（不套隔离、不建文件）
+    const noWs = { id: 'sess-NOWS', session: { header: {} }, ctx: makeAgentCtx('minecraft') }
+    const restrictBefore = restrictCalls.length
+    fire('agent/created', noWs)
+    console.log(`  ${restrictCalls.length === restrictBefore ? '✅' : '❌'} 没工作区的 MC 会话**不套权限策略**（拒绝进入 MC 模式）`)
     if (savedMemDir === undefined) delete process.env.WHALE_CRAFT_MEMORY_DIR
     else process.env.WHALE_CRAFT_MEMORY_DIR = savedMemDir
   }
@@ -890,13 +920,58 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   console.log(`  ${modeNoId.mcMode === false ? '✅' : '❌'} /api/mc/mode：没给 sessionId → false（保守，宁可不显示）`)
 
   // agent 服务在场时现场问 agentPresets；**把模式切回普通要立刻变 false**（不残留按钮）
-  fakeCtx.agents = { get: (id) => (id === 'sess-MC2' ? mcAgent : id === 'sess-P2' ? plainAgent : undefined) }
+  fakeCtx.agents = {
+    get: (id) => (id === 'sess-MC2' ? mcAgent
+      : id === 'sess-P2' ? plainAgent
+        : id === 'sess-NOWS' ? noWs
+          : undefined),
+  }
   const liveMc = await callMc('/api/mc/mode?sessionId=sess-MC2')
   presetByCtx.set(mcAgent.ctx, 'standard')
   const afterSwitch = await callMc('/api/mc/mode?sessionId=sess-MC2')
   presetByCtx.set(mcAgent.ctx, 'minecraft')
   console.log(`  ${liveMc.mcMode === true ? '✅' : '❌'} 有 agent 服务时现场判定（不是只看历史记录）`)
   console.log(`  ${afterSwitch.mcMode === false ? '✅' : '❌'} 🔴 模式切成普通后立刻变 false（按钮不会残留）`)
+
+  /* ⑨ 🔴 用户 2026-09-16："没有选中工作区，则拒绝发起 MC 模式会话**和设置**"。
+   *    · 模式接口：MC 模式但没工作区 → mcMode=false + diag.reason='no-workspace'（前端据此隐藏入口）
+   *    · 设置接口：没有 sessionId / 会话没有工作区 → **400 拒绝**
+   *    · 有工作区 → 放行，并且**在这个时机**把该工作区的 `.whale-craft/` 备好（"点开设置即建"）。 */
+  const modeNoWs = await callMc('/api/mc/mode?sessionId=sess-NOWS')
+  console.log(`  ${modeNoWs.mcMode === false && modeNoWs.diag?.reason === 'no-workspace' ? '✅' : '❌'} 🔴 没工作区的 MC 会话：mcMode=false + reason=no-workspace（前端据此隐藏「MC设置」）`)
+  console.log(`  ${modeNoWs.diag?.workspace === null || modeNoWs.diag?.workspace === undefined ? '✅' : '❌'} 诊断里明确报"没有工作区"（${JSON.stringify(modeNoWs.diag?.workspace ?? null)}）`)
+
+  const callMc2 = async (method, url, body) => {
+    const { EventEmitter } = await import('node:events')
+    const rq = new EventEmitter()
+    rq.method = method
+    rq.url = url
+    rq.headers = { host: '127.0.0.1:39999' }
+    const rs = { writeHead: (code) => { rs.statusCode = code }, end: (b) => { rs.body = String(b ?? '') } }
+    const p = routeMc.handler(rq, rs)
+    if (body !== undefined) rq.emit('data', Buffer.from(JSON.stringify(body)))
+    rq.emit('end')
+    await p
+    try { return { status: rs.statusCode ?? 200, json: JSON.parse(rs.body || '{}') } } catch { return { status: 0, json: {} } }
+  }
+  const noSid = await callMc2('GET', '/api/mc/config')
+  console.log(`  ${noSid.json?.ok === false && /缺少 sessionId/.test(String(noSid.json?.error)) ? '✅' : '❌'} 🔴 设置接口没带 sessionId → 拒绝（${String(noSid.json?.error ?? '').slice(0, 24)}…）`)
+  const noWsAgent2 = { id: 'sess-NOWS', session: { header: {} }, ctx: makeAgentCtx('minecraft') }   // 有 MC preset、没工作区
+  fakeCtx.agents = { get: (id) => (id === 'sess-NOWS' ? noWsAgent2 : undefined) }
+  const noWsCfg = await callMc2('GET', '/api/mc/config?sessionId=sess-NOWS')
+  console.log(`  ${noWsCfg.json?.ok === false && /没有选中工作区/.test(String(noWsCfg.json?.error)) ? '✅' : '❌'} 🔴 会话没工作区 → 设置接口拒绝：${String(noWsCfg.json?.error ?? '').slice(0, 28)}…`)
+
+  // 反面：有工作区 → 放行，并且**在这个时机**把 `.whale-craft/` 备好（"点开设置即建"）
+  const memDirBefore = process.env.WHALE_CRAFT_MEMORY_DIR
+  delete process.env.WHALE_CRAFT_MEMORY_DIR          // 让记忆根跟着会话工作区走（真机就是这么配的）
+  const ws3 = (await import('node:fs')).mkdtempSync(join((await import('node:os')).tmpdir(), 'whale-ws3-'))
+  const wsAgent = { id: 'sess-WSOK', session: { header: { cwd: ws3 } }, ctx: makeAgentCtx('minecraft') }
+  fakeCtx.agents = { get: (id) => (id === 'sess-WSOK' ? wsAgent : id === 'sess-NOWS' ? noWsAgent2 : undefined) }
+  const okCfg = await callMc2('GET', '/api/mc/config?sessionId=sess-WSOK')
+  console.log(`  ${okCfg.json?.ok === true ? '✅' : '❌'} 有工作区 → 设置接口放行`)
+  console.log(`  ${(await import('node:fs')).existsSync((await import('node:path')).join(ws3, '.whale-craft', 'AGENTS.md')) ? '✅' : '❌'} 🔴 **点开设置**这个时机就把该工作区的 .whale-craft/AGENTS.md 备好了`)
+  if (memDirBefore === undefined) delete process.env.WHALE_CRAFT_MEMORY_DIR
+  else process.env.WHALE_CRAFT_MEMORY_DIR = memDirBefore
 }
 
 // ── MC账户体系（元数据 / 凭据分离；LLM 只能看基本信息）──
@@ -1597,7 +1672,12 @@ console.log('\n--- 客户端 bundle（client.js 静态检查）---')
     ['MC设置按会话 preset 本地门控（useSessions）', /useSessions/.test(code) && /projectionValues\?\.agentPreset/.test(code)],
     ['新会话页入口走正经插槽（conversation.input.right）', /conversation\.input\.right/.test(code) && /whale_craft-mc-settings-hero/.test(code)],
     ['两个入口按 blank 互斥（不会同时挂两个模态框）', /useMcSettingsGate\(props, false\)/.test(code) && /useMcSettingsGate\(props, true\)/.test(code) && /s\.blank === true/.test(code)],
-    ['本地 preset 是主判据（不必等网络）', /known\) return blank === wantBlank && mcPresetIds\.includes\(preset\)/.test(code)],
+    ['本地 preset 是主判据（不必等网络）', /const localShow = known && blank === wantBlank && mcPresetIds\.includes\(preset\)/.test(code) && /if \(localShow\) return !deniedNoWorkspace/.test(code)],
+    // 🔴 2026-09-16 用户："没有选中工作区，则拒绝发起 MC 模式会话和设置。"
+    //    前端：只有服务端**明确**说 no-workspace 才隐藏入口（请求失败/其它 false 一律维持本地判断
+    //    ——"一次性请求失败 = 入口永久消失"那个坑不能再踩）
+    ['没工作区才隐藏入口（服务端明确 no-workspace；失败不隐藏）', /diag\?\.reason === 'no-workspace'/.test(code) && /catch\(\(\) => \{ if \(alive\) setDeniedNoWorkspace\(false\) \}\)/.test(code)],
+    ['设置接口全都带上 sessionId（服务端要用它定位工作区）', /const withSid = \(p\) =>/.test(code) && /apiGet\(withSid\('\/api\/mc\/accounts'\)\)/.test(code) && /apiPatch\(withSid\('\/api\/mc\/config'\)/.test(code) && !/api(Get|Patch|Post|Delete)\('\/api\/mc\/(accounts|config|authservers)'/.test(code)],
     ['服务端兜底只给标题条且带重试（不是一次性请求）', /const needServer = !known && !wantBlank/.test(code) && /\+\+tries < 20/.test(code) && /setTimeout\(tick, 3000\)/.test(code)],
     ['名单来自 /api/mc/config 的 mcModePresets（带默认值兜底）', /mcModePresets/.test(code) && /MC_PRESETS_FALLBACK/.test(code)],
     ['判不了就不渲染（return null）', /if \(!show\) return null/.test(code)],

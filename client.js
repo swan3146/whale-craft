@@ -487,7 +487,28 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         return () => { alive = false; if (timer) clearTimeout(timer) }
       }, [needServer, sessionId])
 
-      if (known) return blank === wantBlank && mcPresetIds.includes(preset)
+      const localShow = known && blank === wantBlank && mcPresetIds.includes(preset)
+
+      /**
+       * 🔴 2026-09-16 用户："没有选中工作区，则拒绝发起 MC 模式会话和设置。"
+       * 服务端 `/api/mc/mode` 对"MC 模式但没工作区"会明确回 `{mcMode:false, diag:{reason:'no-workspace'}}`
+       * —— 这时**本地 preset 再像 MC 模式也不显示入口**。
+       * ⚠️ 只有"服务端**明确因为没工作区**而拒绝"才隐藏：请求失败、或别的 false 一律维持本地判断
+       *    （一次性请求失败 = 入口永久消失，这个坑 2026-09-16 刚踩过）。
+       */
+      const [deniedNoWorkspace, setDeniedNoWorkspace] = React.useState(false)
+      React.useEffect(() => {
+        if (!localShow || !sessionId) { setDeniedNoWorkspace(false); return undefined }
+        let alive = true
+        fetch('/api/mc/mode?sessionId=' + encodeURIComponent(sessionId), { headers: { accept: 'application/json' } })
+          .then((r) => (r.ok ? r.json() : null))
+          .then((j) => { if (alive) setDeniedNoWorkspace(j?.mcMode === false && j?.diag?.reason === 'no-workspace') })
+          .catch(() => { if (alive) setDeniedNoWorkspace(false) })
+        return () => { alive = false }
+      }, [localShow, sessionId])
+
+      if (localShow) return !deniedNoWorkspace
+      if (known) return false
       return !wantBlank && serverMode === true
     }
 
@@ -1114,6 +1135,12 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const agentsMdPath = sessionId
         ? '/api/mc/agents-md?sessionId=' + encodeURIComponent(sessionId)
         : '/api/mc/agents-md'
+      /**
+       * 「MC设置」这组接口**都要带 sessionId**：服务端拿它定位**工作区**
+       * （没有选中工作区就 400 拒绝，见 index.js `settingsGate`）。
+       * 统一走 query（GET/POST/PATCH/DELETE 服务端都认），省得每个 body 都塞一遍。
+       */
+      const withSid = (p) => p + (p.includes('?') ? '&' : '?') + 'sessionId=' + encodeURIComponent(sessionId ?? '')
       const [open, setOpen] = React.useState(false)
       const [tab, setTab] = React.useState('accounts')
       const [accounts, setAccounts] = React.useState([])
@@ -1152,12 +1179,12 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         setLoading(true)
         setLoadError('')
         return Promise.all([
-          apiGet('/api/mc/accounts').then((a) => {
+          apiGet(withSid('/api/mc/accounts')).then((a) => {
             setAccounts(Array.isArray(a.accounts) ? a.accounts : [])
             setServers(Array.isArray(a.authServers) ? a.authServers : [])
             setDefaultAccount(a.defaultAccount ?? null)
           }),
-          apiGet('/api/mc/config').then((c) => {
+          apiGet(withSid('/api/mc/config')).then((c) => {
             setWlText(whitelistToText(c.commandWhitelist))
             setAllowAll(c.allowAllCommands === true)
             setInjectWc(c.injectWhaleCraftAgentsMd !== false)
@@ -1211,36 +1238,36 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       }, [load])
 
       const patchAccount = React.useCallback((innerID, patch, key) =>
-        run(key, () => apiPatch('/api/mc/accounts', { innerID, ...patch }), '账户已更新'), [run])
+        run(key, () => apiPatch(withSid('/api/mc/accounts'), { innerID, ...patch }), '账户已更新'), [run])
 
       const refreshAccount = React.useCallback((acc) =>
         run('row:' + acc.innerID + ':refresh',
-          () => apiPost('/api/mc/accounts/refresh', { innerID: acc.innerID }),
+          () => apiPost(withSid('/api/mc/accounts/refresh'), { innerID: acc.innerID }),
           `「${acc.name}」刷新完成`), [run])
 
       const deleteAccount = React.useCallback((acc) =>
         run('row:' + acc.innerID + ':delete',
-          () => apiDelete('/api/mc/accounts', { innerID: acc.innerID }),
+          () => apiDelete(withSid('/api/mc/accounts'), { innerID: acc.innerID }),
           `已删除「${acc.name}」`), [run])
 
       const createAccount = React.useCallback((body, key) =>
-        run(key, () => apiPost('/api/mc/accounts', body), '账户已新建'), [run])
+        run(key, () => apiPost(withSid('/api/mc/accounts'), body), '账户已新建'), [run])
 
       const addServer = React.useCallback((body) =>
-        run('server:add', () => apiPost('/api/mc/authservers', body), '认证服务器已添加'), [run])
+        run('server:add', () => apiPost(withSid('/api/mc/authservers'), body), '认证服务器已添加'), [run])
 
       // 拖放来的卡片：原样把文本交给后端解析（前端不解析、不落任何副本）。
       // ⚠️ 要把**新加的服务器**回传给调用方（「新建第三方账户」拖完要自动选中 + 填进输入框）。
       const addServerCard = React.useCallback(async (card) => {
         let created = null
         await run('server:card',
-          () => apiPost('/api/mc/authservers', { card }).then((r) => { created = r?.server ?? null; return r }),
+          () => apiPost(withSid('/api/mc/authservers'), { card }).then((r) => { created = r?.server ?? null; return r }),
           '已从卡片解析并添加认证服务器')
         return created
       }, [run])
 
       const removeServer = React.useCallback((srv) =>
-        run('server:' + srv.id, () => apiDelete('/api/mc/authservers', { id: srv.id }), `已移除「${srv.name}」`), [run])
+        run('server:' + srv.id, () => apiDelete(withSid('/api/mc/authservers'), { id: srv.id }), `已移除「${srv.name}」`), [run])
 
       /* ── 页 2：白名单 ──
        * 「允许所有指令」开关**一拨就存**（用户 2026-09-16 定），失败把开关拨回去；
@@ -1250,13 +1277,13 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         const want = next === true
         if (want === prev) return Promise.resolve(true)
         setAllowAll(want)                                    // 乐观更新，拨动立刻有反应
-        return run('cfg:allowAll', () => apiPatch('/api/mc/config', { allowAllCommands: want }),
+        return run('cfg:allowAll', () => apiPatch(withSid('/api/mc/config'), { allowAllCommands: want }),
           want ? '已打开：允许所有指令' : '已关闭：只放行白名单')
           .then((ok) => { if (!ok) setAllowAll(prev); return ok })   // 失败回滚
       }, [run, allowAll])
 
       const saveWhitelist = React.useCallback(() =>
-        run('wl:save', () => apiPatch('/api/mc/config', {
+        run('wl:save', () => apiPatch(withSid('/api/mc/config'), {
           commandWhitelist: textToWhitelist(wlText),
         }), '指令白名单已保存'), [run, wlText])
 
@@ -1268,11 +1295,11 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         run('md:reset', () => apiDelete('/api/mc/agents-md', { sessionId }), '已恢复默认'), [run, sessionId])
 
       const toggleInjectWc = React.useCallback((next) =>
-        run('cfg:wc', () => apiPatch('/api/mc/config', { injectWhaleCraftAgentsMd: next === true }),
+        run('cfg:wc', () => apiPatch(withSid('/api/mc/config'), { injectWhaleCraftAgentsMd: next === true }),
           next ? '已开启提示词注入' : '已关闭提示词注入'), [run])
 
       const toggleInjectWs = React.useCallback((next) =>
-        run('cfg:ws', () => apiPatch('/api/mc/config', { injectWorkspaceAgentsMd: next === true }),
+        run('cfg:ws', () => apiPatch(withSid('/api/mc/config'), { injectWorkspaceAgentsMd: next === true }),
           next ? '已开启工作区 AGENTS.md 注入' : '已关闭工作区 AGENTS.md 注入'), [run])
 
       if (!open) return null
