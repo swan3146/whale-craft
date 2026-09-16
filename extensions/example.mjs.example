@@ -1,0 +1,40 @@
+// -*- coding: utf-8 -*-
+/**
+ * 扩展示例（**把文件名后缀改成 .mjs 就会被自动加载**）
+ * ============================================================================
+ * 演示三件事：
+ *   1. 怎么用 asTool 注册一个新工具
+ *   2. 怎么拿到当前会话的 bot
+ *   3. 怎么用 withTimeout 保护可能挂住的调用
+ * ============================================================================
+ */
+import { withTimeout } from '../src/core.mjs'
+
+export const name = 'example'
+
+export async function apply ({ ctx, asTool, getSession, logLine }) {
+  logLine('扩展示例已加载（这行只在加载时出现一次）')
+
+  ctx.tools.register(asTool({
+    name: 'mc_example_ping',
+    description: '扩展示例：报到一下，顺便看看我在不在线。',
+    parameters: {
+      note: { type: 'string', description: '随便说点什么' },
+    },
+    output: {
+      schema: { type: 'object', properties: {}, additionalProperties: true },
+      render: (args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    async execute (args, exec) {
+      const sess = getSession(exec)
+      return {
+        pong: true,
+        note: args?.note ?? null,
+        online: sess.bot.online,
+        sub: sess.bot.sub,
+        // 如果用到了可能挂住的 mineflayer 调用，记得套超时：
+        // await withTimeout(bot.someRiskyCall(), 5000, '说明')
+      }
+    },
+  }))
+}

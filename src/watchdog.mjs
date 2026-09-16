@@ -1,0 +1,561 @@
+// -*- coding: utf-8 -*-
+/**
+ * whale_craft / watchdog.mjs —— 事件看门狗（v2，2026-09-15 体系化重构）
+ * ============================================================================
+ * 用户 2026-09-15 的要求，逐条对应到实现：
+ *
+ *  · "从进游戏到离开前保持运行，进服自动打开、退服自动关闭，退服提醒 AI"
+ *      → arm() / disarm()，由 mc_connect / mc_disconnect 自动调用；disarm 默认通知 AI。
+ *        job 存活期 = 整局游戏（不再是"醒来一次就结算"）。
+ *
+ *  · "高度可配置，有默认配置，AI 调用工具修改"
+ *      → WATCH_DEFAULTS + updateConfig(patch)，经 mc_config 工具读写。
+ *
+ *  · "受击/位置被动移动/捡到物品/死亡/被传送 是否唤醒"
+ *      → wakeOn 矩阵，逐项开关（默认值见 WATCH_DEFAULTS，附理由）。
+ *
+ *  · "玩家提到什么唤醒（不硬编码）"
+ *      → mentionPatterns 是**配置项**，AI 可用 mc_config 增删（学到新外号就记下来）。
+ *
+ *  · "唤醒后短时间内再发话算同话题，继续唤醒"
+ *      → topicWindowSec：唤醒后这段时间内的发言按"延续话题"处理，直接再叫醒。
+ *
+ *  · "全服才两三个人，重视每个对话 / 说话时离得近算在对我说话"
+ *      → wakeOn.nearbySpeech + nearRadius：近距说话不需要叫法。
+ *
+ *  · "可配置的心跳"
+ *      → wakeOn.heartbeat + heartbeatSec。
+ *
+ *  · "被唤醒后要判断是否静观其变；玩家没反应超时后也要反应"
+ *      → observeWindowMs：首次命中后先攒一小段（把连珠炮合并成一次唤醒，
+ *        避免一句一醒烧 token）；followUpAfterSec：等不到下文再补一次提醒。
+ *
+ *  · "LLM 正在运行时应当成为中断管理器/事件记录器，记录改变，
+ *     并在 LLM 合适时插话注入提示词，并暴露读取事件接口"
+ *      → 运行中**不**打断，改为在下一步边界插话；事件同时留档在看门狗 log
+ *        （mc_watch{action:'log'} 读）与 sess.events（mc_events 读）。
+ *
+ * 设计要点（2026-09-15 定稿，用户明确要求）：
+ *
+ *   ① **不用 job 结算来唤醒**——结算是一次性的，没法"在运行中插话"。
+ *   ② **不用 followup 模拟用户发言**。`agent.followup()` 的宿主文档是
+ *      "an ordinary follow-up turn … the sole ordinary message of its own turn"，
+ *      即往对话里插一条**用户消息**；走 `sessionController.prompt({mode:'queue'})`
+ *      效果一样（commands.ts 把 source 写死成 `{kind:'user'}`）。用户不要这个。
+ *   ③ 改为 `agent.steer(plugin 来源的 message)`：
+ *      · 文档："**An idle driver starts a turn**; a running driver consumes it at
+ *        its next step boundary" —— **空闲起一轮 = 唤醒**，运行中下一步插话，两用都对；
+ *      · `source: {kind:'plugin', form:'notice'}` → 宿主渲染成**折叠的一行摘要**，
+ *        不是用户发言。这就是"提示词注入"。
+ *   ④ 仍然是单脑——注入目标始终是**同一个** session。
+ * ============================================================================
+ */
+
+import { createRequire } from 'node:module'
+
+/** 默认配置。括号里是"为什么默认这样"。 */
+export const WATCH_DEFAULTS = {  /** 进服自动挂载（用户要求：进游戏自动打开） */
+  autoArm: true,
+  /** 退服时是否提醒 AI（用户要求：退出游戏会提醒 AI） */
+  notifyOnDisarm: true,
+
+  /** 唤醒条件矩阵。true = 这类事件叫醒我 */
+  wakeOn: {
+    mention: true,        // 命中叫法 —— 主通道
+    nearbySpeech: true,   // 近距说话（无需叫法）—— 全服才两三个人，身边说话基本就是在跟我说话
+    damage: true,         // 受击/低血 —— 要自卫/逃跑，不能装死
+    death: true,          // 死亡 —— 必须知道，要复活/重连
+    teleport: true,       // 位置瞬移 —— 多半是有人在动我
+    pushed: false,        // 被推/水流 —— 太频繁，默认只记事件
+    itemPickup: false,    // 捡到物品 —— 噪音最大，默认只记事件
+    playerJoin: false,    // 有人上线
+    playerLeave: false,   // 有人下线
+    heartbeat: false,     // 心跳（防睡死；开了要配 heartbeatSec）
+  },
+
+  /** 近距说话判定半径（格）。说话者在这个距离内 → 视为对我说话，不需要叫法 */
+  nearRadius: 16,
+
+  /** 心跳间隔（秒）；wakeOn.heartbeat 打开才生效 */
+  heartbeatSec: 300,
+
+  /** 观察窗口（毫秒）：首次命中后先攒这么久，把连珠炮合并成一次唤醒 */
+  observeWindowMs: 2000,
+
+  /** 唤醒后这段时间（秒）内的发言算"同话题延续"，直接再叫醒 */
+  topicWindowSec: 120,
+
+  /** 叫醒后等不到下文的补提醒（秒）；0 = 关闭 */
+  followUpAfterSec: 45,
+
+  /** 限流：每分钟最多叫醒几次（防公屏刷屏烧 token） */
+  maxWakePerMinute: 6,
+
+  /**
+   * 叫法（正则片段，大小写不敏感）。**这是配置不是代码**——AI 可以用 mc_config
+   * 增删（例如玩家给它起了外号，它记下来）。
+   */
+  mentionPatterns: [
+    'deepseek', 'deep\\s*seek', '\\bds\\b', '\\bdsh\\b', '\\bai\\b', 'agent',
+    '机器人', '麦块', 'bot_name', '昵称',
+  ],
+}
+
+/** 深拷贝（配置是嵌套对象，不能共享引用） */
+const clone = (v) => JSON.parse(JSON.stringify(v))
+/**
+ * 构造注入用的 message（走宿主同一条路：`@deepseek-ai/dsh-llm` 的 `createUserMessage`）。
+ *
+ * 关键在于 `source`：宿主要求 `ContextFormed`，用 `{kind:'plugin', plugin, form:'notice', summary}`
+ * 会被渲染成**折叠的一行摘要**（"One-line account of what happened, shown without expanding
+ * the row"），而**不是**用户发言 —— 这正是用户要的"提示词注入而非模拟用户发消息"。
+ *
+ * 解析不到（换宿主版本等）就置 null，注入时自动退到 sessionController.prompt 兜底。
+ */
+let createUserMessage = null
+try {
+  const req = createRequire(import.meta.url)
+  const mod = req('@deepseek-ai/dsh-llm')
+  createUserMessage = typeof mod?.createUserMessage === 'function' ? mod.createUserMessage : null
+} catch { createUserMessage = null }
+
+/** 事件类型 → 中文标签（写进给 AI 的消息里） */
+const LABEL = {
+  mention: '有人喊我',
+  nearbySpeech: '身边有人说话',
+  damage: '我受到攻击/低血',
+  death: '我死了',
+  teleport: '我被传送了',
+  pushed: '我被推动了',
+  itemPickup: '我捡到东西',
+  playerJoin: '有人上线',
+  playerLeave: '有人下线',
+  heartbeat: '心跳',
+}
+
+export class Watchdog {
+  /**
+   * @param {object} o
+   * @param {object} o.ctx    宿主 ctx（要 jobs / sessionController / logger）
+   * @param {object} o.sess   McSession（要 bot / events）
+   * @param {object} o.agent  当前会话的 agent（注入消息用）
+   * @param {Function} o.onFire 事件回调钩子（用于同步到 sess.events）
+   */
+  constructor ({ ctx, sess, agent, promptSignal = null }) {
+    this.ctx = ctx
+    this.sess = sess
+    this.agent = agent
+    /**
+     * 注入用的 AbortSignal。
+     *
+     * 🔴 `sessionController.prompt` 是 **@Remote 方法**，签名 `(request, signal)` ——
+     *    进程内直接调也**必须传 signal**，因为它第一行就是 `signal.throwIfAborted()`
+     *    （`api/session-controller/src/index.ts:346`）。不传 → `undefined.throwIfAborted()`
+     *    → "Cannot read properties of undefined (reading 'throwIfAborted')"。
+     *    而这条注入路径是**空闲时唯一的叫醒通道**——一炸就等于永远叫不醒
+     *    （2026-09-15 真机事故：喊我没反应）。
+     */
+    this.promptSignal = promptSignal ?? new AbortController().signal
+    this.config = clone(WATCH_DEFAULTS)
+    this.config.mentionPatterns = [...WATCH_DEFAULTS.mentionPatterns]
+
+    this.jobId = null
+    this.armed = false
+    this.startedAt = 0
+    this.tickTimer = null
+
+    /** 待处理的命中事件（观察窗口内累积） */
+    this.pending = []
+    this.pendingSince = 0
+    /** 最近一次唤醒 */
+    this.lastWakeAt = 0
+    this.lastWakeKind = null
+    /** 唤醒时间戳队列（限流用） */
+    this.wakeTimes = []
+    /** 累计统计 */
+    this.stats = { fired: 0, injected: 0, dropped: 0, suppressed: 0 }
+    /** 事件留档（readOutput 与 mc_events 读） */
+    this.log = []
+    this.maxLog = 200
+
+    /** 绑定的监听器（disarm 时摘掉） */
+    this._listeners = []
+  }
+
+  /* ─────────────── 配置 ─────────────── */
+
+  /** 浅合并补丁；wakeOn / mentionPatterns 单独处理 */
+  updateConfig (patch = {}) {
+    for (const [k, v] of Object.entries(patch)) {
+      if (k === 'wakeOn' && v && typeof v === 'object') {
+        this.config.wakeOn = { ...this.config.wakeOn, ...v }
+      } else if (k === 'mentionPatterns') {
+        if (Array.isArray(v)) this.config.mentionPatterns = [...v]
+      } else if (k in WATCH_DEFAULTS) {
+        this.config[k] = v
+      } else {
+        throw new Error(`未知配置项：${k}（可用：${Object.keys(WATCH_DEFAULTS).join(', ')}）`)
+      }
+    }
+    return this.config
+  }
+
+  status () {
+    return {
+      armed: this.armed,
+      jobId: this.jobId,
+      startedAt: this.startedAt || null,
+      uptimeSec: this.startedAt ? Math.round((Date.now() - this.startedAt) / 1000) : 0,
+      pending: this.pending.length,
+      lastWakeAt: this.lastWakeAt || null,
+      lastWakeKind: this.lastWakeKind,
+      stats: { ...this.stats },
+      config: clone(this.config),
+    }
+  }
+
+  /* ─────────────── 叫法判定 ─────────────── */
+
+  calledBy (text) {
+    const s = String(text ?? '')
+    return this.config.mentionPatterns.filter((p) => {
+      try { return new RegExp(`(?:${p})`, 'i').test(s) } catch { return false }
+    })
+  }
+
+  /** 说话者是否在近距范围内（拿不到位置时保守返回 false） */
+  #isNearby (who) {
+    try {
+      const b = this.sess.bot.bot
+      const me = b?.entity?.position
+      const them = b?.players?.[who]?.entity?.position
+      if (!me || !them) return false
+      return Math.hypot(me.x - them.x, me.y - them.y, me.z - them.z) <= this.config.nearRadius
+    } catch { return false }
+  }
+
+  /* ─────────────── 挂载 / 卸载 ─────────────── */
+
+  arm () {
+    if (this.armed) return this.status()
+    this.armed = true
+    this.startedAt = Date.now()
+
+    this.#bind()
+    this.#startJob()
+    this.tickTimer = setInterval(() => this.#tick(), 1000)
+    this.tickTimer.unref?.()
+    this.#record('lifecycle', `看门狗已挂载（${this.config.wakeOn.heartbeat ? `心跳 ${this.config.heartbeatSec}s` : '无心跳'}）`)
+    return this.status()
+  }
+
+  /**
+   * 卸载看门狗。
+   * @param {string} reason
+   * @param {{notify?:boolean, fromJob?:boolean}} [opts]
+   *   notify=true 时在对话里提醒 AI（退服提醒）；
+   *   fromJob=true 表示这次是宿主 job 被 kill 触发的，**不要**再回头去 kill 那个 job
+   *   （否则自我递归，而且 job 会卡在 stopping 永远不结算）。
+   */
+  disarm (reason = '主动关闭', { notify = false, fromJob = false } = {}) {
+    if (!this.armed) return { alreadyOff: true, ...this.status() }
+    const jobId = this.jobId
+    this.#teardown(reason)
+
+    // 停 job（若宿主没有 jobs、或本次就是 job 触发的，跳过）
+    if (jobId && !fromJob) {
+      try { this.ctx.get('jobs')?.kill(jobId, this.agent, reason) } catch {}
+    }
+    // 🔴 必须结算 job 的 done —— 否则 job 永远停在 'stopping'，
+    //    job_list 里挂着不动、job_kill 永远"请求中"（曾经的真 bug：_resolveJob 存了从没调用）
+    if (fromJob) this.#settleJob(reason)
+
+    if (notify && this.config.notifyOnDisarm) {
+      this.#inject(`【看门狗已关闭｜${reason}】你已经不在 Minecraft 里了，事件监听停止。`
+        + '如需继续请用 mc_connect 重新进服（进服后看门狗会自动挂上）。', 'lifecycle')
+    }
+    return { ...this.status(), reason }
+  }
+
+  /** 内部拆除：清定时器、摘监听、清待处理。幂等。 */
+  #teardown (reason) {
+    if (!this.armed) return
+    this.armed = false
+    if (this.tickTimer) { clearInterval(this.tickTimer); this.tickTimer = null }
+    this.#unbind()
+    this.pending = []
+    this.pendingSince = 0
+    this.startedAt = 0
+    this.#record('lifecycle', `看门狗已卸载：${reason}`)
+  }
+
+  /** 结算 job 的 done（只能结算一次） */
+  #settleJob (detail, status = 'killed') {
+    const resolve = this._resolveJob
+    this._resolveJob = null
+    this.jobId = null
+    if (typeof resolve !== 'function') return
+    try {
+      resolve({ status, detail: detail ?? 'killed', output: this.log.slice(-30).map((e) => e.text).join('\n') })
+    } catch {}
+  }
+
+  #startJob () {
+    const jobs = this.ctx.get('jobs')
+    if (!jobs) {
+      this.#record('lifecycle', '宿主没有 jobs 服务：看门狗以"无 job"模式运行（仍能唤醒，但 job_list 看不到）')
+      return
+    }
+    const self = this
+    try {
+      this.jobId = jobs.start({
+        kind: 'mc-watch',
+        label: `MC 看门狗（整局存活）`,
+        owner: this.agent,
+        run: () => ({
+          // 宿主 job_kill → 这里。走 fromJob:true：拆除但**不回头 kill 自己**，
+          // 并结算 done（否则 job 卡在 stopping）。
+          cancel: (r) => { self.disarm(r ? `被取消（${r}）` : '被取消', { fromJob: true }) },
+          done: new Promise((resolve) => { self._resolveJob = resolve }),
+          readOutput: () => {
+            const text = self.log.slice(-30).map((e) => `[${new Date(e.at).toISOString().slice(11, 19)}] (${e.kind}) ${e.text}`).join('\n')
+            return text || '（暂无事件）'
+          },
+        }),
+      })
+    } catch (e) {
+      this.#record('lifecycle', `挂 job 失败（降级为无 job 模式）：${e.message}`)
+      this.jobId = null
+    }
+  }
+
+  /* ─────────────── 事件绑定 ─────────────── */
+
+  #bind () {
+    const bot = this.sess.bot
+    const on = (evt, fn) => { bot.on(evt, fn); this._listeners.push([evt, fn]) }
+
+    on('chat', ({ who, text }) => {
+      const called = this.calledBy(text)
+      const near = this.#isNearby(who)
+      // 同话题延续：唤醒后 topicWindowSec 内的发言直接算延续
+      const topical = this.lastWakeAt > 0 && (Date.now() - this.lastWakeAt) < this.config.topicWindowSec * 1000
+      const why = []
+      if (called.length && this.config.wakeOn.mention) why.push('mention')
+      if (near && this.config.wakeOn.nearbySpeech) why.push('nearbySpeech')
+      if (!why.length && topical) why.push('mention')          // 延续话题
+      this.#fire(why, {
+        kind: 'chat',
+        text: `<${who}> ${text}`,
+        who,
+        calledBy: called,
+        near,
+        topical,
+      })
+    })
+
+    on('damage', (e) => {
+      if (!this.config.wakeOn.damage) return
+      this.#fire(['damage'], { kind: 'damage', text: `血量降到 ${e.health}` })
+    })
+    on('death', () => {
+      if (!this.config.wakeOn.death) return
+      this.#fire(['death'], { kind: 'death', text: '我死了' })
+    })
+    on('teleport', (e) => {
+      if (!this.config.wakeOn.teleport) return
+      this.#fire(['teleport'], { kind: 'teleport', text: `位置瞬移 ${e.distance} 格：${JSON.stringify(e.from)} → ${JSON.stringify(e.to)}` })
+    })
+    on('pushed', (e) => {
+      if (!this.config.wakeOn.pushed) return
+      this.#fire(['pushed'], { kind: 'pushed', text: `被动移动 ${e.distance} 格` })
+    })
+    on('pickup', (e) => {
+      if (!this.config.wakeOn.itemPickup) return
+      this.#fire(['itemPickup'], { kind: 'pickup', text: `捡到 ${e.items.join(', ')}` })
+    })
+    on('playerJoin', (e) => {
+      if (!this.config.wakeOn.playerJoin) return
+      this.#fire(['playerJoin'], { kind: 'playerJoin', text: `${e.who} 上线了` })
+    })
+    on('playerLeave', (e) => {
+      if (!this.config.wakeOn.playerLeave) return
+      this.#fire(['playerLeave'], { kind: 'playerLeave', text: `${e.who} 下线了` })
+    })
+  }
+
+  #unbind () {
+    for (const [evt, fn] of this._listeners) { try { this.sess.bot.off(evt, fn) } catch {} }
+    this._listeners = []
+  }
+
+  /* ─────────────── 事件处理 ─────────────── */
+
+  /**
+   * 收到一个事件。reasons 非空 = 命中唤醒条件；为空 = 只记档。
+   * 命中时不立刻唤醒，先进观察窗口攒着（把连珠炮合并成一次）。
+   */
+  #fire (reasons, detail) {
+    // 无论是否唤醒都留档（这就是"事件记录器"）。
+    // 🔴 注意：**只有这一处**写看门狗自己的 log；会话事件队列（sess.events，mc_events 读的）
+    //    由 index.js 的 McSession.ensureWired **单独**写。两边都写会导致同一句话进队列两遍
+    //    （chat/damage/death 三类尤其明显）——曾经的真 bug，别再加回来。
+    this.#record(detail.kind, detail.text)
+
+    if (!reasons.length) return
+    this.pending.push({ reasons, ...detail, at: Date.now() })
+    if (!this.pendingSince) this.pendingSince = Date.now()
+  }
+
+  #record (kind, text) {
+    this.log.push({ at: Date.now(), kind, text })
+    if (this.log.length > this.maxLog) this.log.splice(0, this.log.length - this.maxLog)
+  }
+
+  #tick () {
+    if (!this.armed) return
+    const now = Date.now()
+
+    // 观察窗口到期 → 结算成一次唤醒
+    if (this.pending.length && this.pendingSince && (now - this.pendingSince) >= this.config.observeWindowMs) {
+      this.#flush('事件命中')
+      this.pendingSince = 0
+    }
+
+    // 心跳
+    if (this.config.wakeOn.heartbeat && this.config.heartbeatSec > 0) {
+      const since = now - (this.lastWakeAt || this.startedAt)
+      if (since >= this.config.heartbeatSec * 1000) {
+        this.#inject(`【心跳｜已挂机 ${Math.round(since / 1000)}s】我还在 ${this.sess.bot.sub ?? '游戏'} 里，`
+          + '没出什么事。你可以选择继续挂机（重新挂 mc_watch 或什么都不做），或主动做点什么。', 'heartbeat')
+        this.lastWakeAt = now
+        this.lastWakeKind = 'heartbeat'
+        this.stats.fired++
+      }
+    }
+
+    // 唤醒后等不到下文的补提醒
+    if (this.config.followUpAfterSec > 0 && this.lastWakeAt > 0) {
+      const since = now - this.lastWakeAt
+      const due = this.config.followUpAfterSec * 1000
+      if (since >= due && !this._followedUp) {
+        this._followedUp = true
+        this.#inject(`【提醒】距上次被叫醒已 ${Math.round(since / 1000)}s，对方没有再说话。`
+          + '你可以：① 主动说点什么/做个动作；② 判断没事就继续挂机（不必回复）。', 'followUp')
+      }
+    }
+  }
+
+  /** 把观察到的事件合并成一条消息注入当前会话 */
+  #flush (why) {
+    if (!this.pending.length) return
+    const now = Date.now()
+
+    // 限流
+    this.wakeTimes = this.wakeTimes.filter((t) => now - t < 60_000)
+    if (this.wakeTimes.length >= this.config.maxWakePerMinute) {
+      this.stats.dropped += this.pending.length
+      this.pending = []
+      this.#record('lifecycle', `唤醒被限流丢弃（每分钟上限 ${this.config.maxWakePerMinute}）`)
+      return
+    }
+
+    const items = this.pending
+    this.pending = []
+    const allReasons = [...new Set(items.flatMap((i) => i.reasons))]
+    const lines = items.map((i) => {
+      const tags = i.reasons.map((r) => LABEL[r] ?? r).join('+')
+      const extra = i.calledBy?.length ? `　← 命中叫法：${i.calledBy.join('/')}` : (i.near ? '　← 就在我旁边' : '')
+      return `· [${tags}] ${i.text}${extra}`
+    })
+    const body = `【MC 看门狗｜${allReasons.map((r) => LABEL[r] ?? r).join(' + ')}】\n`
+      + lines.join('\n')
+      + `\n\n（这是同一个对话里的提醒。用 mc_events 可取完整事件队列；`
+      + `需要回应就 mc_say，需要行动就 mc_move / mc_act / mc_build。）`
+
+    this.#inject(body, allReasons.join('+'))
+    this.lastWakeAt = now
+    this.lastWakeKind = allReasons.join('+')
+    this._followedUp = false
+    this.wakeTimes.push(now)
+    this.stats.fired++
+  }
+
+  /**
+   * 把提醒注入当前会话（**提示词注入，不是模拟用户发言**）。
+   *
+   * 首选 `agent.steer(plugin 来源的 message)`：
+   *   · 空闲 → **起一轮**（= 唤醒）；运行中 → 下一步插话（不打断）
+   *   · source 是 `{kind:'plugin', form:'notice'}` → 宿主渲染成折叠的一行摘要，不是用户消息
+   * 兜底才用 `sessionController.prompt`（那条必然是用户来源）。
+   */
+  #inject (text, kind) {
+    const running = this.agent?.status === 'running'
+
+    // ────────────────────────────────────────────────────────────────────────
+    // 首选：agent.steer(plugin 来源的 message) —— 这才是"提示词注入"
+    //
+    // 为什么不用 sessionController.prompt({mode:'queue'})：
+    //   那条路走的是 `agent.followup()`，宿主文档原话是
+    //   "Queue an **ordinary follow-up turn** … becomes the **sole ordinary message**
+    //    of its own turn" —— 即**往对话里插一条用户消息**（用户明确不要这个）。
+    //   而且 commands.ts 里 source 被写死成 `{kind:'user'}`，怎么调都是用户消息。
+    //
+    // 为什么 steer 能"空闲也唤醒"：
+    //   `steer` 的文档原话 "Submit steering for the nearest step.
+    //    **An idle driver starts a turn**; a running driver consumes it at its
+    //    next step boundary." —— 空闲起一轮、运行中插下一步，正是我们要的两用。
+    //
+    // source 用 `{kind:'plugin', form:'notice'}`：宿主把它渲染成**折叠的 notice 行**
+    //   （"One-line account of what happened, shown without expanding the row"），
+    //   不是用户发言。summary 就是那一行。
+    // ────────────────────────────────────────────────────────────────────────
+    const agent = this.agent
+    if (agent && typeof agent.steer === 'function' && createUserMessage) {
+      try {
+        const message = createUserMessage({
+          content: [{ type: 'text', text }],
+          source: {
+            kind: 'plugin',
+            plugin: 'whale_craft',
+            form: 'notice',
+            summary: `MC 看门狗：${kind}`.slice(0, 120),
+          },
+        })
+        agent.steer(message)
+        this.stats.injected++
+        this.#record('lifecycle', `已注入 steer（${running ? '运行中→下一步插话' : '空闲→起一轮'}｜${kind}）`)
+        return
+      } catch (e) {
+        this.#record('lifecycle', `steer 注入失败，回退 prompt：${e?.message ?? e}`)
+      }
+    }
+
+    // 兜底：拿不到 agent 或拿不到 createUserMessage（少见）时才走 sessionController.prompt。
+    // 注意它必然是**用户来源**消息，且 @Remote 签名要第二个 signal 参数。
+    const sc = this.ctx.get('sessionController')
+    if (!sc || typeof sc.prompt !== 'function') {
+      this.#record('lifecycle', `无法注入（没有 agent.steer/createUserMessage，也没有 sessionController.prompt）：${text.slice(0, 60)}…`)
+      return
+    }
+    const label = running ? '运行中→steer' : '空闲→拍一轮'
+    try {
+      const res = sc.prompt({
+        requestId: `mc-wake-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        sessionId: this.agent?.id ?? this.sess.agentId,
+        mode: 'steer',
+        content: [{ type: 'text', text }],
+      }, this.promptSignal)
+      this.stats.injected++
+      this.#record('lifecycle', `已注入（回退 prompt｜${label}｜${kind}）`)
+      if (res && typeof res.then === 'function') {
+        res.catch((e) => {
+          this.stats.injected--
+          this.#record('lifecycle', `注入异步失败（${label}）：${e?.message ?? e}`)
+        })
+      }
+    } catch (e) {
+      this.#record('lifecycle', `注入失败（${label}）：${e?.message ?? e}`)
+    }
+  }
+}

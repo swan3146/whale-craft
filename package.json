@@ -1,0 +1,74 @@
+{
+  "name": "whale_craft",
+  "version": "0.1.0",
+  "description": "DSH 原生 Minecraft Agent 插件：每会话独立机器人 + mc_* / mc_kit_* / mc_admin_* 工具 + 单对话看门狗 + 浏览器 UI + 工作区 .whale-craft 记忆",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "minecraft",
+    "mineflayer",
+    "agent"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yzi1b/whale-craft.git"
+  },
+  "homepage": "https://github.com/yzi1b/whale-craft#readme",
+  "bugs": {
+    "url": "https://github.com/yzi1b/whale-craft/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "selfcheck.mjs",
+    "cordis.patch.yml",
+    "src",
+    "tools",
+    "extensions",
+    "README.md",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "dependencies": {
+    "mineflayer": "^4.37.1",
+    "vec3": "^0.1.7"
+  },
+  "optionalDependencies": {
+    "sharp": "^0.35.3"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/schemastery": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": { "optional": true },
+    "@deepseek-ai/schemastery": { "optional": true }
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-tools": "0.0.1-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "check": "node tools/check-core.mjs && node selfcheck.mjs",
+    "prepublishOnly": "npm run check"
+  }
+}

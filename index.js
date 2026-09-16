@@ -1,0 +1,2177 @@
+/**
+ * whale_craft —— DSH 原生 Minecraft Agent 插件（host 半端）
+ * ============================================================================
+ * 目标：把"我"接进 MC 做成**一等公民**，而不是外挂一个 MCP 子进程。
+ *
+ *  1. 原生工具：mc_status / mc_say / mc_move / mc_map / mc_dig / ... 直接注册进
+ *     ctx.tools（所有会话可见），不再依赖 @deepseek-ai/dsh-mcp-client。
+ *  2. 🔴 **每会话独立实例**：每个 agent（会话）有自己的 McBot + 事件队列 + 看门狗。
+ *     不同会话可以连不同服务器、用不同账号，互不干扰。
+ *     同一个会话内只能有一个 bot 实例（一个游戏角色）。
+ *  3. 🔴 **连接参数工具化**：服务器地址/端口/登录凭据/子服 全部由 mc_connect 工具
+ *     运行时传参，AI 根据用户指令或记忆文件决定连哪里。Config 里不再有硬编码的
+ *     服务器/凭据（旧字段保留为 fallback，逐步废弃）。
+ *  4. 事件通知**只有一条通道**：`mc_watch` 后台看门狗任务（job 结算 → DSH followup
+ *     唤醒**同一个会话**）。本插件**不存在**任何跨会话唤醒实现。
+ *
+ * 机器人核心在 ./src/core.mjs（不依赖 DSH，可独立测试）。
+ * 挂载：profile cordis.patch.yml 里 `- id: whale_craft / name: whale_craft`。
+ * ============================================================================
+ */
+import z from '@deepseek-ai/schemastery'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import { existsSync, readdirSync, readFileSync, mkdirSync, copyFileSync, unlinkSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { resolve, sep, join } from 'node:path'
+import { McBot, lossless, logLine, libraryInfo } from './src/core.mjs'
+import { Watchdog, WATCH_DEFAULTS } from './src/watchdog.mjs'
+import { MemoryStore } from './src/memory.mjs'
+import { PluginConfig, DEFAULT_CONFIG, resolveStateDir } from './src/config.mjs'
+import { AccountStore, parseAuthlibCard, normalizeServerUrl, dashUuid } from './src/accounts.mjs'
+import { DEFAULT_AGENTS_MD, agentsMdPath, readAgentsMd, writeAgentsMd, resetAgentsMd, isAgentsMdPath } from './src/agentsmd.mjs'
+import { encodePng } from './src/png.mjs'
+import { ImageEngine, imageEngineAvailable, imageEngineError } from './src/image.mjs'
+
+export const name = 'whale_craft'
+export const inject = ['webServer', 'tools']
+
+/** 插件版本（`mc_capabilities` 会报给 Master；读不到就 unknown） */
+const PLUGIN_VERSION = (() => {
+  try { return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version ?? 'unknown' } catch { return 'unknown' }
+})()
+
+/* ============================ HTTP 工具与信任栅栏 ============================ */
+/* 与 @deepseek-ai/dsh-client-connection 的 /api 同款栅栏（DNS-rebinding + 跨站），
+ * 非认证层。照抄 dsh-serve 的实现，保持同源插件行为一致。 */
+
+function isLoopbackHostname(hostname) {
+  if (hostname === 'localhost' || hostname === '[::1]') return true
+  const parts = hostname.split('.')
+  return parts.length === 4 && parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255)
+    && parts[0] === '127'
+}
+
+function parseAuthority(authority) {
+  try { return new URL(`http://${authority}`) } catch { return undefined }
+}
+
+function isTrustedAuthority(hostUrl, trustedHosts) {
+  return trustedHosts.some((entry) => {
+    const entryUrl = parseAuthority(entry)
+    if (entryUrl === undefined) return false
+    const port = entryUrl.port !== '' ? entryUrl.port : new URL(`https://${entry}`).port
+    const canonical = port === '' ? entryUrl.hostname : `${entryUrl.hostname}:${port}`
+    return canonical === entryUrl.hostname
+      ? entryUrl.hostname === hostUrl.hostname
+      : entryUrl.host === hostUrl.host
+  })
+}
+
+function isTrustedRequest(headers, trustedHosts) {
+  const host = headers.host
+  if (typeof host !== 'string') return false
+  const hostUrl = parseAuthority(host)
+  if (hostUrl === undefined) return false
+  if (!isLoopbackHostname(hostUrl.hostname) && !isTrustedAuthority(hostUrl, trustedHosts)) return false
+  if (headers['sec-fetch-site'] === 'cross-site') return false
+  const origin = headers.origin
+  if (origin === undefined) return true
+  try { return new URL(origin).host === hostUrl.host } catch { return false }
+}
+
+function sendJson(res, status, body) {
+  const data = JSON.stringify(body)
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(data) })
+  res.end(data)
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve) => {
+    let data = ''
+    req.on('data', (chunk) => {
+      data += chunk
+      if (data.length > 1_000_000) req.destroy()      // 防手滑发大包
+    })
+    req.on('end', () => { try { resolve(JSON.parse(data || '{}')) } catch { resolve({}) } })
+    req.on('error', () => resolve({}))
+  })
+}
+
+/**
+ * Config 只保留**行为配置**（与"连哪个服"无关）。
+ * 连接参数（host/port/authUrl/authUser/authPass/subserver）已全部移到 mc_connect 工具。
+ * 旧字段保留为 fallback（工具不传参时用），但默认值已清空凭据。
+ */
+export const Config = z.object({
+  // ── 以下为 fallback（deprecated，工具传参优先）──
+  host: z.string().default(''),
+  port: z.natural().default(25565),
+  subserver: z.string().default(''),
+  authUrl: z.string().default(''),
+  authUser: z.string().default(''),
+  authPass: z.string().default(''),
+  autoConnect: z.boolean().default(false),
+
+  // ── 行为配置（保留）──
+  /**
+   * "喊我"的触发词（正则，大小写不敏感）。聊天里命中这些词才算在叫我。
+   * 默认覆盖用户的各种叫法（deepseek / ds / dsh / ai / agent / 机器人 / 麦块 / bot_name）。
+   */
+  mentions: z.array(z.string()).default([
+    'deepseek', 'deep\\s*seek', '\\bds\\b', '\\bdsh\\b', '\\bai\\b', 'agent',
+    '机器人', '麦块', 'bot_name', '昵称',
+  ]),
+  /** 聊天是否必须命中触发词才算叫我（默认 true：避免公屏闲聊把我叫醒） */
+  chatMentionOnly: z.boolean().default(true),
+  /** 受攻击/低血是否算作"叫我"（默认 true；看门狗可按次覆盖） */
+  damageCountsAsCall: z.boolean().default(true),
+})
+
+
+/* ======================== 每会话独立实例 ======================== */
+
+/**
+ * 一个会话的 MC 状态：独立 McBot + 事件队列 + 看门狗。
+ * 不同会话的 McSession 互不干扰。
+ */
+class McSession {
+  constructor(agentId, config) {
+    this.agentId = agentId
+    this.config = config
+    // 不传固定 config：连接参数走 connect()；instanceId 让每个会话有独立的锁与日志标识
+    this.bot = new McBot({ instanceId: agentId })
+    this.mode = 'standby'           // standby / active / sleep
+    this.events = []                // 未消费的 MC 事件
+    this.maxEvents = 200
+    this.watchdog = null            // 看门狗（Watchdog 实例，进服自动挂载）
+    this.selectedAccount = null     // 本会话选定的账户 innerID（mc_accounts{action:"use"}）
+    this._wired = false
+  }
+
+  /* ── 事件绑定（懒绑：首次使用时才 wire，避免未连接的 bot 产生无意义事件）── */
+
+  ensureWired(pluginCtx) {
+    if (this._wired) return
+    this._wired = true
+    const self = this
+
+    this.bot.on('log', (line) => pluginCtx.logger?.info?.(`[${self.agentId}] ${line}`))
+    this.bot.on('spawn', (e) => self.#pushEvent('lifecycle', `已上线 ${e.sub} @ ${JSON.stringify(e.position)}`))
+    this.bot.on('death', (e) => self.#pushEvent('lifecycle', `我死了 @ ${JSON.stringify(e.position)}`))
+    this.bot.on('reconnect', (e) => self.#pushEvent('lifecycle', `已重连 ${e.sub}`))
+    this.bot.on('chat', ({ who, text }) => self.#pushEvent('chat', `<${who}> ${text}`, { who }))
+    this.bot.on('system', ({ text }) => self.#pushEvent('system', text))
+    this.bot.on('damage', (e) => self.#pushEvent('damage', `血量降到 ${e.health} @ ${JSON.stringify(e.position)}`))
+  }
+
+  /* ── 清理 ── */
+
+  destroy() {
+    try { this.watchdog?.disarm('会话结束') } catch {}
+    try { this.bot.disconnect('会话结束') } catch {}
+    this.watchdog = null
+    this.events = []
+  }
+
+  /* ── 事件队列 ── */
+
+  #pushEvent(kind, text, extra = {}) {
+    this.events.push({ at: Date.now(), kind, text, ...extra })
+    if (this.events.length > this.maxEvents) this.events.splice(0, this.events.length - this.maxEvents)
+  }
+
+  drainEvents(limit = 20, kind = null) {
+    const taken = []
+    const rest = []
+    for (const e of this.events) {
+      if (taken.length < limit && (!kind || e.kind === kind)) taken.push(e)
+      else rest.push(e)
+    }
+    this.events = rest
+    return taken
+  }
+
+  /* ── 模式 ── */
+
+  modeView() {
+    return {
+      mode: this.mode,
+      online: this.bot.online,
+      sub: this.bot.sub,
+      connection: this.bot._connectionProfile ?? null,
+      pendingEvents: this.events.length,
+      watch: this.watchdog?.status() ?? null,
+    }
+  }
+
+  /* ── "喊我"判定 ── */
+
+  mentionRegex() {
+    if (this._mentionRe?.source !== this.config.mentions.join('|')) {
+      this._mentionRe = new RegExp(this.config.mentions.map((p) => `(?:${p})`).join('|'), 'i')
+    }
+    return this._mentionRe
+  }
+
+  isCalled(text) { return this.mentionRegex().test(String(text ?? '')) }
+
+  calledBy(text) {
+    const s = String(text ?? '')
+    return this.config.mentions.filter((p) => { try { return new RegExp(`(?:${p})`, 'i').test(s) } catch { return false } })
+  }
+}
+
+
+/* ======================== 全局注册表 ======================== */
+
+/**
+ * 管理所有活跃的 McSession。按 agentId 索引。
+ * 插件卸载时统一清理。
+ */
+class McRegistry {
+  constructor(ctx, config) {
+    this.ctx = ctx
+    this.config = config
+    /** @type {Map<string, McSession>} */
+    this.sessions = new Map()
+  }
+
+  /** 获取当前会话的 McSession（不存在就创建） */
+  getOrCreate(agentId) {
+    let sess = this.sessions.get(agentId)
+    if (!sess) {
+      sess = new McSession(agentId, this.config)
+      sess.ensureWired(this.ctx)
+      this.sessions.set(agentId, sess)
+      this.ctx.logger?.info?.(`[whale_craft] 新建会话实例：${agentId}`)
+    }
+    return sess
+  }
+
+  /** 只读查询：不存在就返回 undefined（**不要**用 getOrCreate——查状态不该建实例） */
+  peek(agentId) { return this.sessions.get(agentId) }
+
+  /** 销毁某个会话的实例 */
+  destroy(agentId) {
+    const sess = this.sessions.get(agentId)
+    if (sess) {
+      sess.destroy()
+      this.sessions.delete(agentId)
+      this.ctx.logger?.info?.(`[whale_craft] 销毁会话实例：${agentId}`)
+    }
+  }
+
+  /** 销毁所有（插件卸载时） */
+  destroyAll() {
+    for (const [id, sess] of this.sessions) {
+      try { sess.destroy() } catch {}
+    }
+    this.sessions.clear()
+  }
+
+  /** 列出所有活跃实例（诊断用） */
+  listSessions() {
+    return [...this.sessions.entries()].map(([id, sess]) => ({
+      agentId: id,
+      online: sess.bot.online,
+      sub: sess.bot.sub,
+      mode: sess.mode,
+      connection: sess.bot._connectionProfile ?? null,
+      pendingEvents: sess.events.length,
+      watching: sess.watchdog?.status() ?? null,
+    }))
+  }
+}
+
+
+/* ======================== 看门狗（绑定到具体 McSession）======================== */
+
+/**
+ * 拿到（或创建）本会话的看门狗。
+ * 看门狗要往会话里注入消息，必须绑 agent —— 在这里补齐并随时刷新引用。
+ */
+function ensureWatchdog (ctx, sess, agent, promptSignal = null) {
+  if (!sess.watchdog) {
+    // 注意：看门狗**不**往 sess.events 写（唯一写入方是 McSession.ensureWired）——
+    // 两边都写会让同一句话进队列两遍。
+    sess.watchdog = new Watchdog({ ctx, sess, agent, promptSignal })
+  } else {
+    if (agent) sess.watchdog.agent = agent
+    if (promptSignal) sess.watchdog.promptSignal = promptSignal
+  }
+  return sess.watchdog
+}
+
+
+/* ============================ 文件托管上传（给用户发图/发文件） ============================ */
+
+const MIME_BY_EXT = {
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+  '.webp': 'image/webp', '.svg': 'image/svg+xml', '.avif': 'image/avif', '.bmp': 'image/bmp',
+  '.pdf': 'application/pdf', '.txt': 'text/plain', '.md': 'text/markdown', '.json': 'application/json',
+  '.html': 'text/html', '.csv': 'text/csv', '.zip': 'application/zip',
+}
+
+function mimeFor (name) {
+  const i = String(name).lastIndexOf('.')
+  return i < 0 ? 'application/octet-stream' : (MIME_BY_EXT[String(name).slice(i).toLowerCase()] ?? 'application/octet-stream')
+}
+
+/**
+ * 把一段字节上传到 dsh-file-host，拿回**公网可访问的直链**。
+ *
+ * 为什么要插件自己传：那个玩游戏的会话 preset 里**没有 shell**，跑不了
+ * `node dsh-file-host/upload.mjs`。插件跑在宿主进程里，可以走**回环**
+ * （`127.0.0.1:<本实例端口>/serve/file-host/api/upload`）绕过外网 WAF。
+ *
+ * @returns {Promise<{shareId:string, galleryUrl:string, items:Array, markdown:string}>}
+ */
+async function uploadToFileHost (ctx, { data, name, title, ttlMs }) {
+  const port = ctx.webServer?.port
+  if (!port) throw new Error('拿不到本实例端口（ctx.webServer.port），无法上传')
+  const base = `http://127.0.0.1:${port}/serve/file-host`
+
+  const form = new FormData()
+  if (title) form.append('title', String(title))
+  if (ttlMs) form.append('ttl', String(ttlMs))
+  // ⚠️ 必须用**拷贝后**的 buffer 构造 Blob：Node 里池化 Buffer（byteOffset≠0、底层 8KB 池）
+  //    走 fetch 的 FormData 序列化会丢文件。这是 dsh-file-host 记过的坑。
+  const copied = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
+  form.append('file', new Blob([copied], { type: mimeFor(name) }), name)
+
+  const res = await fetch(`${base}/api/upload`, { method: 'POST', body: form })
+  const body = await res.json().catch(() => null)
+  if (!res.ok || !body?.ok) {
+    throw new Error(`上传失败（HTTP ${res.status}）：${JSON.stringify(body?.error ?? body).slice(0, 200)}`)
+  }
+  const value = body.value ?? {}
+  const items = (value.items ?? []).map((i) => ({ id: i.id, name: i.name, url: i.url, bytes: i.bytes }))
+  const first = items[0]
+  const isImage = /^image\//.test(mimeFor(name))
+  return {
+    shareId: value.shareId,
+    galleryUrl: value.galleryUrl,
+    expiresAt: value.expiresAt ?? null,
+    items,
+    // 图片给现成的内联语法；文件只能给可点链接（聊天里没有文件卡片语法）
+    markdown: first ? (isImage ? `![${first.name ?? name}](${first.url})` : `[${first.name ?? name}](${first.url})`) : null,
+    note: first
+      ? (isImage
+          ? '把 markdown 那串**原样写进你的回复**，图片就会在对话里内联显示。'
+          : '这是文件（非图片），聊天里没有文件卡片语法，只能给可点链接。')
+      : '没有返回 items，可能服务端异常。',
+  }
+}
+
+/* ============================ 插件主体 ============================ */
+
+export function apply(ctx, config) {
+  const registry = new McRegistry(ctx, config)
+
+  /* ── 插件状态目录（**配置 + 账户库**）：`$DSH_HOME/whale_craft/` ──────────────────
+   * 🔴 2026-09-16 用户要求：配置和账户**不该躺在工作区里** —— 工作区是项目的家，
+   *    插件有插件自己的家。宿主（app-boot）`ctx.provide('dshHomePath', …)` 给了这个路径，
+   *    与 `$DSH_HOME/skills` / `.agent-presets` / `storages` / `attachments` 同一套规矩。
+   * ------------------------------------------------------------------------ */
+  const dshHomePath = (() => { try { return ctx.get('dshHomePath') } catch { return undefined } })()
+  const stateDir = resolveStateDir({ dshHomePath, whaleDir: process.env.WHALE_CRAFT_DIR })
+
+  /* ── 记忆 / 提示词：挂在**会话工作区**下，不再假设"插件装在工作区里" ──────────────
+   * 抽取成标准插件后，包可能装在 `node_modules/` 或任意目录，**不能**再用 `__dirname/..` 推工作区。
+   * 正路：宿主给工具的 `exec.agent.session.header.cwd` 就是该会话的工作区（tool-fs 同款来源）。
+   * 记忆与提示词都挂它下面：`<工作区>/.whale-craft/`。
+   * 优先级：`WHALE_CRAFT_MEMORY_DIR` → `config.memoryDir` → `<工作区>/.whale-craft`
+   *         （**没有会话上下文时**兜底 `WHALE_CRAFT_DIR` 或 `$DSH_HOME/whale_craft/memory`）。
+   * ------------------------------------------------------------------------ */
+  /** 会话工作区（拿不到就 null：说明调用方没有 agent 上下文） */
+  const workspaceOf = (agent) => {
+    const cwd = agent?.session?.header?.cwd
+    return typeof cwd === 'string' && cwd.trim() !== '' ? cwd : null
+  }
+
+  const memoryRootFor = (cwd) => {
+    const explicit = process.env.WHALE_CRAFT_MEMORY_DIR ?? pluginConfig.memoryDir
+    if (explicit) return explicit
+    if (cwd) return join(cwd, '.whale-craft')
+    return process.env.WHALE_CRAFT_DIR ? stateDir : join(stateDir, 'memory')
+  }
+
+  /** 老版本（≤0.3.x）把 config/accounts 放在 `<工作区>/.whale-craft/`：每个工作区首次见到时搬一次 */
+  const migratedWorkspaces = new Set()
+  const migrateWorkspaceState = (cwd) => {
+    if (!cwd || migratedWorkspaces.has(cwd)) return
+    migratedWorkspaces.add(cwd)
+    for (const [name, label] of [['config.json', '全局配置'], ['accounts.json', '账户库']]) {
+      const from = join(cwd, '.whale-craft', name)
+      const to = join(stateDir, name)
+      try {
+        if (!existsSync(to) && existsSync(from)) {
+          mkdirSync(stateDir, { recursive: true })
+          copyFileSync(from, to)
+          if (readFileSync(to, 'utf8') === readFileSync(from, 'utf8')) unlinkSync(from)
+          logLine(`已把${label}搬出工作区：${from} → ${to}`)
+        }
+      } catch (e) { logLine(`${label}搬迁失败（保留旧位置）：${e.message}`) }
+    }
+  }
+
+  /** 按工作区缓存 MemoryStore（同一工作区不重复扫盘） */
+  const memoryCache = new Map()
+  const memoryFor = (cwd) => {
+    const root = memoryRootFor(cwd)
+    let store = memoryCache.get(root)
+    if (!store) {
+      migrateWorkspaceState(cwd)
+      store = new MemoryStore(root)
+      memoryCache.set(root, store)
+    }
+    return store
+  }
+
+  const pluginConfig = new PluginConfig(stateDir)
+  /** 无会话上下文时用的兜底记忆库（`capabilities` / 扩展 api / 全局注入用） */
+  const memory = memoryFor(null)
+  /** 这个会话的工作区根（mc_kit_share / mc_kit_image / 地图落盘用）；拿不到就给个兜底目录 */
+  const workspaceRootFor = (agent) => workspaceOf(agent) ?? join(stateDir, 'workspace')
+
+  /** 按 sessionId 找 agent（HTTP 那几个接口用；拿不到就 null） */
+  const safeAgentById = (sessionId) => {
+    if (!sessionId) return null
+    try { return ctx.get('agents')?.get?.(String(sessionId)) ?? null } catch { return null }
+  }
+  logLine(`whale_craft：配置 ${pluginConfig.file}｜记忆 <会话工作区>/.whale-craft（兜底 ${memory.root}）`)
+
+  /* ─────────── MC账户库：元数据在 $DSH_HOME/whale_craft/accounts.json，凭据只进宿主凭据服务 ───────────
+   * 🔴 LLM 永远拿不到密码/token：工具只回基本信息；凭据只在这两个 helper 里出现，且不外传。
+   * ------------------------------------------------------------------------ */
+  const accounts = new AccountStore({ dir: stateDir, logger: ctx.logger ?? null })
+  accounts.ensureDefaults()
+  // 凭据服务可能晚就绪 → 必须 ctx.inject 等（老教训：apply() 时 ctx.get() 常是 undefined）
+  ctx.inject(['credentials'], (scope) => {
+    accounts.credentials = scope.get('credentials') ?? null
+    void accounts.refreshCredentialIndex().then(() => {
+      logLine(`账户库就绪：${accounts.list().length} 个账户｜凭据服务 ${accounts.credentialsReady ? '可用' : '不可用（拒绝存密码）'}`)
+    })
+  })
+
+  /** 账户 → core 的 auth 描述符（**唯一**读凭据的地方；返回值含密码，绝不外传） */
+  const resolveAuth = async (innerID = null) => {
+    const acc = accounts.resolve(innerID)
+    if (!acc) {
+      const e = new Error('一个账户都没有——请在「MC设置」里新建一个（默认应该有一个离线账户 DeepSeek）')
+      e.needUserAction = true
+      throw e
+    }
+    const view = accounts.view(acc)
+    if (acc.type === 'offline') {
+      return { innerID: acc.innerID, label: view.name, auth: { mode: 'offline', name: view.name, uuid: view.uuid } }
+    }
+    const srv = accounts.listAuthServers().find((s) => s.id === acc.serverId)
+    if (!srv) {
+      const e = new Error(`账户「${view.name}」用的认证服务器已经被移除了`)
+      e.needUserAction = true
+      e.hint = '请在「MC设置」里给这个账户换一个认证服务器，或删掉它'
+      throw e
+    }
+    const cred = await accounts.getCredential(acc.innerID)
+    if (!cred?.password && !cred?.accessToken) {
+      const e = new Error(`账户「${view.name}」还没有保存的登录凭据`)
+      e.needUserAction = true
+      e.hint = '请在「MC设置」里重新登录这个账户（输入账号密码）'
+      throw e
+    }
+    return {
+      innerID: acc.innerID,
+      label: view.name,
+      auth: {
+        mode: 'yggdrasil',
+        authUrl: srv.url,
+        authUser: acc.login ?? null,
+        authPass: cred.password ?? null,
+        accessToken: cred.accessToken ?? null,
+        clientToken: cred.clientToken ?? null,
+      },
+    }
+  }
+
+  /**
+   * 登录成功后回写：皮肤站账户把**档案名/UUID/账号 id** 更新进账户库，并把**新令牌**存回凭据服务。
+   * ⚠️ 只对皮肤站账户做 name/uuid 覆盖：离线账户的 UUID 是"按名字派生"的，写死会毁掉这个语义。
+   */
+  const persistAuth = async (resolved, profile, session) => {
+    try {
+      const acc = accounts.get(resolved.innerID)
+      if (!acc) return
+      if (acc.type === 'yggdrasil') {
+        const patch = {}
+        const uuid = dashUuid(profile?.id)
+        if (uuid) patch.uuid = uuid
+        if (profile?.name) patch.name = String(profile.name)
+        if (session?.user?.id) patch.id = String(session.user.id)
+        if (Object.keys(patch).length) accounts.update(resolved.innerID, patch)
+        if (session?.accessToken) {
+          const cur = await accounts.getCredential(resolved.innerID)
+          await accounts.setCredential(resolved.innerID, {
+            password: resolved.auth.authPass ?? cur?.password ?? null,
+            accessToken: session.accessToken,
+            clientToken: session.clientToken ?? cur?.clientToken ?? null,
+          })
+        }
+      }
+      await accounts.refreshCredentialIndex()
+    } catch (e) { ctx.logger?.warn?.(`[whale_craft] 回写账户信息失败：${e.message}`) }
+  }
+
+  /** 把"需要用户处理"的提示拼进错误里（让 LLM 知道该叫用户去「MC设置」） */
+  const withUserHint = (e, label) => {
+    if (!e?.needUserAction) return e
+    const hint = e.hint ?? '请让用户在「MC设置」里重新登录这个账户，或点它的「刷新」'
+    const out = new Error(`${e.message}｜${hint}${label ? `（账户：${label}）` : ''}`)
+    out.needUserAction = true
+    return out
+  }
+
+  // 注入用的 AbortSignal（插件生命周期）。`sessionController.prompt` 是 @Remote 方法，
+  // 签名 (request, signal)，**必须传 signal**——否则 undefined.throwIfAborted() 直接炸。
+  const promptAbort = new AbortController()
+  ctx.effect(() => () => { try { promptAbort.abort() } catch {} }, 'whale_craft: prompt signal')
+
+  ctx.effect(() => () => { registry.destroyAll() })
+
+  /* ─────────── HTTP API：状态条 UI 用（状态查询 / 强制停止 / 普通停止）─────────── */
+
+  /** 运行期信任列表（--trusted-host 等） */
+  const liveTrustedHosts = () => {
+    const runtime = ctx.get('webRuntime')
+    return runtime !== undefined && Array.isArray(runtime.trustedHosts) ? runtime.trustedHosts : []
+  }
+
+  /**
+   * **强制停止**某个会话的 MC —— 用户 2026-09-16 定的语义与顺序：
+   *
+   *   ① **先停 LLM**（如果它正在输出）。不先停的话：它还会继续调工具、甚至把刚退掉的游戏重连回来。
+   *      中断之所以有效，靠的是工具侧 raceAbort 监听 exec.signal —— 宿主自己**没有**硬中断能力
+   *      （`tools/index.ts:219` 原话 "cannot hard-kill same-process code"），所以"让工具必然结算"是唯一出路。
+   *   ② **先尝试优雅退出游戏**（`bot.quit` + 宽限期，真走不掉才强断；见 src/core.mjs 的 disconnect）。
+   *   ③ **再强清该会话全部后台任务**（看门狗就在里面）。
+   *   ④ **最后再停一次 LLM**：②③期间会有退服事件/注入（"你被踢了"、工具被 abort 的结算）可能又把它推起来，
+   *      收尾再停一次，避免会话停在异常状态。
+   *
+   * ⚠️ **普通停止已移除**（用户要求："移除停止，只剩强行停止"）。唯一的例外是 `cancelTurn:false`：
+   * 给 **AI 自己调 `mc_stop`** 用——工具就跑在被停的那一轮里，cancel 会 abort 掉它自己所在的 turn
+   * （表现为 "tool call aborted"，真机报告过）。UI 的按钮走 HTTP，用默认的 cancelTurn:true。
+   *
+   * @param {string} sessionId
+   * @param {{reason?: string, cancelTurn?: boolean}} [opts]
+   */
+  const stopSession = async (sessionId, { reason = '用户强制停止', cancelTurn = true } = {}) => {
+    const sess = registry.peek(sessionId)
+    const agents = ctx.get('agents')
+    const agent = agents?.get?.(sessionId)
+    const out = {
+      sessionId, reason, order: [],
+      stoppedLLM: false, finalStopLLM: false, stopLLMError: null,
+      quit: null, kicked: false, killedJobs: [],
+    }
+
+    /** 停 LLM：优先 sessionController.cancel（宿主正路），退到 agent.cancel */
+    const cancelLLM = () => {
+      try {
+        const sc = ctx.get('sessionController')
+        if (typeof sc?.cancel === 'function') { sc.cancel({ sessionId }); return true }
+        if (typeof agent?.cancel === 'function') { agent.cancel({ kind: 'user' }, { keepInbox: true }); return true }
+      } catch (e) { out.stopLLMError = String(e?.message ?? e) }
+      return false
+    }
+
+    /**
+     * 等它真的停下来（running → 其它）。拿不到 status 就只给一小段缓冲，别白等。
+     * 详见 packages/core/agent-loop/src/agent.ts 的 `get status()`。
+     */
+    const waitIdle = async (ms) => {
+      const known = agent?.status !== undefined
+      const budget = known ? ms : Math.min(ms, 120)
+      const t0 = Date.now()
+      while (Date.now() - t0 < budget) {
+        if (known && agent.status !== 'running') return true
+        await new Promise((r) => setTimeout(r, 50))
+      }
+      return !known
+    }
+
+    // ① 先停 LLM
+    if (cancelTurn) {
+      out.stoppedLLM = cancelLLM()
+      out.order.push('stop-llm')
+      await waitIdle(1500)
+    }
+
+    // ② 先尝试退出游戏（关看门狗 → 优雅 quit → 走不掉才强断）
+    if (sess?.watchdog) { try { sess.watchdog.disarm(reason, { notify: false }) } catch {} }
+    if (sess) {
+      try {
+        out.quit = await sess.bot.disconnect(reason)
+        out.kicked = true
+      } catch (e) { out.quitError = String(e?.message ?? e) }
+      sess.mode = 'standby'
+      out.order.push('quit-game')
+    }
+
+    // ③ 再强清该会话全部后台任务
+    const jobs = ctx.get('jobs')
+    if (jobs && agent) {
+      try {
+        for (const j of jobs.list(agent) ?? []) {
+          const id = j?.id ?? j?.jobId
+          if (!id) continue
+          try { jobs.kill(id, agent, reason); out.killedJobs.push(id) } catch {}
+        }
+      } catch (e) { out.jobsError = String(e?.message ?? e) }
+    }
+    out.order.push('kill-jobs')
+
+    // ④ 最后再停一次 LLM（收尾，避免状态异常）
+    if (cancelTurn) {
+      out.finalStopLLM = cancelLLM()
+      out.order.push('stop-llm-final')
+      await waitIdle(800)
+    }
+
+    ctx.logger?.info?.(`[whale_craft] 强制停止 ${sessionId}｜${JSON.stringify(out)}`)
+    return out
+  }
+
+  /* ─────────── 归档保护（用户 2026-09-15 补充要求）───────────
+   * "会话归档前要自动强行停止，或者阻止归档。"
+   *
+   * 做法：包一层 `ctx.workspaceRegistry.archiveSession`。归档一个正在玩 MC 的会话时，
+   * 先把机器人踢下线、关看门狗、清后台任务、中断当前轮，**再**放行归档。
+   * 选择"自动停止"而不是"阻止归档"——用户想归档就该让它归档，只是别留个孤儿 bot 在线。
+   *
+   * 为什么能包：`archiveSession` 是 workspace 服务上的普通方法（`workspace/src/index.ts:243`），
+   * 不是抽象/私有；卸载时还原原方法。
+   * ------------------------------------------------------------------------ */
+
+  /**
+   * 安装归档保护。
+   *
+   * ⚠️ 必须在 `workspaceRegistry` **就绪之后**才能装：`apply()` 跑的时候它往往还没起来，
+   *    `ctx.get('workspaceRegistry')` 会返回 undefined（隔离实例实测踩到）。
+   *    正解是 `ctx.inject(['workspaceRegistry'], cb)` —— 服务就绪（或重新就绪）时回调，
+   *    并且回调里的 `scope.effect` 把还原逻辑挂在**那个 fiber** 上。
+   *    参照宿主自己的写法：`packages/client/modules/src/index.ts:576`。
+   */
+  const installArchiveGuard = (scope) => {
+    const wsRegistry = scope.get('workspaceRegistry')
+    if (!wsRegistry || typeof wsRegistry.archiveSession !== 'function') {
+      logLine('宿主没有 workspaceRegistry：归档保护未启用')
+      return
+    }
+    const originalArchive = wsRegistry.archiveSession
+    wsRegistry.archiveSession = async function (sessionId) {
+      const id = String(sessionId)
+      const sess = registry.peek(id)
+      if (sess && (sess.bot?.online || sess.watchdog?.armed)) {
+        logLine(`会话 ${id} 将被归档 → 先强制停止 MC`)
+        try {
+          await stopSession(id, { reason: '会话被归档' })
+        } catch (e) {
+          logLine(`归档前停止失败（仍继续归档）：${e.message}`)
+        }
+      }
+      return originalArchive.call(this, sessionId)
+    }
+    scope.effect(() => () => { wsRegistry.archiveSession = originalArchive }, 'whale_craft: archive guard')
+    logLine('已挂上归档保护（归档前自动停止 MC）')
+    scope.logger?.info?.('[whale_craft] 已挂上归档保护（归档前自动停止 MC）')
+  }
+
+  if (ctx.get('workspaceRegistry') === undefined) {
+    ctx.inject(['workspaceRegistry'], (scope) => installArchiveGuard(scope))
+  } else {
+    installArchiveGuard(ctx)
+  }
+
+  /**
+   * 「MC设置」模态框的后端（账户 / 认证服务器 / 指令白名单）。
+   * 🔴 响应里**永远没有密码或 token**；错误统一 200 + `{ok:false,error,needUserAction?,hint?}`，
+   *    这样前端只管解析 JSON，不用管状态码。
+   */
+  let authProbe = null
+  const probeBot = () => (authProbe ??= new McBot({ instanceId: 'auth-probe' }))
+
+  /** 设置页要的那几项配置（集中一处，GET/PATCH 共用） */
+  const configView = () => ({
+    commandWhitelist: pluginConfig.get('commandWhitelist'),
+    allowAllCommands: pluginConfig.get('allowAllCommands'),
+    injectWhaleCraftAgentsMd: pluginConfig.get('injectWhaleCraftAgentsMd'),
+    injectWorkspaceAgentsMd: pluginConfig.get('injectWorkspaceAgentsMd'),
+    // 「MC设置」入口的模式门控：前端拿这份名单 + 会话记录的 preset 就能**本地**判定
+    // （不必为按钮问一次服务端；2026-09-16 事故：一次性请求失败后按钮永久消失）
+    mcModePresets: pluginConfig.mcModePresets,
+    configFile: pluginConfig.file,
+  })
+
+  const handleSettingsApi = async (req, res, path, url) => {
+    const ok = (body) => sendJson(res, 200, { ok: true, ...body })
+    // ⚠️ DELETE **也带 body**（前端把 innerID/id 放在 body 里）——只有 GET 没有 body。
+    //    E2E 实测踩过：早先按 "GET/DELETE 都不读体" 写，两个删除接口全废。
+    const body = req.method === 'GET' ? {} : await readJsonBody(req)
+
+    if (path === '/api/mc/accounts' && req.method === 'GET') {
+      return ok({
+        defaultAccount: accounts.resolve()?.innerID ?? null,
+        authServers: accounts.listAuthServers(),
+        accounts: accounts.list(),
+        credentialsReady: accounts.credentialsReady,
+      })
+    }
+    if (path === '/api/mc/accounts' && req.method === 'POST') {
+      // 第三方账户：允许**顺手把认证服务器记住**——前端「新建第三方账户」就是"先填服务器、再填账号密码"，
+      // 只给一个地址，这里负责 resolve-or-create（免得前端要发两次请求、也不怕重复地址）。
+      let serverId = body.serverId ? String(body.serverId) : null
+      if (String(body.type) === 'yggdrasil' && !serverId && body.serverUrl) {
+        const url = normalizeServerUrl(String(body.serverUrl))
+        const existing = accounts.listAuthServers().find((s) => s.url === url)
+        serverId = existing ? existing.id : accounts.addAuthServer({ name: body.serverName ?? null, url }).id
+      }
+      const acc = accounts.add({
+        type: body.type, name: body.name, uuid: body.uuid ?? null,
+        serverId, login: body.login ?? null,
+      })
+      if (body.password) await accounts.setCredential(acc.innerID, { password: String(body.password) })
+      if (body.default === true) accounts.update(acc.innerID, { default: true })
+      await accounts.refreshCredentialIndex()
+      return ok({ account: accounts.view(accounts.get(acc.innerID)) })
+    }
+    if (path === '/api/mc/accounts' && req.method === 'PATCH') {
+      const patch = { ...body }
+      delete patch.innerID
+      return ok({ account: accounts.update(String(body.innerID ?? ''), patch) })
+    }
+    if (path === '/api/mc/accounts' && req.method === 'DELETE') {
+      return ok(await accounts.remove(String(body.innerID ?? '')))
+    }
+    if (path === '/api/mc/accounts/refresh' && req.method === 'POST') {
+      const innerID = String(body.innerID ?? '')
+      const resolved = await resolveAuth(innerID)
+      if (resolved.auth.mode === 'offline') {
+        return ok({ account: accounts.view(accounts.get(innerID)), note: '离线账户不需要认证（UUID 按名字派生）' })
+      }
+      let captured = null
+      await probeBot().authOnly(resolved.auth, { onSession: (s) => { captured = s } })
+      if (captured) await persistAuth(resolved, captured.selectedProfile, captured)
+      return ok({ account: accounts.view(accounts.get(innerID)) })
+    }
+    if (path === '/api/mc/authservers' && req.method === 'POST') {
+      let url = body.url ? String(body.url) : null
+      if (!url && body.card) {
+        url = parseAuthlibCard(body.card)
+        if (!url) throw new Error('这张卡片里没找到认证服务器地址（要 `authlib-injector:yggdrasil-server:<网址>` 或一条网址）')
+      }
+      if (!url) throw new Error('要给 url，或把卡片拖进来（card）')
+      return ok({ server: accounts.addAuthServer({ name: body.name ? String(body.name) : null, url }) })
+    }
+    if (path === '/api/mc/authservers' && req.method === 'DELETE') {
+      return ok(accounts.removeAuthServer(String(body.id ?? '')))
+    }
+    if (path === '/api/mc/config' && req.method === 'GET') {
+      return ok(configView())
+    }
+    if (path === '/api/mc/config' && req.method === 'PATCH') {
+      for (const k of ['commandWhitelist', 'allowAllCommands', 'injectWhaleCraftAgentsMd', 'injectWorkspaceAgentsMd']) {
+        if (body[k] !== undefined) pluginConfig.set(k, body[k])
+      }
+      return ok(configView())
+    }
+
+    /* ── 提示词 AGENTS.md（「MC设置 → 提示词」页）：读 / 存 / 恢复默认 ──
+     * 🔴 它是**按会话工作区**的（`<工作区>/.whale-craft/AGENTS.md`），所以前端要带 sessionId。 */
+    if (path === '/api/mc/agents-md') {
+      const sessionId = String(body.sessionId ?? url?.searchParams?.get('sessionId') ?? '')
+      const cwd = workspaceOf(safeAgentById(sessionId))
+      const promptDir = memoryRootFor(cwd)
+      const wsPath = join(workspaceRootFor(safeAgentById(sessionId)), 'AGENTS.md')
+      if (req.method === 'GET') {
+        const cur = readAgentsMd(promptDir)
+        return ok({
+          text: cur.text,
+          source: cur.source,
+          path: cur.path,
+          isDefault: cur.source === 'default',
+          defaultText: DEFAULT_AGENTS_MD,
+          workspacePath: wsPath,
+          workspaceExists: existsSync(wsPath),
+        })
+      }
+      if (req.method === 'PUT') return ok({ ...writeAgentsMd(promptDir, body.text), source: 'custom' })
+      if (req.method === 'DELETE') return ok({ ...resetAgentsMd(promptDir), source: 'default' })
+    }
+    throw new Error(`未知的设置接口：${req.method} ${path}`)
+  }
+
+  const handleMcApi = async (req, res) => {
+    const url = new URL(req.url ?? '/', 'http://localhost')
+    const path = url.pathname
+
+    if (req.method === 'GET' && path === '/api/mc/status') {
+      const sessionId = url.searchParams.get('sessionId') ?? ''
+      const sess = registry.peek(sessionId)
+      if (!sess) return sendJson(res, 200, { ok: true, active: false })
+      // 🔴 active = **真在游戏里**（机器人在线 或 看门狗挂着），不是"这个会话碰过 mc_* 工具"。
+      //    只要调过一次 mc_status 就会建 McSession；若按"存在即 active"，
+      //    状态条会在所有用过的会话上永久显示"未上线"（用户要的是"只在真进游戏时显示"）。
+      const active = Boolean(sess.bot.online) || Boolean(sess.watchdog?.armed)
+      if (!active) return sendJson(res, 200, { ok: true, active: false })
+      return sendJson(res, 200, {
+        ok: true, active: true, sessionId,
+        ...sess.bot.status(), ...sess.modeView(),
+        lastTimeout: sess.bot.lastTimeout ?? null,
+        timeouts: sess.bot.stats?.timeouts ?? 0,
+      })
+    }
+
+    if (req.method === 'GET' && path === '/api/mc/sessions') {
+      return sendJson(res, 200, { ok: true, sessions: registry.listSessions() })
+    }
+
+    /* ── 「MC设置」入口的模式门控（2026-09-16）─────────────────────────────
+     * 前端只该在 **MC 模式**的会话里显示设置入口。以前前端要么无条件显示、
+     * 要么靠 DOM 猜测，都出过事故（普通会话也有按钮 / 输入框上方冒出长条）。
+     * 这里给出**与 restrict/guard 完全同一个判据**（isMcModeAgent）的真值，
+     * 前端拿到 false / 还没拿到就一律不渲染。
+     * ──────────────────────────────────────────────────────────────────── */
+    if (req.method === 'GET' && path === '/api/mc/mode') {
+      const sessionId = url.searchParams.get('sessionId') ?? ''
+      let mcMode = false
+      if (sessionId) {
+        try {
+          const agent = ctx.get('agents')?.get?.(sessionId)
+          mcMode = agent ? isMcModeAgent(agent) : mcModeAgentIds.has(sessionId)
+        } catch {
+          mcMode = mcModeAgentIds.has(sessionId)
+        }
+      }
+      return sendJson(res, 200, { ok: true, sessionId, mcMode })
+    }
+
+    if (req.method === 'POST' && path === '/api/mc/stop') {
+      const body = await readJsonBody(req)
+      const sessionId = String(body.sessionId ?? '')
+      if (!sessionId) return sendJson(res, 400, { ok: false, error: 'sessionId 必填' })
+      // 用户 2026-09-16：**普通停止已移除**，这里只有强制停止一种语义
+      // （顺序：停 LLM → 优雅退游戏 → 清该会话后台任务 → 再停一次 LLM）。
+      // body.hard 不再有意义，传了也忽略（旧前端/旧脚本兼容）。
+      const result = await stopSession(sessionId, {
+        reason: body.reason ? String(body.reason) : '用户强制停止',
+      })
+      return sendJson(res, 200, { ok: true, ...result })
+    }
+
+    /* ── 「MC设置」模态框用的接口（账户 / 认证服务器 / 白名单）── */
+    if (path.startsWith('/api/mc/accounts') || path.startsWith('/api/mc/authservers')
+      || path.startsWith('/api/mc/agents-md') || path === '/api/mc/config') {
+      try {
+        return await handleSettingsApi(req, res, path, url)
+      } catch (e) {
+        const err = { ok: false, error: String(e?.message ?? e) }
+        if (e?.needUserAction) { err.needUserAction = true; if (e.hint) err.hint = String(e.hint) }
+        return sendJson(res, 200, err)
+      }
+    }
+
+    return sendJson(res, 404, { ok: false, error: `unknown endpoint ${req.method} ${path}` })
+  }
+
+  const apiRoute = {
+    kind: 'prefix',
+    path: '/api/mc',
+    handler: async (req, res) => {
+      if (!isTrustedRequest(req.headers, liveTrustedHosts())) {
+        res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' })
+        res.end('forbidden')
+        return
+      }
+      try { await handleMcApi(req, res) } catch (e) {
+        ctx.logger?.warn?.(`[whale_craft] /api/mc 处理失败：${e instanceof Error ? e.message : String(e)}`)
+        sendJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
+      }
+    },
+  }
+  ctx.effect(() => ctx.webServer.register(apiRoute), 'whale_craft: /api/mc 路由')
+
+  // 启动自检标记：确认"插件到底加载了没"（同时写 whale-craft.log 与宿主日志）
+  const startup = `插件已加载｜pid=${process.pid}｜每会话独立实例｜工具注册中…`
+  logLine(startup)
+  ctx.logger?.info?.(`[whale_craft] ${startup}`)
+
+  const text = (value, render) => ({
+    schema: { type: 'object', properties: {}, additionalProperties: true },
+    render: (args, value2) => [{ type: 'text', text: render ? render(args, value2) : String(value2?.text ?? JSON.stringify(value2, null, 2)) }],
+  })
+
+  /**
+   * 工具定义统一入口：
+   *   ① 返回值无损化（宿主要求无损 JSON；mineflayer 到处返回 Vec3 类实例）
+   *   ② 注入本轮 turn 的 exec.signal 给 bot —— 这是"停止按钮真的有效"的关键：
+   *      宿主的 cancel 只是 abort 一个 signal（它无法抛弃同进程 pending 的 promise，
+   *      见 packages/core/tools/src/index.ts:219 "cannot hard-kill same-process code"），
+   *      所以必须由我们在每个 mineflayer await 上监听它，否则按停止要等本地超时（最长 25s）。
+   */
+  /** 我们自己注册的工具名（MC 模式做工具白名单时要带上它们，否则会被 restrict 一并滤掉） */
+  const ourToolNames = []
+
+  const asTool = (spec) => {
+    if (spec?.name && !ourToolNames.includes(spec.name)) ourToolNames.push(spec.name)
+    return defineTool({
+      ...spec,
+      async execute(args, exec) {
+        const sess = getSession(exec)
+        sess.bot.setAbortSignal(exec?.signal)
+        return lossless(await spec.execute(args, exec))
+      },
+    })
+  }
+
+  /** 从 exec 里拿 agentId，再拿到当前会话的 McSession */
+  const getSession = (exec) => {
+    const agent = exec?.agent
+    if (!agent) throw new Error('拿不到当前会话（exec.agent 不可用）')
+    return registry.getOrCreate(agent.id)
+  }
+
+  /* ── 状态与开关 ── */
+
+  ctx.tools.register(asTool({
+    name: 'mc_status',
+    description: '看我在 Minecraft 里的状态：是否在线、子服、坐标、血量、模式、连接信息、待处理事件数、看门狗状态。',
+    parameters: {},
+    output: text(),
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      const s = sess.bot.status()
+      return { ...s, ...sess.modeView(), recentChat: sess.bot.recentChat(5) }
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_connect',
+    description: '连接到 MC 服务器。**这里没有账号密码**——用哪个账户由「MC设置」里维护的账户决定：\n'
+      + '先用 `mc_accounts` 看有哪些账户（用 `action:"use"` 选定，或用本工具的 `account` 参数指名 innerID）。\n'
+      + '服务器地址/端口/子服由你传（不传就用插件配置里的 fallback）；连接成功后会等区块加载完成。\n'
+      + '登录失败时会明确说"需要用户处理"——那就告诉用户去「MC设置」里重新登录或点「刷新」。',
+    parameters: {
+      host:      { type: 'string', description: '服务器地址（如 example.com）' },
+      port:      { type: 'number', description: '端口（默认 25565）' },
+      subserver: { type: 'string', description: '子服域名（Velocity fakeHost 路由，如 mc.example.com）' },
+      account:   { type: 'string', description: '（可选）用哪个账户：innerID（mc_accounts 里能看到）；不传就用本会话选定的/默认账户' },
+      version:   { type: 'string', description: 'MC 版本（如 1.20.4 / 26.2）。**默认不传 = 自动探测**（发 STATUS ping 按服务端上报的协议号反查），这是推荐用法；只有探测失败时才手填。' },
+    },
+    output: text(),
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      const innerID = args.account ? String(args.account) : (sess.selectedAccount ?? null)
+      const resolved = await resolveAuth(innerID)
+      sess.selectedAccount = resolved.innerID
+
+      const opts = { auth: resolved.auth }
+      if (args.host)      opts.host      = String(args.host)
+      if (args.port)      opts.port      = Number(args.port)
+      if (args.subserver) opts.subserver = String(args.subserver)
+      if (args.version)   opts.version   = String(args.version)
+      // 登录成功后把（皮肤站的）档案信息与新令牌回写；回调只活在插件层，不进工具返回值
+      opts.onAuth = ({ profile, session }) => { void persistAuth(resolved, profile, session) }
+
+      try {
+        await sess.bot.connect(opts)
+      } catch (e) {
+        throw withUserHint(e, resolved.label)
+      }
+      sess.mode = 'active'
+      const ready = await sess.bot.waitForChunks()
+      // 进服自动挂看门狗（用户要求：进游戏自动打开）
+      const wd = ensureWatchdog(ctx, sess, exec?.agent, promptAbort.signal)
+      if (wd.config.autoArm && !wd.armed) {
+        try { wd.arm() } catch (e) { ctx.logger?.warn?.(`[whale_craft] 看门狗自动挂载失败：${e.message}`) }
+      }
+      return {
+        connected: true,
+        account: accounts.view(accounts.get(resolved.innerID)),
+        ...sess.bot.status(), chunksReady: ready,
+        connection: sess.bot._connectionProfile,
+        watchdog: wd.status().armed ? '已自动挂载' : '未挂载（autoArm 关闭）',
+      }
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_accounts',
+    description: '【账户】列出 / 搜索 / 刷新 / 选定 MC 账户。**永远拿不到密码或 token**——只有基本信息。\n'
+      + 'action：\n'
+      + '· list（默认）列出所有账户：innerID / ID / 游戏名 / UUID / 类型（离线或皮肤站）/ 服务器名与地址 / 是否已存凭据\n'
+      + '· search  按指令搜（名字、UUID、服务器名、登录账号都行）：给 query\n'
+      + '· use     选定本会话要用的账户：给 innerID（之后 mc_connect 就用它）\n'
+      + '· refresh 刷新某个账户的登录状态（皮肤站会去认证服换新令牌）：innerID 不传就用当前选定/默认的\n'
+      + '⚠️ 刷新或登录失败时会带 needUserAction——**这时候要明确告诉用户**：请到「MC设置」里重新登录该账户，'
+      + '或点它的「刷新」按钮（密码只有用户能填，你拿不到）。',
+    parameters: {
+      action:  { type: 'string', description: 'list（默认）/ search / use / refresh' },
+      innerID: { type: 'string', description: '账户内部 id（list 里能看到，形如 acc-xxxxxxxx）' },
+      query:   { type: 'string', description: 'search 的关键词' },
+    },
+    output: text(),
+    async execute(args, exec) {
+      const action = String(args.action ?? 'list').toLowerCase()
+      const sess = getSession(exec)
+
+      if (action === 'list') {
+        return {
+          accounts: accounts.list(),
+          authServers: accounts.listAuthServers(),
+          credentialsReady: accounts.credentialsReady,
+          selected: sess.selectedAccount ?? accounts.resolve()?.innerID ?? null,
+        }
+      }
+      if (action === 'search') return accounts.search(args.query)
+
+      if (action === 'use') {
+        const id = String(args.innerID ?? '').trim()
+        if (!id) throw new Error('use 要给 innerID（先 action:"list" 看看有哪些账户）')
+        const acc = accounts.get(id)
+        if (!acc) throw new Error(`没有这个账户：${id}`)
+        sess.selectedAccount = id
+        return {
+          selected: accounts.view(acc),
+          note: '本会话之后 mc_connect 就用这个账户（要进服请再调 mc_connect）',
+        }
+      }
+
+      if (action === 'refresh') {
+        const innerID = args.innerID ? String(args.innerID) : (sess.selectedAccount ?? accounts.resolve()?.innerID ?? null)
+        const resolved = await resolveAuth(innerID)
+        if (resolved.auth.mode === 'offline') {
+          return {
+            refreshed: resolved.innerID, type: 'offline',
+            account: accounts.view(accounts.get(resolved.innerID)),
+            note: '离线账户不需要认证；UUID 按名字派生（想固定就在「MC设置」里给它设自定义 UUID）',
+          }
+        }
+        let captured = null
+        let out
+        try {
+          out = await sess.bot.authOnly(resolved.auth, { onSession: (s) => { captured = s } })
+        } catch (e) {
+          throw withUserHint(e, resolved.label)
+        }
+        if (captured) await persistAuth(resolved, captured.selectedProfile, captured)
+        return {
+          refreshed: resolved.innerID, type: 'yggdrasil', auth: out,
+          account: accounts.view(accounts.get(resolved.innerID)),
+        }
+      }
+
+      throw new Error(`未知 action："${action}"（可用 list/search/use/refresh）`)
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_stop',
+    description: '停止本会话的 Minecraft：**先尝试优雅退出游戏，再清空本会话全部后台任务（看门狗在里面）**。\n'
+      + '⚠️ 它**不会中断你自己当前这一轮**（你正跑在这轮里，自我 abort 会表现为 "tool call aborted"）。'
+      + '所以它适合"我不想玩了，下线"——想停掉自己正在跑的动作，直接别再调工具就行。\n'
+      + '页面上标题旁只剩一个「强制停止」按钮，它比这个工具更狠：**先停 LLM → 再优雅退游戏 → '
+      + '再清后台任务 → 最后再停一次 LLM**（那是给人按的）。',
+    parameters: {
+      reason: { type: 'string', description: '原因（写进日志）' },
+    },
+    output: text(),
+    async execute(args, exec) {
+      const sessionId = exec?.agent?.id
+      if (!sessionId) throw new Error('拿不到当前会话')
+      // cancelTurn:false —— 工具就跑在被停的这一轮里，绝不能让 stop 把这一轮 abort 掉
+      return stopSession(sessionId, {
+        reason: args.reason ? String(args.reason) : 'AI 主动下线',
+        cancelTurn: false,
+      })
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_disconnect',
+    description: '从 MC 下线（当前会话的机器人退出游戏）。不影响其他会话的机器人。看门狗会自动关闭并提醒你。',
+    parameters: { reason: { type: 'string' } },
+    output: text(),
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      const why = args.reason ? String(args.reason) : 'agent 主动下线'
+      // 退服自动关看门狗 + 提醒（用户要求：退出游戏会提醒 AI）
+      let watchOff = null
+      if (sess.watchdog) { try { watchOff = sess.watchdog.disarm(`下线：${why}`, { notify: true }) } catch {} }
+      const quit = await sess.bot.disconnect(why)      // 优雅优先，走不掉才强断
+      sess.mode = 'standby'
+      return { online: false, quit, watchdog: watchOff ? '已关闭并已提醒' : '本来就没挂' }
+    },
+  }))
+
+  /* ── 说话与事件 ── */
+
+  ctx.tools.register(asTool({
+    name: 'mc_say',
+    description: '在 MC 公屏说话（游戏里所有玩家能看到）。',
+    parameters: { message: { type: 'string', required: true, description: '要说的话（单行，会被截断到 220 字）' } },
+    output: text(),
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      return { sent: sess.bot.chatSay(String(args.message)) }
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_watch',
+    description: '看门狗控制（**唯一**的事件通知通道）。看门狗在**进服时自动挂载、退服时自动卸载**，'
+      + '整局游戏期间持续运行：记录所有事件，命中唤醒条件就在**同一个对话里**提醒你——'
+      + '你空闲时开新一轮；你正在跑时在下一步插话（不打断）。'
+      + 'action="status"（默认）看状态与配置；"arm" 手动挂载；"disarm" 关闭；"log" 看最近事件留档。'
+      + '唤醒条件/近距半径/心跳/观察窗口等一律用 mc_config 调（有默认值）。',
+    parameters: {
+      action: { type: 'string', description: 'status（默认）/ arm / disarm / log' },
+      reason: { type: 'string', description: 'disarm 时的原因（会写进日志）' },
+    },
+    output: text(),
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      const agent = exec?.agent
+      if (!agent) throw new Error('拿不到当前会话（exec.agent 不可用），看门狗必须绑定会话')
+      const wd = ensureWatchdog(ctx, sess, agent, promptAbort.signal)
+      const action = String(args.action ?? 'status')
+      if (action === 'arm') return { ...wd.arm(), note: '看门狗已挂载，整局游戏期间有效（退服自动卸载并提醒你）。' }
+      if (action === 'disarm') return wd.disarm(args.reason ? String(args.reason) : 'AI 主动关闭')
+      if (action === 'log') return { armed: wd.armed, stats: { ...wd.stats }, recent: wd.log.slice(-30) }
+      return wd.status()
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_config',
+    description: '读写本会话的 MC 配置（看门狗唤醒条件、近距半径、心跳间隔、观察窗口、叫法等）。'
+      + '不传参数 = 看当前配置 + 默认值。改配置传 patch；嵌套项用点号键，'
+      + '如 {"wakeOn.itemPickup":true,"nearRadius":24,"mentionPatterns":["ds","用户"]}。'
+      + '叫法是**配置不是硬编码**——学到玩家的新称呼就加进 mentionPatterns。',
+    parameters: {
+      patch: { type: 'object', additionalProperties: true, description: '要改的配置项（浅合并）；不传=只读' },
+      reset: { type: 'boolean', description: 'true=恢复默认配置' },
+    },
+    output: text(),
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      const wd = ensureWatchdog(ctx, sess, exec?.agent, promptAbort.signal)
+      const clone = (v) => JSON.parse(JSON.stringify(v))
+      if (args.reset) {
+        wd.config = clone(WATCH_DEFAULTS)
+        return { reset: true, config: wd.config }
+      }
+      // 把 "wakeOn.itemPickup": true 这种点号键拆成嵌套补丁
+      const patch = {}
+      for (const [k, v] of Object.entries(args.patch ?? {})) {
+        const dot = k.indexOf('.')
+        if (dot > 0) {
+          const head = k.slice(0, dot)
+          patch[head] = { ...(patch[head] ?? {}), [k.slice(dot + 1)]: v }
+        } else patch[k] = v
+      }
+      if (Object.keys(patch).length) wd.updateConfig(patch)
+      return { config: wd.config, defaults: clone(WATCH_DEFAULTS) }
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_capabilities',
+    description: '【边界信息】这个插件能做什么、边界在哪：**支持的 MC 版本范围**（testedVersions）、底层 mineflayer 版本、'
+      + '支持的登录方式、工具命名空间、各种上限（序列步数/记忆大小/事件队列）以及当前配置要点。\n'
+      + '**进服前不确定版本能不能连时先看它**；确实不支持就如实告诉 Master，别硬试。',
+    parameters: {},
+    output: text(),
+    async execute(args, exec) {
+      const lib = libraryInfo()
+      return {
+        plugin: { name: 'whale_craft', version: PLUGIN_VERSION, dir: fileURLToPath(new URL('.', import.meta.url)) },
+        game: {
+          testedVersions: lib.testedVersions,
+          oldest: lib.oldest,
+          latest: lib.latest,
+          mineflayer: lib.mineflayer,
+          dataVersions: lib.dataVersions,
+          note: 'testedVersions = "实测可用"清单（也是上界拒绝的依据）。不在这份清单里的版本**可能**仍能连'
+            + '（协议数据更全），但属于未验证；连不上就如实反馈，别反复硬试。',
+        },
+        auth: {
+          modes: ['offline（离线账户）', 'yggdrasil（皮肤站/外置登录）'],
+          notSupported: ['microsoft（Mojang 官方正版登录）—— 暂不支持'],
+          note: '凭据只存本机 DSH 凭据库；AI 只能看到账户基本信息（innerID/ID/名字/UUID/服务器），看不到密码或 token。',
+        },
+        tools: {
+          namespaces: { mc_: '游戏内', mc_kit_: '游戏外辅助（记忆/发文件/画图）', mc_admin_: '管理（MC 模式看不见也调不动）' },
+          count: ourToolNames.length,
+          names: [...ourToolNames],
+        },
+        limits: {
+          sequence: { steps: 64, budgetMs: 600_000 },
+          memory: { textBytes: 256 * 1024, blobBytes: 16 * 1024 * 1024, files: 2000, depth: 5 },
+          eventsQueued: 200,
+          timeoutsMs: { lookAt: 4000, equip: 6000, dig: 25000, place: 6000, flyTo: 30000 },
+        },
+        config: {
+          file: pluginConfig.file,
+          keys: Object.keys(DEFAULT_CONFIG),
+          commandWhitelist: pluginConfig.get('commandWhitelist'),
+          allowAllCommands: pluginConfig.get('allowAllCommands'),
+          memoryDir: memoryFor(workspaceOf(exec?.agent)).root,
+          mcModePresets: pluginConfig.mcModePresets,
+        },
+        prompt: {
+          agentsMd: agentsMdPath(memoryFor(workspaceOf(exec?.agent)).root),
+          injectWhaleCraftAgentsMd: pluginConfig.get('injectWhaleCraftAgentsMd'),
+          injectWorkspaceAgentsMd: pluginConfig.get('injectWorkspaceAgentsMd'),
+        },
+      }
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_sessions',
+    description: '列出当前所有活跃的 MC 会话实例（诊断用：确认各会话的 bot 状态、连接信息）。',
+    parameters: {},
+    output: text(),
+    async execute() {
+      return {
+        note: '每会话独立实例；事件只经 mc_watch 回各自会话。',
+        sessions: registry.listSessions(),
+      }
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_events',
+    description: '读取/消费当前会话的 MC 事件队列（看门狗记录的一切：聊天、受伤、死亡、被传送、捡物、上下线）。'
+      + '默认消费掉；peek=true 只看不清。给 waitSec 则先阻塞等待最多这么久（替代旧的 mc_wait）。',
+    parameters: {
+      limit: { type: 'number', description: '最多取几条（默认 20）' },
+      kind: { type: 'string', description: '只看某类：chat / system / damage / lifecycle' },
+      peek: { type: 'boolean', description: 'true=只看不消费' },
+      waitSec: { type: 'number', description: '先等最多几秒（默认 0=不等，上限 120）' },
+    },
+    output: text(),
+    timeoutMs: 130_000,
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      const limit = Math.min(Math.max(Number(args.limit ?? 20), 1), 100)
+      const kind = args.kind ? String(args.kind) : null
+
+      // 可选阻塞等待（吸收原 mc_wait）
+      const waitSec = Math.min(Math.max(Number(args.waitSec ?? 0), 0), 120)
+      let waitedMs = 0
+      if (waitSec > 0) {
+        const from = sess.events.length
+        const t0 = Date.now()
+        while (Date.now() - t0 < waitSec * 1000) {
+          if (exec?.signal?.aborted) break              // 用户按停止 → 别空等
+          if (sess.events.slice(from).some((e) => !kind || e.kind === kind)) break
+          await new Promise((r) => setTimeout(r, 250))
+        }
+        waitedMs = Date.now() - t0
+      }
+
+      const list = args.peek
+        ? sess.events.filter((e) => !kind || e.kind === kind).slice(-limit)
+        : sess.drainEvents(limit, kind)
+      return { waitedMs, count: list.length, events: list }
+    },
+  }))
+
+  /* ── 世界读取 ── */
+
+  ctx.tools.register(asTool({
+    name: 'mc_scan',
+    description: '扫描我周围方块：给 name 就找这种方块的位置；不给就返回方块统计。',
+    parameters: {
+      radius: { type: 'number', description: '水平半径（默认 8，上限 24）' },
+      height: { type: 'number', description: '垂直范围 ±（默认 4，上限 16）' },
+      name: { type: 'string', description: '可选：只找这种方块（如 oak_log）' },
+      limit: { type: 'number', description: 'name 模式下最多返回几个（默认 10）' },
+    },
+    output: text(),
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      await sess.bot.waitForChunks()
+      return sess.bot.scan({
+        radius: args.radius, height: args.height,
+        name: args.name ? String(args.name) : null,
+        limit: args.limit,
+      })
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_map',
+    description: '看周围地形。format="chars"（默认）返回**字符地形图**（无视觉也能读：'
+      + '@ 是我 · ~ 水 · . 沙 · " 草木 · T 木构 · : 石/建筑 · _ 土/农田 · # 白 · ? 未加载）；'
+      + 'format="image" 额外生成**俯视图像**（**模型有视觉时直接能看**，也能在回复里发给用户）；'
+      + 'format="both" 两者都给。字符图省 token 且坐标精确；形状/外观问题用图像。',
+    parameters: {
+      radius: { type: 'number', description: '半径（默认 32，上限 96）' },
+      glyphStep: { type: 'number', description: '字符图抽稀步长（默认 2；1 最细）' },
+      yTop: { type: 'number', description: '地表搜索起始高度偏移（默认 +10）' },
+      yBottom: { type: 'number', description: '向下搜索深度（默认 -24）' },
+      format: { type: 'string', description: 'chars（默认）/ image / both' },
+      scale: { type: 'number', description: '图像每格放大倍数（默认 4，1–16）' },
+      share: { type: 'boolean', description: 'true=生成图像后**直接上传**，返回可直接发给用户的内联 markdown' },
+      shareTitle: { type: 'string', description: 'share 时的标题（默认「Minecraft 地图」）' },
+    },
+    output: {
+      schema: { type: 'object', properties: {}, additionalProperties: true },
+      render: (args, value) => {
+        const blocks = [{ type: 'text', text: String(value?.text ?? JSON.stringify(value, null, 2)) }]
+        // 图像以附件形式内联；纯文本模型由宿主自动降级成文本占位
+        if (value?.image?.attachment) blocks.push({ type: 'image', attachment: value.image.attachment })
+        return blocks
+      },
+    },
+    timeoutMs: 60_000,
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      await sess.bot.waitForChunks()
+      const format = String(args.format ?? 'chars').toLowerCase()
+      const step = Math.max(1, Number(args.glyphStep ?? 2))
+      const hm = sess.bot.heightmap({ radius: args.radius, yTop: args.yTop, yBottom: args.yBottom })
+
+      const out = {
+        center: hm.center, radius: hm.radius, unloadedTiles: hm.unloaded,
+        legend: hm.legend.slice(0, 15),
+        format,
+      }
+      if (format === 'chars' || format === 'both') {
+        out.glyphMap = McBot.glyphMap(hm.names, step, { x: hm.radius, y: hm.radius })
+      }
+      if (format === 'image' || format === 'both') {
+        const img = sess.bot.mapImage({
+          radius: args.radius, yTop: args.yTop, yBottom: args.yBottom, scale: args.scale,
+        })
+        const png = encodePng(img.width, img.height, img.rgba)
+        out.image = { width: img.width, height: img.height, bytes: png.length, scale: img.scale }
+
+        // ① 内联给模型/前端看
+        const att = ctx.get('attachments')
+        if (att && typeof att.saveImage === 'function') {
+          try {
+            out.image.attachment = await att.saveImage({
+              data: new Uint8Array(png), mediaType: 'image/png', name: 'mc-map.png',
+            })
+          } catch (e) { out.image.attachmentError = e.message }
+        } else {
+          out.image.attachmentError = '宿主没有 attachments 服务'
+        }
+        // ② 顺手落盘（落到**本会话工作区**的 out/ 或兜底目录），便于发给用户 / 用 read_image 再看
+        try {
+          const { writeFileSync, mkdirSync } = await import('node:fs')
+          const dir = join(workspaceRootFor(exec?.agent), 'out')
+          if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+          const file = `${dir}mc-map-${Date.now()}.png`
+          writeFileSync(file, png)
+          out.image.file = file
+          // ③ share:true 时**直接上传**，把现成的内联 markdown 给出去——
+          //    免得 AI 还要多调一次 mc_kit_share（它没有 shell，不会自己上传）
+          if (args.share) {
+            try {
+              const shared = await uploadToFileHost(ctx, {
+                data: png, name: 'mc-map.png', title: args.shareTitle ?? 'Minecraft 地图',
+              })
+              out.image.share = shared
+              out.image.markdown = shared.markdown
+            } catch (e) { out.image.shareError = e.message }
+          }
+        } catch (e) { out.image.fileError = e.message }
+      }
+      return out
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_entities',
+    description: '附近有哪些实体（玩家/生物/掉落物）及距离。',
+    parameters: { radius: { type: 'number', description: '半径（默认 24）' } },
+    output: text(),
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      await sess.bot.waitForChunks()
+      return { entities: sess.bot.entities(Number(args.radius ?? 24)) }
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_inventory',
+    description: '看背包和手持物品。',
+    parameters: {},
+    output: text(),
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      return sess.bot.inventory()
+    },
+  }))
+
+  /* ── 行动 ── */
+
+  ctx.tools.register(asTool({
+    name: 'mc_move',
+    description: '移动。mode="walk" 走过去（自动避障/游泳）；mode="fly" 创造模式直飞（最稳，创造模式默认用它）；'
+      + 'mode="jump" 原地跳一下（爬台阶/脱困，不需要坐标）。',
+    parameters: {
+      x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
+      mode: { type: 'string', description: 'walk / fly / jump（创造模式缺省 fly；jump 不需要坐标）' },
+      budgetMs: { type: 'number', description: 'walk 的最长时间（默认 40000，上限 90000）' },
+    },
+    output: text(),
+    timeoutMs: 120_000,
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      const mode = String(args.mode ?? '')
+      if (mode === 'jump') return sess.bot.jump()
+      if (args.x === undefined || args.y === undefined || args.z === undefined) {
+        throw new Error('walk/fly 需要 x/y/z；只想跳一下请给 mode:"jump"')
+      }
+      const target = { x: Number(args.x), y: Number(args.y), z: Number(args.z) }
+      const creative = sess.bot.bot?.game?.gameMode === 'creative'
+      const use = mode || (creative ? 'fly' : 'walk')
+      if (use === 'fly') return sess.bot.flyTo(target.x, target.y, target.z)
+      if (use !== 'walk') throw new Error(`未知 mode："${use}"（可用 walk / fly / jump）`)
+      return sess.bot.walkTo(target, { budget: Math.min(Number(args.budgetMs ?? 40_000), 90_000) })
+    },
+  }))
+
+  /* ── 行动：看向/走近/放置/破坏/使用/攻击/装备/丢弃（统一入口）── */
+
+  ctx.tools.register(asTool({
+    name: 'mc_act',
+    description: '与游戏世界互动（**优先用这个，而不是服务器指令**）。mode：\n'
+      + '· look   看向坐标(x,y,z)或玩家(who)——"看向我"就是 look + who\n'
+      + '· toward 看向并走近某个玩家(who)\n'
+      + '· place  把背包方块放到 (x,y,z)；悬空时会先垫脚搭上去（=搭高）\n'
+      + '· break  破坏 (x,y,z) 的方块\n'
+      + '· use    使用/激活方块(x,y,z)或实体(who)：开门、按按钮、拉杆、喂动物\n'
+      + '· attack 攻击 4.5 格内的实体（可给 who 指定名字）\n'
+      + '· equip  把背包里的物品拿到手上(name)\n'
+      + '· toss   丢弃物品(name, count)',
+    parameters: {
+      mode: { type: 'string', description: 'look / toward / place / break / use / attack / equip / toss' },
+      who: { type: 'string', description: '玩家或实体名（look/toward/use/attack 用）' },
+      x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
+      name: { type: 'string', description: '方块或物品名（place/equip/toss 用）' },
+      count: { type: 'number', description: 'toss 丢几个（默认 1）' },
+      approach: { type: 'boolean', description: 'toward 是否走近（默认 true）' },
+      budgetMs: { type: 'number' },
+    },
+    output: text(),
+    timeoutMs: 120_000,
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      const bot = sess.bot
+      const mode = String(args.mode ?? 'look')
+      switch (mode) {
+        case 'look':    return { mode, ...(await bot.lookAt(args)) }
+        case 'toward':  return { mode, ...(await bot.interact(args)) }
+        case 'place':   return { mode, ...(await bot.placeBlock(args)) }
+        case 'break':   return { mode, ...(await bot.breakBlock(args)) }
+        case 'use':     return { mode, ...(await bot.useBlock(args)) }
+        case 'attack':  return { mode, ...(await bot.attack(args)) }
+        case 'equip':   return { mode, ...(await bot.equip({ name: args.name })) }
+        case 'toss':    return { mode, ...(await bot.tossItem({ name: args.name, count: args.count })) }
+        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/break/use/attack/equip/toss）`)
+      }
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_give',
+    description: '**创造模式直接获取物品**（不走 /give 指令——那是协议级改槽位，非 OP 也能用）。'
+      + '给英文物品 id，如 oak_planks / diamond_sword / white_concrete。clearAll=true 清空背包。',
+    parameters: {
+      name: { type: 'string', description: '物品英文 id（如 oak_planks）' },
+      count: { type: 'number', description: '数量（默认 1，上限该物品堆叠数）' },
+      slot: { type: 'number', description: '指定槽位 0-44（缺省自动找快捷栏空位）' },
+      clearAll: { type: 'boolean', description: 'true=清空整个背包（忽略 name）' },
+    },
+    output: text(),
+    timeoutMs: 60_000,
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      if (args.clearAll) return sess.bot.clearInventory()
+      return sess.bot.giveItem({ name: args.name, count: args.count, slot: args.slot })
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_sequence',
+    description: '**按顺序执行一串世界交互**（替代"写脚本"）：适合"走到这里放几个方块，再走到那里放几个"这类连串动作。\n'
+      + 'steps 是数组，每项 op 可为：wait(sec) / move(x,y,z,mode) / look(x,y,z 或 who) / toward(who) / '
+      + 'place(x,y,z,name) / break(x,y,z) / dig(name 或 x,y,z,count) / use(x,y,z 或 who) / attack(who) / '
+      + 'equip(name) / give(name,count) / toss(name,count) / say(text) / jump。\n'
+      + '逐步执行，默认遇错即停，整体有预算上限（默认 300s）。',
+    parameters: {
+      steps: { type: 'array', items: { type: 'object', additionalProperties: true }, description: '步骤数组（上限 64）' },
+      stopOnError: { type: 'boolean', description: '出错是否停（默认 true）' },
+      budgetMs: { type: 'number', description: '总预算（默认 300000）' },
+    },
+    output: text(),
+    timeoutMs: 600_000,
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      return sess.bot.runSequence(args.steps, {
+        stopOnError: args.stopOnError !== false,
+        budgetMs: Math.min(Number(args.budgetMs ?? 300_000), 570_000),
+      })
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_build',
+    description: '批量搭方块：把 (x1,y1,z1)–(x2,y2,z2) 这个实心长方体用 name 方块搭出来（会自己走近/垫脚，上限 max 个）。'
+      + '适合"搭一面墙/一根柱子/一个平台"，比一个个 mc_act{place} 省事。',
+    parameters: {
+      x1: { type: 'number', required: true }, y1: { type: 'number', required: true }, z1: { type: 'number', required: true },
+      x2: { type: 'number', required: true }, y2: { type: 'number', required: true }, z2: { type: 'number', required: true },
+      name: { type: 'string', description: '用哪种方块（缺省背包第一种）' },
+      max: { type: 'number', description: '最多放几个（默认 64，防手滑）' },
+    },
+    output: text(),
+    timeoutMs: 180_000,
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      return sess.bot.build({
+        x1: Number(args.x1), y1: Number(args.y1), z1: Number(args.z1),
+        x2: Number(args.x2), y2: Number(args.y2), z2: Number(args.z2),
+        name: args.name ? String(args.name) : null,
+        max: Math.min(Math.max(Number(args.max ?? 64), 1), 256),
+      })
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_dig',
+    description: '挖方块：给 name 挖最近的，或给 pos 挖指定坐标；count 可连续挖多个。',
+    parameters: {
+      name: { type: 'string' }, x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
+      maxDistance: { type: 'number', description: '搜索半径（默认 6）' },
+      count: { type: 'number', description: '挖几个（默认 1，上限 16）' },
+    },
+    output: text(),
+    timeoutMs: 120_000,
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      const pos = (args.x !== undefined && args.y !== undefined && args.z !== undefined)
+        ? { x: Number(args.x), y: Number(args.y), z: Number(args.z) } : null
+      const lines = await sess.bot.dig({
+        name: args.name ? String(args.name) : null, pos,
+        maxDistance: args.maxDistance, count: args.count,
+      })
+      return { result: lines }
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_command',
+    description: '以玩家身份执行服务器指令。**白名单可配置**（默认 tp/give/time/weather/say/gamemode/effect/'
+      + 'setblock/fill/clone/summon/title/clear/xp）。要放行别的指令，在**普通会话**里用 `mc_admin_config` 改 '
+      + '`commandWhitelist`（MC 模式会话改不了）。\n'
+      + '⚠️ 这是**最后手段**：正经动作优先 `mc_act` / `mc_build` / `mc_move`（那些不需要 OP）。',
+    parameters: { command: { type: 'string', required: true, description: '以 / 开头的完整指令' } },
+    output: text(),
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      const raw = String(args.command ?? '').trim()
+      const name = raw.replace(/^\//, '').split(/\s+/)[0].toLowerCase()
+      if (!pluginConfig.commandAllowed(name)) {
+        throw new Error(`指令 /${name} 不在白名单里。当前白名单：${JSON.stringify(pluginConfig.get('commandWhitelist'))}`
+          + '（要放行请在普通会话里用 mc_admin_config 改 commandWhitelist）')
+      }
+      return { sent: sess.bot.command(raw, { allow: (n) => pluginConfig.commandAllowed(n) }) }
+    },
+  }))
+
+  /* ── 给用户发图片/文件（插件自己走回环上传，会话不需要 shell）── */
+
+  ctx.tools.register(asTool({
+    name: 'mc_kit_share',
+    description: '把工作区里的一个文件上传到托管服务，得到**能直接发给用户的公网链接**。\n'
+      + '· 图片（png/jpg/svg/webp…）→ 返回值里的 `markdown` 字段是现成的内联语法，'
+      + '把它**原样写进你的回复**，图片就会在对话里内联显示（这是用户要的效果）。\n'
+      + '· 非图片文件 → 没有卡片语法，只能给可点链接。\n'
+      + '· 默认 24h 过期自动清理。path 必须在工作区内。',
+    parameters: {
+      path: { type: 'string', required: true, description: '要上传的文件路径（工作区内；绝对或相对工作区）' },
+      title: { type: 'string', description: '这一批的标题（展示用）' },
+      ttlMs: { type: 'number', description: '有效期毫秒（默认服务端 24h）' },
+    },
+    output: text(),
+    timeoutMs: 90_000,
+    async execute(args, exec) {
+      // 路径按**本会话工作区**解析（插件装在哪与此无关）
+      const raw = String(args.path ?? '').trim()
+      if (!raw) throw new Error('path 不能为空')
+      const abs = insideWorkspace(raw, exec?.agent)
+      const { readFileSync, statSync } = await import('node:fs')
+      if (!existsSync(abs)) throw new Error(`文件不存在：${abs}`)
+      const st = statSync(abs)
+      if (!st.isFile()) throw new Error(`不是文件：${abs}`)
+
+      const data = readFileSync(abs)
+      const name = abs.split(/[\\/]/).pop()
+      return await uploadToFileHost(ctx, { data, name, title: args.title, ttlMs: args.ttlMs })
+    },
+  }))
+
+  /* ── 图像：SVG 为编辑语言（写/引图/光栅化/保存）──
+   * 用户的思路：SVG 是文本，AI 本来就会写——拼网格/画框/加文字（含中文）都在 SVG 里表达，
+   * 我们只补它做不到的两件事：**把外部图片塞进 SVG**（embed）和 **SVG→PNG**（render）。
+   * ------------------------------------------------------------------------ */
+
+  /** 把用户给的路径解析到**这个会话的工作区**内（不许越界） */
+  const insideWorkspace = (raw, agent) => {
+    const root = workspaceRootFor(agent)
+    const abs = resolve(root, String(raw ?? '').trim())
+    const prefix = root.endsWith(sep) ? root : root + sep
+    if (abs !== root && !abs.startsWith(prefix)) {
+      throw new Error(`路径必须在工作区内（${root}）`)
+    }
+    return abs
+  }
+
+  ctx.tools.register(asTool({
+    name: 'mc_kit_image',
+    description: '图像能力。**SVG 是编辑语言**：布局/画矩形框/加文字（含中文）/拼网格，'
+      + '都可以直接写 SVG 文本（用 write 存成 .svg），再用这个工具光栅化成 PNG。\n'
+      + 'action：\n'
+      + '· info    看一张图的尺寸/格式（也能确认文件到底是不是能用的图）\n'
+      + '· embed   把图片变成 data URI + 现成的 `<image>` 标签 —— **往 SVG 里引入图片必须这么做**\n'
+      + '· render  SVG → PNG（可给 width/height/scale；svg 文本或 svgPath 二选一）\n'
+      + '· grid    把多张图按网格拼成**可继续编辑的 SVG 文本**（省掉重复写 N 个 <image> 和算坐标）\n'
+      + '· save    把 SVG 文本或 PNG 字节落盘\n'
+      + '产出的 PNG 可以直接 mc_kit_share 发给用户。',
+    parameters: {
+      action: { type: 'string', description: 'info / embed / render / grid / save' },
+      path: { type: 'string', description: '输入文件（info/embed 用）' },
+      out: { type: 'string', description: '输出路径（render/save 用）' },
+      svg: { type: 'string', description: 'render：SVG 文本' },
+      svgPath: { type: 'string', description: 'render：SVG 文件路径' },
+      width: { type: 'number', description: 'render：目标宽' },
+      height: { type: 'number', description: 'render：目标高' },
+      scale: { type: 'number', description: 'render：倍率（2=两倍清晰度）' },
+      paths: { type: 'array', items: { type: 'string' }, description: 'grid：要拼的图片路径（按顺序）' },
+      cols: { type: 'number', description: 'grid：列数（默认自动）' },
+      cell: { type: 'number', description: 'grid：每格最长边（默认 256）' },
+      gap: { type: 'number', description: 'grid：格子间距（默认 8）' },
+      labels: { type: 'array', items: { type: 'string' }, description: 'grid：每格标签（可中文）' },
+      title: { type: 'string', description: 'grid：整图标题' },
+    },
+    output: text(),
+    timeoutMs: 120_000,
+    async execute(args, exec) {
+      const inWs = (p) => insideWorkspace(p, exec?.agent)
+      if (!ImageEngine.available()) {
+        throw new Error(`图像引擎不可用：${imageEngineError() ?? 'sharp 未解析到'}`)
+      }
+      const action = String(args.action ?? '').toLowerCase()
+      const needOut = (dflt) => {
+        const p = args.out ? inWs(args.out) : inWs(dflt)
+        return p
+      }
+
+      switch (action) {
+        case 'info':
+          return await ImageEngine.info(inWs(args.path))
+
+        case 'embed': {
+          const r = await ImageEngine.embed(inWs(args.path), {
+            asTag: true, x: args.x ?? 0, y: args.y ?? 0, width: args.width, height: args.height,
+          })
+          // data URI 很长，别原样刷屏：给长度 + 现成标签 + 用法
+          return {
+            file: r.file, mime: r.mime, bytes: r.bytes, dataUriLength: r.dataUri.length,
+            tag: r.tag, note: r.note,
+          }
+        }
+
+        case 'render': {
+          if (!args.svg && !args.svgPath) throw new Error('render 需要 svg 文本或 svgPath')
+          const r = await ImageEngine.render({
+            svg: args.svg ?? null,
+            svgPath: args.svgPath ? inWs(args.svgPath) : null,
+            width: args.width, height: args.height, scale: args.scale,
+          })
+          const out = needOut('out/mc-image.png')
+          const saved = ImageEngine.save(out, r.png)
+          return { rendered: `${r.width}x${r.height}`, ...saved, hint: '要发给用户就 mc_kit_share 这个文件' }
+        }
+
+        case 'grid': {
+          const r = await ImageEngine.grid({
+            paths: (args.paths ?? []).map((p) => inWs(p)),
+            cols: args.cols, cell: args.cell, gap: args.gap,
+            labels: args.labels, title: args.title,
+          })
+          const out = needOut('out/mc-grid.svg')
+          ImageEngine.save(out, r.svg)
+          return {
+            svg: `${r.width}x${r.height}`, cells: r.cells, layout: `${r.cols}x${r.rows}`,
+            file: out, bytes: Buffer.byteLength(r.svg),
+            note: '这是**可继续编辑的 SVG 文本**：想加标注就改这个文件（画 <rect stroke>、加 <text>），'
+              + '再 mc_kit_image{action:"render"} 光栅化成 PNG。',
+          }
+        }
+
+        case 'save': {
+          if (!args.svg && !args.path) throw new Error('save 需要 svg（文本）或 path（要复制的文件）')
+          const out = needOut('out/mc-image.svg')
+          if (args.svg) { const s = ImageEngine.save(out, String(args.svg)); return { ...s, kind: 'svg' } }
+          const src = inWs(args.path)
+          const { readFileSync } = await import('node:fs')
+          const s = ImageEngine.save(out, readFileSync(src))
+          return { ...s, kind: 'copy', from: src }
+        }
+
+        default:
+          throw new Error(`未知 action："${action}"（可用 info/embed/render/grid/save）`)
+      }
+    },
+  }))
+
+  /* ── 长期记忆（游戏外通用能力，所以叫 mc_kit_ 不叫 mc_）──
+   * 固定 <工作区>/.whale-craft/：AI 维护 README.md 索引，按服务器建子文件夹，
+   * 任意格式文件可读写（含图片），**不执行任何东西**。
+   * ------------------------------------------------------------------------ */
+
+  ctx.tools.register(asTool({
+    name: 'mc_kit_memory',
+    description: '长期记忆（跨会话、重启后还在）。固定放在工作区的 **`.whale-craft/`** 文件夹里，'
+      + '按服务器建子文件夹（`_global/` 放通用的）。\n'
+      + '**索引由你自己维护**：`.whale-craft/README.md`（插件每轮把它的内容 + 一份自动目录树注入你的上下文，'
+      + '所以就算忘了更新 README 也不会失真；但记得**改了记忆就顺手更新 README**）。\n'
+      + 'action：\n'
+      + '· index（默认）看总览：有哪些文件夹/文件、各多少条、README 现状\n'
+      + '· read    读文件（path 或 topic+server）；**读图片会作为附件给你，你能直接看到**\n'
+      + '· append  追加一条（最常用；给 key 则**覆盖**同 key 的那条，不会堆积）——只对文本文件\n'
+      + '· write   整文件覆盖（重组内容、写小标题/表格）——文本文件\n'
+      + '· put     把自己读到的**任意文件（图片最常用）复制进记忆**，之后可随时 read 出来看\n'
+      + '· delete  删文件（path 指向目录则整目录删）\n'
+      + '· search  跨文本文件搜关键词，返回命中行\n'
+      + '路径写法：`path:"mc.example.com/maps/town.png"`，或 `topic:"landmarks"`（server 默认取你当前所在服，'
+      + '不传 server 就写进 `_global/`）。\n'
+      + '⚠️ 这个文件夹里**只读写文件，不执行任何东西**（没有 shell、不跑脚本）。',
+    parameters: {
+      action: { type: 'string', description: 'index（默认）/ read / append / write / put / delete / search' },
+      path: { type: 'string', description: '相对路径，如 mc.example.com/landmarks.md（与 topic 二选一）' },
+      topic: { type: 'string', description: '主题名（会拼成 <server>/<topic>.md）' },
+      server: { type: 'string', description: '服务器文件夹；默认当前所在服，不传则 _global' },
+      text: { type: 'string', description: 'append 的内容（一条事实，一句话说清）' },
+      content: { type: 'string', description: 'write 的完整内容（文本文件）' },
+      key: { type: 'string', description: 'append 用：同 key 覆盖（如 "用户叫什么"）' },
+      source: { type: 'string', description: 'put 用：要存入记忆的文件路径（工作区内；图片最常用）' },
+      name: { type: 'string', description: 'put 用：存进去的名字（缺省用原文件名）' },
+      query: { type: 'string', description: 'search 的关键词' },
+      limit: { type: 'number', description: 'search 最多几条（默认 30）' },
+    },
+    output: {
+      schema: { type: 'object', properties: {}, additionalProperties: true },
+      render: (args, value) => {
+        const blocks = [{ type: 'text', text: String(value?.text ?? JSON.stringify(value, null, 2)) }]
+        // read 到图片时把它作为附件带出去 —— 这样模型**能直接看到**存下来的图
+        if (value?.attachment) blocks.push({ type: 'image', attachment: value.attachment })
+        return blocks
+      },
+    },
+    async execute(args, exec) {
+      const mem = memoryFor(workspaceOf(exec?.agent))
+      const action = String(args.action ?? 'index').toLowerCase()
+      if (action === 'index') return mem.overview()
+
+      // put：把工作区里的源文件复制进记忆（图片最常用；任何格式都行）
+      if (action === 'put') {
+        const src = insideWorkspace(args.source, exec?.agent)
+        let server = args.server
+        if (server === undefined && args.path === undefined) {
+          const sess = getSession(exec)
+          server = sess.bot.sub ?? null
+        }
+        return mem.put({ source: src, name: args.name, path: args.path, server })
+      }
+
+      // 只在"没显式给 server 且没给 path"时，才用当前所在服兜底
+      let server = args.server
+      if (server === undefined && args.path === undefined) {
+        const sess = getSession(exec)
+        server = sess.bot.sub ?? null      // 不在线 → null → 落进 _global
+      }
+
+      const sel = { path: args.path, topic: args.topic, server }
+      switch (action) {
+        case 'read': {
+          const r = mem.read(sel)
+          // 读的是图片 → 顺手做成附件，render 会把它当 image 块发出去（模型就能看到）
+          if (r.kind === 'image') {
+            const att = ctx.get('attachments')
+            if (att && typeof att.saveImage === 'function') {
+              try {
+                const { readFileSync } = await import('node:fs')
+                r.attachment = await att.saveImage({
+                  data: new Uint8Array(readFileSync(r.file)),
+                  mediaType: r.mediaType ?? 'image/png',
+                  name: r.path.split('/').pop(),
+                })
+              } catch (e) { r.attachmentError = e.message }
+            } else {
+              r.attachmentError = '宿主没有 attachments 服务'
+            }
+          }
+          return r
+        }
+        case 'append': return mem.append({ ...sel, text: args.text, key: args.key })
+        case 'write':  return mem.write({ ...sel, content: args.content })
+        case 'delete': return mem.delete(sel)
+        case 'search': return mem.search({ query: args.query, limit: args.limit })
+        default: throw new Error(`未知 action："${action}"（可用 index/read/append/write/put/delete/search）`)
+      }
+    },
+  }))
+
+  /* ── 总索引自动注入系统提示（用户要求：自动注入 + 提醒及时读）── */
+
+  /** 记忆索引的正文（按工作区渲染；`store` 的根不存在且要求静默时返回空串） */
+  const memoryIndexText = (store, { silentWhenMissing = false } = {}) => {
+    if (silentWhenMissing && !existsSync(store.root)) return ''
+    // 没记忆时不占位（第一次 append 后自动出现）
+    const files = store.list()
+    if (!files.length) {
+      return '【麦块长期记忆】现在是空的（`.whale-craft/`）。学到值得记住的事（用户是谁、地标坐标、约定）就用 '
+        + '`mc_kit_memory {action:"append", topic:"<主题>", text:"..."}` 记下来，'
+        + '并在 `.whale-craft/README.md` 里补一行索引。'
+    }
+    return '【麦块长期记忆】根目录 `.whale-craft/`（其中 `README.md` 是**你维护的索引**）\n\n'
+      + store.indexText()
+      + '\n\n**要动手前先读相关文件**（`mc_kit_memory {action:"read", path:"..."}`）——'
+      + '别凭印象做事；不确定就先 `search`。新学到的事实随手 `append`，'
+      + '并且**改了记忆就顺手更新 `.whale-craft/README.md`**。'
+  }
+
+  /**
+   * 全局兜底注入：**只在没有 agent 上下文**（或拿不到工作区）时兜一手，
+   * 而且那个兜底根不存在就**什么都不注入**（免得在别人机器上给每个会话塞一段空记忆提示）。
+   * 真正的"按工作区"注入在下面 `installMemoryIndex(agent)`（scoped 层会 shadow 这个全局层）。
+   *
+   * 🔴 必须**只**通过 `ctx.inject(['systemPrompt'], cb)` 注册：
+   *    Cordis 规定「访问 `ctx.systemPrompt` 这种属性必须先 inject」
+   *    （`cannot get property "systemPrompt" without inject`）——`ctx.get()` 才豁免。
+   *    直接 `injectMemoryIndex(ctx)` 会把整棵插件树带崩（隔离实例实测踩到）。
+   */
+  const injectMemoryIndex = (scope) => {
+    scope.systemPrompt.context({
+      name: 'whale_craft:memory-index',
+      // 比宿主自留段（沙箱 110 / 审批 115 / 子 agent 120）靠后，紧贴运行期上下文
+      order: 200,
+      text: () => memoryIndexText(memory, { silentWhenMissing: true }),
+    })
+  }
+  ctx.inject(['systemPrompt'], (scope) => injectMemoryIndex(scope))
+
+  /**
+   * **按会话工作区**注入记忆索引（每个 agent 一次；scoped 注册会 shadow 全局那份）。
+   * 用 `agent.ctx.get('systemPrompt')`：`ctx.get()` 不受"必须先 inject"约束（同上面的教训）。
+   */
+  const memoryIndexInstalled = new WeakSet()
+  const installMemoryIndex = (agent) => {
+    if (!agent?.ctx || memoryIndexInstalled.has(agent)) return
+    let sp = null
+    try { sp = agent.ctx.get('systemPrompt') } catch { sp = null }
+    if (!sp || typeof sp.context !== 'function') return
+    memoryIndexInstalled.add(agent)
+    const store = memoryFor(workspaceOf(agent))
+    sp.context({
+      name: 'whale_craft:memory-index',
+      order: 200,
+      text: () => memoryIndexText(store),
+    })
+  }
+
+  /* ─────────── MC 模式：权限隔离 + 专属指导（用户 2026-09-16 要求）───────────
+   * 判定"是不是 MC 模式"：`agentPresets.composedPreset(agent.ctx)` 落在配置的
+   * `mcModePresets` 里。然后做三件事：
+   *   ① 工具可见性：对这个 agent 挂 `tools.restrict`（隐藏 mc_admin_*，以及配置的白/黑名单）
+   *   ② 工具执行：注册**全局 guard** 硬拒 mc_admin_*（即使隐藏失效也调不动）
+   *   ③ 提示词：注入 whale_craft 专属指导（宿主的 AGENTS.md 注入之外，另加这一段）
+   * ------------------------------------------------------------------------ */
+
+  /** 宿主 agentPresets 服务（可能晚就绪 → 必须走 inject 等，别用 apply 时的 ctx.get） */
+  let agentPresetsSvc = null
+  ctx.inject(['agentPresets'], (scope) => { agentPresetsSvc = scope.get('agentPresets') ?? null })
+
+  const isMcModeAgent = (agent) => {
+    if (!agent?.ctx) return false
+    try {
+      const id = agentPresetsSvc?.composedPreset?.(agent.ctx)
+      return pluginConfig.isMcModePreset(id)
+    } catch { return false }
+  }
+
+  /** 取某个 agent scope 上的 tools 服务：restrict **必须**用 scoped 服务，否则会被宿主拒绝 */
+  const scopedTools = (agentCtx) => {
+    const pickers = [() => agentCtx.get('tools'), () => agentCtx.tools]
+    for (const pick of pickers) {
+      try {
+        const t = pick()
+        if (t && typeof t.restrict === 'function') return t
+      } catch { /* 该 scope 没 inject 时属性访问会抛，换下一种拿法 */ }
+    }
+    return null
+  }
+
+  /** MC 模式专属指导（用户要求："我们也加上我们这个模式的专门提示词注入、指导之类"） */
+  const MC_MODE_GUIDANCE = [
+    '【whale_craft · 麦块模式专属指导】',
+    '',
+    '你现在是"进游戏玩"的那个 Agent。约定如下：',
+    '1. **单对话**：主线信息都在这一个对话里。事件唤醒**只有** `mc_watch` 看门狗一条通道（它直接往本会话注入提示词）；',
+    '   **不要**另开会话、不要轮询、不要跨会话推送。',
+    '2. **工具分三层，用对**：`mc_*` 游戏内动作 · `mc_kit_*` 游戏外辅助（记忆/发文件/画图）· ',
+    '   `mc_admin_*` 管理配置——**MC 模式用不了**（要改配置请让用户在普通会话里改）。',
+    '3. **记忆**：根目录 `.whale-craft/`，索引是**你维护的 `README.md`**。开工前先读相关文件；',
+    '   学到新事实随手 `mc_kit_memory {action:"append"}`，并把 README 的索引补上。',
+    '   那个文件夹里**只读写文件、不执行任何东西**（本模式没有 shell，也别指望跑脚本）。',
+    '4. **服务器指令是最后手段**（还要 OP）：正经动作优先 `mc_act` / `mc_build` / `mc_move`。',
+    '5. 上线前先 `mc_entities` 看谁在线，别凭记忆写玩家名；没被要求就别在别人的建筑上乱挖乱建。',
+  ].join('\n')
+
+  /** 这个 agent 是否已经应用过 MC 模式策略（WeakSet：一个 agent 只做一次） */
+  const mcPolicyApplied = new WeakSet()
+
+  /**
+   * 已确认属于 MC 模式的会话 id（给前端 `/api/mc/mode` 兜底用）。
+   * 主路径是现场问 `agentPresets`（见 handleMcApi 的 /api/mc/mode），
+   * 这里只是"agent 已经不在了 / 拿不到 agentPresets"时的退路。
+   */
+  const mcModeAgentIds = new Set()
+
+  const applyMcModePolicy = (agent) => {
+    if (!agent || mcPolicyApplied.has(agent)) return
+    if (!isMcModeAgent(agent)) return
+    mcPolicyApplied.add(agent)
+    if (agent.id) mcModeAgentIds.add(String(agent.id))
+
+    // ① 提示词：本模式专属指导 + 行事准则（AGENTS.md）
+    try {
+      const sp = agent.ctx.get('systemPrompt')
+      if (sp && typeof sp.context === 'function') {
+        sp.context({ name: 'whale_craft:mode-guidance', order: 240, text: () => MC_MODE_GUIDANCE })
+
+        // 行事准则：`.whale-craft/AGENTS.md`（Master 可在「MC设置 → 提示词」里改；AI 不许读写）
+        // 文本是**函数**：开关/内容改了下一轮就生效，不用重建 agent。
+        sp.context({
+          name: 'whale_craft:agents-md',
+          order: 205,
+          text: () => {
+            if (pluginConfig.get('injectWhaleCraftAgentsMd') !== true) return ''
+            const cur = readAgentsMd(memoryRootFor(workspaceOf(agent)))
+            const tag = cur.source === 'custom' ? 'Master 自定义版' : '默认版'
+            return `【Whale Craft 行事准则 · .whale-craft/AGENTS.md（${tag}）】\n\n${cur.text.trim()}`
+          },
+        })
+
+        // 工作区 AGENTS.md：默认**不注入**；Master 在提示词页打开开关后才补一份
+        // （2026-09-16 实测：MC 模式下宿主本来就没注入它，所以这里是我们插件自己补）
+        sp.context({
+          name: 'whale_craft:workspace-agents-md',
+          order: 206,
+          text: () => {
+            if (pluginConfig.get('injectWorkspaceAgentsMd') !== true) return ''
+            try {
+              const p = join(workspaceRootFor(agent), 'AGENTS.md')
+              if (!existsSync(p)) return ''
+              const t = readFileSync(p, 'utf8').trim()
+              return t ? `【工作区 AGENTS.md（Master 打开了"注入工作区 AGENTS.md"）】\n\n${t}` : ''
+            } catch { return '' }
+          },
+        })
+
+        logLine(`MC 模式：已注入专属指导 + 行事准则（${agent.id}）`)
+      }
+    } catch (e) { logLine(`MC 模式提示词注入失败：${e.message}`) }
+
+    // ② 工具可见性：隐藏管理工具（以及配置里的白/黑名单）
+    try {
+      const t = scopedTools(agent.ctx)
+      if (!t) { logLine('MC 模式：拿不到 scoped tools，跳过可见性限制（guard 仍会硬拒）'); return }
+      const { allowOtherTools, denyOtherTools, hideAdminTools } = pluginConfig.mcMode
+      const adminNames = ourToolNames.filter((n) => n.startsWith('mc_admin_'))
+      const deny = [...denyOtherTools, ...(hideAdminTools ? adminNames : [])]
+
+      if (allowOtherTools.length) {
+        // 白名单模式：我们自己的非管理工具 + 配置里允许的"其它工具"
+        const allow = [...ourToolNames.filter((n) => !n.startsWith('mc_admin_')), ...allowOtherTools]
+        t.restrict({ allow })
+        logLine(`MC 模式：已应用工具白名单（${agent.id}）：${allow.join(', ')}`)
+      } else if (deny.length) {
+        t.restrict({ deny })
+        logLine(`MC 模式：已隐藏工具（${agent.id}）：${deny.join(', ')}`)
+      }
+    } catch (e) {
+      // 配置里写了宿主不认识的工具名会让 restrict 抛错 —— 退化成"只限制本插件自己的工具"
+      try {
+        const t = scopedTools(agent.ctx)
+        const safe = ourToolNames.filter((n) => n.startsWith('mc_admin_'))
+        if (t && safe.length) {
+          t.restrict({ deny: safe })
+          logLine(`MC 模式：配置里有 restrict 不认识的名字（${String(e.message).slice(0, 120)}）→ 退化为只隐藏管理工具`)
+        }
+      } catch (e2) { logLine(`MC 模式工具限制失败：${e2.message}`) }
+    }
+  }
+
+  // ③ 硬保证：MC 模式会话**调不动**管理工具（不管可见性怎样）
+  try {
+    ctx.tools.guard((exec) => {
+      const name = String(exec?.name ?? '')
+      if (!isMcModeAgent(exec?.agent)) return undefined
+
+      // ① 管理工具：MC 模式一律拒绝（隐藏之外再上一道硬锁）
+      if (name.startsWith('mc_admin_')) {
+        return 'MC 模式会话不能读取或修改 whale_craft 配置——请在普通会话里用 mc_admin_config 改。'
+      }
+
+      // ② 凭据文件与行事准则：不许用文件工具绕过去读写
+      if (/^(read|edit|write|glob|grep|ls|cat|mc_kit_memory)$/i.test(name)) {
+        const text = JSON.stringify(exec?.arguments ?? {})
+        if (/(\.credentials|credentials\.yaml|[/\\]\.dsh[/\\])/i.test(text)) {
+          return 'MC 模式不允许触碰宿主凭据文件；账号密码在「MC设置」里维护，AI 不需要也不应该看到。'
+        }
+        // ③ 明文凭据备忘（`secrets/` 下用户自己的私密档）：同样不许读
+        //    （2026-09-16：账户体系上线后，密码只该待在「MC设置 → 账户」里）
+        if (/[/\\]secrets[/\\]/i.test(text)) {
+          return 'MC 模式不允许读凭据备忘目录（secrets/）；账号密码在「MC设置 → 账户」里维护，AI 不需要也不应该看到。'
+        }
+        if (isAgentsMdPath(text)) {
+          return 'AGENTS.md 是给 Master 编辑的行事准则，AI 不能读写它（要改请在「MC设置 → 提示词」里改）。'
+        }
+      }
+      return undefined
+    })
+  } catch (e) { logLine(`注册 MC 模式 guard 失败：${e.message}`) }
+
+  // agent 建立 / 首轮开始时应用策略（preset 组合可能晚于 agent/created，所以两个时机都试）
+  // 每个 agent 都要做两件事：① 注入**本工作区**的记忆索引 ② 若是 MC 模式再套权限/指导
+  ctx.effect(() => {
+    const handlers = []
+    for (const ev of ['agent/created', 'agent/session-start']) {
+      try {
+        handlers.push(ctx.on(ev, ({ agent }) => {
+          try { installMemoryIndex(agent) } catch (e) { logLine(`记忆索引注入失败：${e.message}`) }
+          try { applyMcModePolicy(agent) } catch (e) { logLine(`MC 模式策略失败：${e.message}`) }
+        }))
+      } catch { /* 宿主没有这个事件就跳过 */ }
+    }
+    return () => { for (const off of handlers) { try { off?.() } catch {} } }
+  }, 'whale_craft: mc-mode policy')
+
+  /* ── 管理工具：只有**非 MC 模式**会话能用（MC 模式看不见 + 调了被 guard 拒）── */
+
+  ctx.tools.register(asTool({
+    name: 'mc_admin_config',
+    description: '【管理】读写 whale_craft 的**全局配置**（服务器指令白名单、MC 模式的工具暴露、记忆目录…）。\n'
+      + '⚠️ **只有非 MC 模式的会话能用**：麦块模式会话看不见、也调不动它（要改配置就在普通会话里改）。\n'
+      + 'action：\n'
+      + '· get（默认）看生效配置；给 path 只看某一项\n'
+      + '· set   改一项（path + value）\n'
+      + '· unset 删掉一项（回到默认值）· reset 全部恢复默认 · list 看默认值 + 生效值\n'
+      + '可用键：`commandWhitelist`（字符串数组；支持 "tp" 精确名、"/^gi.*/" 正则、"*" 全放行）· '
+      + '`mcModePresets`（哪些 preset 算 MC 模式）· `mcMode.allowOtherTools`（MC 模式工具白名单，非空即"只给这些"）· '
+      + '`mcMode.denyOtherTools`（黑名单）· `mcMode.hideAdminTools`（默认 true）· `memoryDir`。\n'
+      + '改完**立即生效**，落在 `<工作区>/.whale-craft/config.json`。（白名单只能"收窄"，不能凭空添加 preset 没挂的工具。）',
+    parameters: {
+      action: { type: 'string', description: 'get（默认）/ set / unset / reset / list' },
+      path: { type: 'string', description: '配置项点号路径，如 commandWhitelist 或 mcMode.allowOtherTools' },
+      value: { type: 'json', description: 'set 用的值（数组 / 字符串 / 布尔 / 对象）' },
+    },
+    output: text(),
+    async execute(args) {
+      const action = String(args.action ?? 'get').toLowerCase()
+      const info = { file: pluginConfig.file, lastError: pluginConfig.lastError ?? null }
+      switch (action) {
+        case 'get':
+          return args.path
+            ? { ...info, path: String(args.path), value: pluginConfig.get(args.path) }
+            : { ...info, values: pluginConfig.values() }
+        case 'set':
+          return { ...info, ...pluginConfig.set(args.path, args.value) }
+        case 'unset':
+          return { ...info, ...pluginConfig.unset(args.path) }
+        case 'reset':
+          return { ...info, ...pluginConfig.reset() }
+        case 'list':
+          return { ...info, values: pluginConfig.values(), defaults: DEFAULT_CONFIG, mcModePresets: pluginConfig.mcModePresets }
+        default:
+          throw new Error(`未知 action："${action}"（可用 get/set/unset/reset/list）`)
+      }
+    },
+  }))
+
+  /* ─────────── 扩展点：其他 Agent 往 extensions/ 丢文件就能加工具 ───────────
+   * 需求 6 的另一半："其他 Agent 要保留为它做扩展、写 Agent 的能力"。
+   * 任何 .mjs 导出 `apply(api)` 即可；api 里给了 asTool / getSession / registry /
+   * memory / ctx / config。这样别的会话可以给它加能力而**不用改这个文件**。
+   * 说明文档：whale_craft/extensions/README.md
+   * ------------------------------------------------------------------------ */
+
+  ctx.effect(() => {
+    const dir = fileURLToPath(new URL('./extensions/', import.meta.url))
+    if (!existsSync(dir)) return
+    let files = []
+    try { files = readdirSync(dir).filter((f) => f.endsWith('.mjs') || f.endsWith('.js')) } catch { return }
+    if (!files.length) return
+    void (async () => {
+      for (const f of files) {
+        try {
+          const mod = await import(new URL(`./extensions/${f}`, import.meta.url).href)
+          if (typeof mod.apply === 'function') {
+            await mod.apply({ ctx, config, registry, asTool, getSession, ensureWatchdog, memory, memoryFor, workspaceOf, logLine, Watchdog })
+            const label = mod.name ?? f
+            logLine(`扩展已加载：${label}`)
+            ctx.logger?.info?.(`[whale_craft] 扩展已加载：${label}`)
+          }
+        } catch (e) {
+          logLine(`扩展 ${f} 加载失败：${e.message}`)
+          ctx.logger?.warn?.(`[whale_craft] 扩展 ${f} 加载失败：${e.message}`)
+        }
+      }
+    })()
+  }, 'whale_craft: extensions')
+
+  /* ── 诊断 ── */
+
+  ctx.tools.register(asTool({
+    name: 'mc_diag',
+    description: '诊断：当前会话的机器人内部状态（物理/控制位/收包/事件队列）——排查"走不动/收不到消息"用。',
+    parameters: {},
+    output: text(),
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      const b = sess.bot.bot
+      if (!b?.entity) return { online: false, lastError: sess.bot.lastError, mode: sess.mode }
+      return {
+        online: true, version: b.version, physicsEnabled: b.physicsEnabled,
+        controlState: { forward: b.controlState?.forward, jump: b.controlState?.jump, sneak: b.controlState?.sneak },
+        velocity: b.entity.velocity, onGround: b.entity.onGround, inWater: b.entity.isInWater,
+        position: { x: Math.floor(b.entity.position.x), y: Math.floor(b.entity.position.y), z: Math.floor(b.entity.position.z) },
+        pendingEvents: sess.events.length, mode: sess.mode, stats: sess.bot.stats,
+        connection: sess.bot._connectionProfile ?? null,
+        watching: sess.watchdog?.status() ?? null,
+      }
+    },
+  }))
+}
+
+export default { name, inject, Config, apply }

@@ -1,0 +1,53 @@
+name: Release
+
+# 打一个 v* tag（例如 v0.3.0）就自动：跑检查 → npm pack → 建 GitHub Release 挂上 tarball。
+# 如果仓库里配了 NPM_TOKEN secret，顺带发 npm（没配就只发 GitHub Release，不会失败）。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 建 Release 要写权限
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          registry-url: 'https://registry.npmjs.org'
+      - run: npm ci --no-audit --no-fund
+
+      - name: 发布前必须全绿
+        run: node tools/check-core.mjs && node selfcheck.mjs
+
+      - name: tag 必须和 package.json 版本一致
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          echo "tag=$TAG  package.json=$PKG"
+          [ "$TAG" = "$PKG" ] || { echo "::error::tag 与 package.json 版本不一致"; exit 1; }
+
+      - name: npm pack
+        run: npm pack
+
+      - name: 建 GitHub Release 并挂上 tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            whale_craft-*.tgz
+
+      - name: 发 npm（只在配了 NPM_TOKEN 时执行）
+        if: ${{ env.NODE_AUTH_TOKEN != '' }}
+        run: npm publish --access public
