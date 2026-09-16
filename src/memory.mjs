@@ -18,8 +18,10 @@
  *       ├── landmarks.md
  *       └── maps/town-plan.png ← 任何格式都行（图片、json、txt…）
  *
- * 注入给模型的文本 = README.md（AI 写的索引）+ **自动生成的目录树**。
+ * 投递给模型的文本 = README.md（AI 写的索引）+ **自动生成的目录树**（`indexText()`）。
  * 两者都给：README 是 AI 的叙述，目录树保证"就算忘了更新 README 也不会失真"。
+ * ⚠️ 这段文字由插件以**插件提示行**投进 `agent.inbox.nextStep`（会话开始时一次），
+ *    **不再**注册进系统提示词（用户 2026-09-16 定：系统提示词由 preset 交给宿主自动注入）。
  *
  * 安全：所有路径过 safePath()——拒绝绝对路径、`..`、超深路径，且解析后必须仍在
  * `.whale-craft/` 内。记忆工具**不是**通用文件编辑器的替身，边界就是这个文件夹。
@@ -211,7 +213,8 @@ export class MemoryStore {
   }
 
   /**
-   * 注入系统提示用的文本（5 秒缓存）：**README.md（AI 维护的索引）+ 自动目录树**。
+   * 投递给模型的文本（5 秒缓存）：**README.md（AI 维护的索引）+ 自动目录树**。
+   * 写操作会清掉缓存（见 append/write/delete），所以投递那一刻读到的总是最新的。
    */
   indexText () {
     if (Date.now() - this._textCache.at < 5000) return this._textCache.text

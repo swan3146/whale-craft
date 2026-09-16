@@ -9,7 +9,7 @@
 - 🎮 **每会话一个独立机器人**：不同对话可以连不同服务器、用不同账号，互不干扰
 - 👀 **能看世界**：字符地形图（省 token、坐标精确）与**真图像**（`mc_map{format:"image"}`）双通道
 - 🔔 **单脑看门狗**：事件只走 `mc_watch` 一条通道，空闲时唤醒、生成中插话（提示词注入，不模拟用户发言）
-- 🧠 **长期记忆**：`<工作区>/.whale-craft/` 文档树，索引由 AI 维护，每轮自动带进上下文
+- 🧠 **长期记忆**：`<工作区>/.whale-craft/` 文档树，索引由 AI 维护，会话开始时自动带进上下文
 - 🔒 **密码不进模型上下文**：凭据只存宿主凭据库；账户走「MC设置」UI
 - 🖥️ **自带浏览器 UI**：状态条 +「强制停止」按钮 + 「MC设置」模态框（账户 / 指令白名单 / 提示词）
 
@@ -163,10 +163,13 @@ dsh plugin --profile web add whale_craft
 
 1. **看不见** `mc_admin_*`（`tools.restrict`）；
 2. **调不动** `mc_admin_*`（全局 `guard` 硬拒，即使隐藏失效）；
-3. 收到两段专属提示词：`whale_craft:mode-guidance`（玩法约定）与 `.whale-craft/AGENTS.md`（可在「MC设置 → 提示词」里改）。
+3. 收到 2–3 条**插件提示行**（在对话里看得见、可折叠，**不是**用户发言）：
+   `.whale-craft/AGENTS.md`（行事准则，可在「MC设置 → 提示词」里改）、`.whale-craft/README.md`（记忆总索引）、
+   以及可选的（默认关）工作区 `AGENTS.md`。
+4. 系统提示词 = preset 自己的 persona（宿主按 preset 自动注入，**插件不插手**）。
 
 > 插件本身**不带 preset 目录**（`~/.dsh/.agent-presets/<名字>/` 需要你自己放一份 persona）。
-> 只要 preset id 落在 `mcModePresets` 里，隔离就生效。
+> 只要 preset id 落在 `mcModePresets` 里，隔离就生效；缺失时插件会照官方 `copy()` 建一个「MC模式」并写好 persona。
 
 ---
 

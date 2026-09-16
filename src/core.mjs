@@ -888,12 +888,29 @@ export class McBot extends EventEmitter {
     return false
   }
 
+  /**
+   * 给前端 / 工具看的**连接信息**：只有地址三件套。
+   *
+   * 🔴 用户 2026-09-16："状态条别只写'在游戏中'，要显示服务器地址。"
+   *    `_connectionProfile` 里还带着 `authMode` / `account`（账号名）—— 那是给日志与诊断用的，
+   *    **不该跟着这个视图发到浏览器**，所以统一从这里出（`status()` 与 `modeView()` 共用）。
+   * @returns {{host: string|null, port: number|null, subserver: string|null}|null}
+   */
+  connectionView () {
+    const p = this._connectionProfile
+    if (!p) return null
+    return { host: p.host ?? null, port: p.port ?? null, subserver: p.subserver || null }
+  }
+
   status () {
     const b = this.bot
-    if (!b?.entity) return { online: false, sub: this.sub, lastError: this.lastError }
+    // 连的哪个服（用户 2026-09-16："状态条别只写'在游戏中'，要显示服务器地址"）。
+    // 只回地址/端口/子服，**不含账号与凭据**；前端负责"太长就截断"。
+    const connection = this.connectionView()
+    if (!b?.entity) return { online: false, sub: this.sub, connection, lastError: this.lastError }
     const p = b.entity.position
     return {
-      online: true, sub: this.sub,
+      online: true, sub: this.sub, connection,
       position: { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) },
       yaw: b.entity.yaw, pitch: b.entity.pitch,
       gamemode: b.game?.gameMode, dimension: b.game?.dimension, time: b.time?.timeOfDay,

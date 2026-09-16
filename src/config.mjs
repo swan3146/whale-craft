@@ -133,9 +133,10 @@ export function isCopiedPresetDescription (desc, shippedDescriptions) {
  *
  * 历史：1 = 复制官方 minimal；**2 = 顺手把 persona 换成我们自己的 + 关掉那个 shell**
  *      （复制 minimal 会把"极简模式"的 persona（You are a helpful software engineer assistant.）
- *      和它的持久 shell 一起带过来，而 MC 模式的指导里明写"本模式没有 shell" —— 自相矛盾）。
+ *      和它的持久 shell 一起带过来，而 MC 模式的指导里明写"本模式没有 shell" —— 自相矛盾）；
+ *      **3 = persona 换成用户定稿的那一句**（"你在一台真实的 Minecraft Java 版服务器里扮演一名玩家…"）。
  */
-export const MC_PRESET_SPEC = 2
+export const MC_PRESET_SPEC = 3
 
 /**
  * 把 composition 里的 **persona 行**换成我们自己的（纯函数，好测）。

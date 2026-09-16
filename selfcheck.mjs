@@ -510,6 +510,22 @@ console.log('\n--- disconnect：优雅优先 / 强断兜底 ---')
   console.log(`  ${!r3.graceful && !r3.forced ? '✅' : '❌'} 没连接时立刻返回（不吊死，${r3.ms}ms）`)
 }
 
+// McBot.status 要带上**连的哪个服**（用户 2026-09-16："状态条应该显示服务器地址，太长则截断"）
+console.log('\n--- status：服务器地址 ---')
+{
+  const { McBot } = await import('./src/core.mjs')
+  const b = new McBot({ instanceId: 'sc-status-' + Math.random().toString(36).slice(2, 7) })
+  b._connectionProfile = { host: 'example.com', port: 25566, subserver: 'mc.example.com', version: '26.2', authMode: 'offline', account: '<user>' }
+  const offline = b.status()
+  console.log(`  ${offline.online === false && offline.connection?.host === 'example.com' && offline.connection?.port === 25566 && offline.connection?.subserver === 'mc.example.com' ? '✅' : '❌'} 离线时也给地址（host/port/subserver）：${JSON.stringify(offline.connection ?? null)}`)
+  console.log(`  ${!/account|authMode|version/.test(JSON.stringify(offline.connection ?? {})) ? '✅' : '❌'} 🔴 地址里**不带账号/认证模式**（凭据绝不外流）`)
+  b.bot = { entity: { position: { x: 1, y: 2, z: 3 }, yaw: 0, pitch: 0, isInWater: false }, game: {}, time: {}, players: {}, health: 20, food: 20 }
+  const online = b.status()
+  console.log(`  ${online.online === true && online.connection?.host === 'example.com' ? '✅' : '❌'} 在线时同样带地址（前端据此显示）`)
+  const noProfile = new McBot({ instanceId: 'sc-status-null' }).status()
+  console.log(`  ${noProfile.connection === null ? '✅' : '❌'} 从没连过 → connection=null（前端只显示"在游戏中"，不瞎编）`)
+}
+
 // ── 记忆（需求 6 v3）：固定 .whale-craft + AI 维护的 README 索引 + 任意格式 ──
 console.log('\n--- 记忆能力（.whale-craft / README 索引 / 任意格式）---')
 {
@@ -706,37 +722,26 @@ console.log('\n--- 归档保护 ---')
   }
 }
 
-// ── 总索引自动注入系统提示（用户要求：自动注入 + 提醒及时读）──
-console.log('\n--- 总索引自动注入 ---')
+// ── 提示词注入**只有一条通道**（用户 2026-09-16："系统提示词不用显式注入，设置好了会自动注入"）──
+console.log('\n--- 提示词注入通道（插件提示行，不再碰 systemPrompt）---')
 {
-  // 注册走 ctx.inject（Cordis 规定：访问 ctx.systemPrompt 属性必须先 inject）
-  const fiber = injectedFibers.find((f) => f.deps.includes('systemPrompt'))
-  console.log(`  ${fiber ? '✅' : '❌'} 通过 ctx.inject(['systemPrompt']) 登记（属性访问需先 inject）`)
-  if (fiber) {
-    fiber.cb({
-      systemPrompt: fakeCtx.systemPrompt,
-      effect: (fn) => { try { fn() } catch {} },
-      logger: fakeCtx.logger,
-    })
-  }
-
-  const ctxEntry = injectedContexts.find((c) => c.name === 'whale_craft:memory-index')
-  console.log(`  ${ctxEntry ? '✅' : '❌'} 已注册动态 context：whale_craft:memory-index`)
-  console.log(`  ${typeof ctxEntry?.text === 'function' ? '✅' : '❌'} text 是函数（每次组装时求值，能反映最新记忆）`)
-  console.log(`  ${ctxEntry?.order === 200 ? '✅' : '❌'} order=${ctxEntry?.order}（排在宿主自留段 110/115/120 之后）`)
-
-  const text = String(ctxEntry?.text?.() ?? '')
-  const emptyOk = /长期记忆/.test(text) && /mc_kit_memory/.test(text)
-  console.log(`  ${emptyOk ? '✅' : '❌'} 没记忆时不占位、改为教它怎么记（${text.length} 字）`)
-
-  // 真写一条到插件的真实记忆库，注入文本必须立刻反映出来
-  const mm = await tools.get('mc_kit_memory').execute(
-    { action: 'append', topic: 'selftest-tmp', server: '_global', text: '这是一条自检临时记忆' }, A)
-  const text2 = String(ctxEntry?.text?.() ?? '')
-  const reflected = text2.includes('selftest-tmp') && /先读/.test(text2)
-  console.log(`  ${reflected ? '✅' : '❌'} 写入后注入文本立刻带上该文件 + "先读"提醒`)
-  await tools.get('mc_kit_memory').execute({ action: 'delete', path: String(mm.path) }, A)
-  console.log(`  ${!String(ctxEntry?.text?.() ?? '').includes('selftest-tmp') ? '✅' : '❌'} 删除后注入文本同步移除`)
+  const { readFileSync } = await import('node:fs')
+  const idx = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+  // ① 一句话：**不再往 systemPrompt 里塞任何东西**（那既冗余，又会被 persona 的
+  //    complete / includeRuntimeContext 压掉 —— 2026-09-16 真机"设置页正常、AI 什么都没收到"）。
+  const spFiber = injectedFibers.find((f) => f.deps.includes('systemPrompt'))
+  console.log(`  ${!spFiber ? '✅' : '❌'} 不再 ctx.inject(['systemPrompt'])（系统提示词由 preset 交给宿主自动注入）`)
+  console.log(`  ${injectedContexts.length === 0 ? '✅' : '❌'} 一个 systemPrompt.context() 段都没注册（${injectedContexts.length} 段）`)
+  console.log(`  ${!/systemPrompt\.(context|section)\(/.test(idx) ? '✅' : '❌'} 源码里也搜不到任何 systemPrompt 段注册`)
+  console.log(`  ${!/installAgentPrompts|whale_craft:memory-index|whale_craft:mode-guidance|MC_MODE_GUIDANCE/.test(idx) ? '✅' : '❌'} 旧的 installAgentPrompts / 记忆索引段 / 模式指导段 已整段删除`)
+  // ② 记忆索引改走提示行（和两个 AGENTS.md 同一条路）
+  console.log(`  ${/rel: '\.whale-craft\/README\.md'/.test(idx) && /提示词注入：\.whale-craft\/README\.md/.test(idx) ? '✅' : '❌'} 记忆索引（.whale-craft/README.md）也当**插件提示行**投递`)
+  console.log(`  ${/const noticesSent = new WeakMap\(\)/.test(idx) && /noticesSent\.set\(agent/.test(idx) ? '✅' : '❌'} 记下**实际投出去**的文件（状态页据此报真实投递，不是"打算投"）`)
+  // ③ persona：用户给的**定稿原文**，一字不改
+  const persona = '你在一台真实的 Minecraft Java 版服务器里扮演一名玩家：你的"身体"是一台无头机器人，能观察世界、移动、挖掘和建造。'
+  const m = idx.match(/const MC_PERSONA_TEXT = '([^']*)'/)
+  console.log(`  ${m?.[1] === persona ? '✅' : '❌'} 🔴 preset persona = 用户定稿的那一句原文${m?.[1] === persona ? '' : `（实际：${JSON.stringify(m?.[1] ?? null)}）`}`)
+  // ④ 每个 MC 会话都会拿到"记忆索引"提示行：这条在下面 ⑦ 用真 agent 验（body 里带记忆工具名）
 }
 
 // ── 全局配置 + 管理工具 + MC 模式权限隔离（用户 2026-09-16 要求）──
@@ -811,7 +816,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     console.log(`  ${/patchMcPresetComposition\(svc, target\)/.test(src) && /patchMcPresetComposition\(svc, existingId\)/.test(src) ? '✅' : '❌'} 新建/重建都会把 persona 换成我们的、并关掉 shell`)
     console.log(`  ${/stillShippedPersona/.test(src) && /You are a helpful software engineer assistant/.test(src) ? '✅' : '❌'} 旧版（无标记）那份：只在"官方那句人设还在"时才动它`)
     console.log(`  ${/runtimeContextSuppressed \? \[\]/.test(src) ? '✅' : '❌'} 状态块注释里钉住了宿主那段 contexts: runtimeContextSuppressed ? [] （这是根因）`)
-    console.log(`  ${/registered: segs/.test(src) && /segments: delivered/.test(src) ? '✅' : '❌'} 状态块同时给"注册了没有"和"**实际收不收得到**"（不许再撒谎）`)
+    console.log(`  ${/notices: sent/.test(src) && /segments: \{/.test(src) ? '✅' : '❌'} 状态块报的是**实际投出去的文件**（noticesSent，不许再撒谎）`)
     // 🔴 用户："我不要模拟用户发送啊！" —— 投递的那条必须标成 plugin/notice，且**不许** steer（空闲时会起一轮）
     console.log(`  ${/kind: 'plugin', plugin: 'whale_craft', form: 'notice'/.test(src) ? '✅' : '❌'} 投递的消息标成 plugin/notice（插件提示行，不归到用户头上）`)
     console.log(`  ${!/agent\.steer\(/.test(src) ? '✅' : '❌'} 🔴 插件里**没有** steer 兜底（steer 空闲会"起一轮"＝没问就替用户说话）`)
@@ -895,7 +900,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     // 🔴 2026-09-16 抽取成标准插件：记忆/提示词必须**按会话工作区**解析（插件装哪都行）
     console.log(`  ${/const workspaceOf = \(agent\) =>/.test(idx) && /agent\?\.session\?\.header\?\.cwd/.test(idx) ? '✅' : '❌'} 工作区取自 exec.agent.session.header.cwd（不再用"插件自己在哪"）`)
     console.log(`  ${/join\(cwd, '\.whale-craft'\)/.test(idx) ? '✅' : '❌'} 记忆根 = <会话工作区>/.whale-craft`)
-    console.log(`  ${/const installAgentPrompts = \(agent\)/.test(idx) && /installAgentPrompts\(agent\)/.test(idx) ? '✅' : '❌'} 提示词段（含记忆索引）按 agent 注入（每个工作区各一份）`)
+    console.log(`  ${/const noticesSent = new WeakMap\(\)/.test(idx) && /inbox\.nextStep\.push\(createUserMessage\(\{/.test(idx) ? '✅' : '❌'} 提示词按会话工作区投递到 agent.inbox.nextStep（每个会话一份，插件不再碰 systemPrompt）`)
   }
 
   // ② 管理工具（走真实插件实例，落盘在自检临时目录）
@@ -937,7 +942,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   const plainRead = guards.every((g) => { try { return g(plainExec3) === undefined } catch { return true } })
   console.log(`  ${plainRead ? '✅' : '❌'} 读普通文件不受影响`)
 
-  // ⑤ 会话建立时应用策略：MC 模式 → 隐藏管理工具 + 注入专属指导；普通模式 → 什么都不做
+  // ⑤ 会话建立时应用策略：MC 模式 → 隐藏管理工具 + 投提示行；普通模式 → 什么都不做
   const restrictCalls = []
   const guidanceCtxs = []
   const makeAgentCtx = (preset) => {
@@ -963,10 +968,15 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   {
     const msgs = mcAgent.inbox.nextStep
     const first = msgs[0]
-    console.log(`  ${msgs.length === 1 ? '✅' : '❌'} MC 会话：提示词被投递到 inbox.nextStep（${msgs.length} 条）`)
+    const second = msgs[1]
+    console.log(`  ${msgs.length === 2 ? '✅' : '❌'} MC 会话：提示词被投递到 inbox.nextStep（${msgs.length} 条：行事准则 + 记忆索引）`)
     console.log(`  ${first?.source?.kind === 'plugin' && first?.source?.plugin === 'whale_craft' && first?.source?.form === 'notice' ? '✅' : '❌'} 🔴 来源是 plugin/notice（**不是**用户发言）：${JSON.stringify(first?.source ?? null)}`)
     const body = (first?.content ?? []).map((c) => c.text ?? '').join('')
-    console.log(`  ${/Whale Craft 行事准则/.test(body) && /Minecraft/.test(body) ? '✅' : '❌'} 投递内容含行事准则（${body.length} 字）`)
+    console.log(`  ${/Whale Craft 行事准则/.test(body) && /Minecraft/.test(body) ? '✅' : '❌'} 第 1 条 = 行事准则（${body.length} 字），首行写明文件：${JSON.stringify(body.split('\n')[0])}`)
+    console.log(`  ${/^Instructions from: \.whale-craft\/AGENTS\.md$/.test(body.split('\n')[0] ?? '') ? '✅' : '❌'} 正文首行是 "Instructions from: .whale-craft/AGENTS.md"（与 DSH 原生同形状）`)
+    const body2 = (second?.content ?? []).map((c) => c.text ?? '').join('')
+    console.log(`  ${second?.source?.form === 'notice' && /^Instructions from: \.whale-craft\/README\.md$/.test(body2.split('\n')[0] ?? '') ? '✅' : '❌'} 第 2 条 = 记忆索引（.whale-craft/README.md），同样是插件提示行`)
+    console.log(`  ${/长期记忆/.test(body2) && /mc_kit_memory/.test(body2) ? '✅' : '❌'} 记忆索引正文含"怎么记/怎么读"（${body2.length} 字）—— 不需要再单独往系统提示里塞一段`)
     console.log(`  ${plainAgent.inbox.nextStep.length === 0 ? '✅' : '❌'} 普通会话**不投递**（只有 MC 模式才投）`)
     const inboxBefore = mcAgent.inbox.nextStep.length
     fire('agent/session-start', mcAgent)
@@ -974,20 +984,14 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   }
   const denyList = mcRestrict?.f?.deny ?? []
   console.log(`  ${denyList.includes('mc_admin_config') ? '✅' : '❌'} MC 模式会话被隐藏管理工具：${JSON.stringify(denyList)}`)
-  // ⚠️ 按 **name** 找，不按 preset 找：同一个 agent 现在会先注入 memory-index，再注入 mode-guidance
-  const g = guidanceCtxs.find((x) => x.c?.name === 'whale_craft:mode-guidance')
-  console.log(`  ${g?.c?.name === 'whale_craft:mode-guidance' ? '✅' : '❌'} MC 模式注入了专属指导（name=${g?.c?.name}）`)
-  // 🔴 2026-09-16：两个 AGENTS.md **不再走 systemPrompt**（会被 persona 的 complete/includeRuntimeContext 压掉），
-  //    改成**插件提示行**投递（inbox.nextStep）—— 断言见上面那段 + 下面 ⑦。
-  console.log(`  ${!guidanceCtxs.some((x) => x.c?.name === 'whale_craft:agents-md') && !guidanceCtxs.some((x) => x.c?.name === 'whale_craft:workspace-agents-md') ? '✅' : '❌'} 两个 AGENTS.md 不再重复走 systemPrompt（只走提示行，避免投两遍）`)
-  console.log(`  ${/单对话/.test(String(g?.c?.text?.() ?? '')) && /mc_kit_memory/.test(String(g?.c?.text?.() ?? '')) ? '✅' : '❌'} 指导内容含关键约定（单对话 / 记忆工具名）`)
-  // 用户 2026-09-16：指导里不再写"别碰插件源码与宿主配置（那是别的会话的活）"
-  console.log(`  ${!/插件源码|宿主配置|别的会话/.test(String(g?.c?.text?.() ?? '')) ? '✅' : '❌'} 指导里已删掉"别碰插件源码/宿主配置"那条`)
+  // 🔴 2026-09-16：**一个 systemPrompt 段都不注册**了（用户："系统提示词不用显式注入"）。
+  //    这条断言就是防回归：以后谁再往 systemPrompt 里塞东西，这里会红。
+  console.log(`  ${guidanceCtxs.length === 0 ? '✅' : '❌'} MC 模式也不注册 systemPrompt 段（实际 ${guidanceCtxs.length} 段）—— 提示词只走插件提示行`)
   console.log(`  ${!restrictCalls.some((c) => c.preset === 'standard') ? '✅' : '❌'} 非 MC 模式的会话不被限制（不误伤普通会话）`)
-  // 重复触发不应重复注入（WeakSet 去重）
-  const before = guidanceCtxs.length
+  // 重复触发不应重复投递（WeakMap 去重）
+  const before = mcAgent.inbox.nextStep.length
   fire('agent/session-start', mcAgent)
-  console.log(`  ${guidanceCtxs.length === before ? '✅' : '❌'} 同一 agent 重复触发只应用一次策略`)
+  console.log(`  ${mcAgent.inbox.nextStep.length === before ? '✅' : '❌'} 同一 agent 重复触发只投一次`)
 
   /* ⑦ 🔴🔴 2026-09-16 真机事故回归（两轮）：提示词必须**必达 + 看得见**。
    *    第一轮事故：段注册绑在"那一刻是 MC 模式"上 → preset 晚选上就永远不注册。
@@ -1005,13 +1009,28 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   presetByCtx.set(lateAgent.ctx, 'minecraft')                       // ← "用户选了 MC模式"
   fakeCtx.agents = { get: (id) => (id === 'sess-LATE' ? lateAgent : id === 'sess-MC2' ? mcAgent : id === 'sess-P2' ? plainAgent : undefined) }
   eventHandlers.filter((h) => h.ev === 'agent-preset/selected').forEach((h) => h.fn('sess-LATE', 'minecraft'))
-  await new Promise((r) => setTimeout(r, 0))                         // 让 installAgentPrompts ⑤ 里那个 queueMicrotask 落地
   const lateBody = (lateAgent.inbox.nextStep[0]?.content ?? []).map((c) => c.text ?? '').join('')
   console.log(`  ${/Whale Craft 行事准则/.test(lateBody) ? '✅' : '❌'} 🔴 模式晚选上后**立刻投递**（${lateAgent.inbox.nextStep.length} 条 / ${lateBody.length} 字）—— 就是那个 bug`)
-  console.log(`  ${lateAgent.inbox.nextStep.length === 1 ? '✅' : '❌'} 补投递没有重复（只有一条 .whale-craft/AGENTS.md）`)
+  console.log(`  ${lateAgent.inbox.nextStep.length === 2 ? '✅' : '❌'} 补投递没有重复（行事准则 + 记忆索引，各一条）`)
   const lateRestrict = restrictCalls.find((c) => c.preset === undefined)
   console.log(`  ${(lateRestrict?.f?.deny ?? []).includes('mc_admin_config') ? '✅' : '❌'} 模式晚选上时"命令式"的隔离也补上了（restrict 含 mc_admin_config）`)
   console.log(`  ${eventHandlers.some((h) => h.ev === 'agent-preset/selected') ? '✅' : '❌'} 挂了宿主的 agent-preset/selected 事件（会话里切模式才生效）`)
+
+  /* ⑦b 记忆索引**是活的**：写一条记忆 → 新会话的提示行里必须带上它；删掉就不再出现。
+   *    （以前这条测的是 systemPrompt 段的 `text()`；现在同一份文字走提示行，测法一样。） */
+  {
+    const mm = await tools.get('mc_kit_memory').execute(
+      { action: 'append', topic: 'selftest-tmp', server: '_global', text: '这是一条自检临时记忆' }, A)
+    const idxAgent = { id: 'sess-IDX', session: { header: { cwd: mkdtempSync(join(tmpdir(), 'whale-idx-')) } }, ctx: makeAgentCtx('minecraft'), inbox: { nextStep: [] } }
+    fire('agent/created', idxAgent)
+    const idxBody = idxAgent.inbox.nextStep.map((m) => (m.content ?? []).map((c) => c.text ?? '').join('')).join('\n')
+    console.log(`  ${idxBody.includes('selftest-tmp') && /先读/.test(idxBody) ? '✅' : '❌'} 写进记忆后，新会话的提示行立刻带上该文件 + "先读"提醒`)
+    await tools.get('mc_kit_memory').execute({ action: 'delete', path: String(mm.path) }, A)
+    const idxAgent2 = { id: 'sess-IDX2', session: { header: { cwd: mkdtempSync(join(tmpdir(), 'whale-idx2-')) } }, ctx: makeAgentCtx('minecraft'), inbox: { nextStep: [] } }
+    fire('agent/created', idxAgent2)
+    const idxBody2 = idxAgent2.inbox.nextStep.map((m) => (m.content ?? []).map((c) => c.text ?? '').join('')).join('\n')
+    console.log(`  ${!idxBody2.includes('selftest-tmp') ? '✅' : '❌'} 删掉后不再出现（索引是投递那一刻现读的，不是缓存）`)
+  }
 
   /* ⑧ 🔴 用户："插件初始化就要检查 `.whale-craft` 是否存在，不存在则建立；README.md 是否存在，
    *    不存在则写入默认值。"（AGENTS.md 同理：提示词页编辑的就是这个文件，文件必须先在） */
@@ -1930,6 +1949,13 @@ console.log('\n--- 客户端 bundle（client.js 静态检查）---')
     ['UI 无"当前来源 / 默认版"之类', !/当前来源|默认版/.test(code)],
     ['提示词那页就叫「提示词」（不写"行事准则"）', /label: '提示词'/.test(code) && !/行事准则/.test(code)],
     ['强制停止的 tooltip 说人话（不写四步实现）', !/先停 LLM/.test(code)],
+    // 🔴 用户 2026-09-16："状态条是不是只显示'在游戏中'？应该显示服务器地址，太长则截断。"
+    ['状态条显示服务器地址（host[:port] · 子服）', /function mcAddress\(state\)/.test(code) && /conn\?\.host/.test(code) && /conn\?\.subserver/.test(code)],
+    ['地址太长就截断（完整地址留在 tooltip）', /address\.length > 26 \? address\.slice\(0, 25\) \+ '…'/.test(code) && /'data-mc-sub': '', title: address/.test(code)],
+    ['CSS 也兜一层截断（max-width + ellipsis）', /\[data-mc-sub\]\{[^}]*max-width:24ch[^}]*text-overflow:ellipsis/.test(code)],
+    ['拿不到地址就只显示"在游戏中"（不硬编造一个"—"）', /address \? React\.createElement\('span', \{ 'data-mc-sub'/.test(code)],
+    // 地址只能走 connectionView()（host/port/subserver）；`_connectionProfile` 还带账号名，别发到浏览器
+    ['后端只把 connectionView() 发给前端（不发含账号的 _connectionProfile）', !/connection: (sess|this)\.bot\._connectionProfile/.test(readFileSync(new URL('./index.js', import.meta.url), 'utf8'))],
   ]
   for (const [label, passed] of checks) console.log(`  ${passed ? '✅' : '❌'} ${label}`)
 }

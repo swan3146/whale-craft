@@ -56,7 +56,7 @@ window.__ModuleLoader__.load({
 [data-mc-dot]{width:7px;height:7px;border-radius:999px;background:var(--dsw-alias-state-success-primary);flex:none;}
 [data-mc-dot][data-mc-warn]{background:var(--dsw-alias-state-warn-primary);}
 [data-mc-text]{color:var(--dsw-alias-label-secondary);}
-[data-mc-sub]{color:var(--dsw-alias-label-tertiary);}
+[data-mc-sub]{color:var(--dsw-alias-label-tertiary);max-width:24ch;overflow:hidden;text-overflow:ellipsis;}
 [data-mc-btn]{display:inline-flex;align-items:center;justify-content:center;height:22px;padding:0 9px;
   border:0;border-radius:999px;background:transparent;cursor:pointer;font-size:12px;line-height:1;
   color:var(--dsw-alias-label-secondary);font-family:inherit;}
@@ -339,6 +339,24 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       return [state, setState]
     }
 
+    /**
+     * 状态条上要显示的**服务器地址**：`host[:port]`（非默认端口才带端口），
+     * 有子服时再跟一个 `· 子服域名`（Velocity 的 forced-host）。
+     *
+     * 🔴 用户 2026-09-16："状态条是不是只显示'在游戏中'？应该显示服务器地址，太长则截断。"
+     *    地址由 `/api/mc/status` 的 `connection` 给（只有 host/port/subserver，**没有账号**）。
+     * @returns {string} 地址；一个都没有就返回空串（此时状态条只显示"在游戏中"）
+     */
+    function mcAddress(state) {
+      const conn = state?.connection ?? null
+      const host = String(conn?.host ?? '').trim()
+      const port = Number(conn?.port ?? 0) || 0
+      const sub = String(conn?.subserver || state?.sub || '').trim()
+      const endPoint = host ? (port && port !== 25565 ? host + ':' + port : host) : ''
+      if (endPoint && sub && sub !== host) return endPoint + ' · ' + sub
+      return endPoint || sub
+    }
+
     function McStatusBar(props) {
       // session scope 的标准 props；兼容 session 对象形态
       const sessionId = props?.sessionId ?? props?.session?.id
@@ -363,7 +381,9 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       if (!sessionId || !state || state.active !== true) return null
 
       const online = state.online === true
-      const sub = state.connection?.subserver || state.sub || '—'
+      const address = mcAddress(state)
+      // 太长就截断（完整地址留在 tooltip 里）
+      const shown = address.length > 26 ? address.slice(0, 25) + '…' : address
       const timeouts = Number(state.timeouts ?? 0)
       const stale = timeouts > 0
 
@@ -373,12 +393,12 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           'data-mc-status': '',
           ...(busy ? { 'data-mc-busy': '' } : {}),
           title: online
-            ? `在游戏中：${sub}${stale ? `（有 ${timeouts} 次操作超时，可能已失步）` : ''}`
-            : '已连接但角色不在线',
+            ? `${address ? address + '：' : ''}在游戏中${stale ? `（有 ${timeouts} 次操作超时，可能已失步）` : ''}`
+            : (address ? `已连接 ${address} 但角色不在线` : '已连接但角色不在线'),
         },
         React.createElement('span', { 'data-mc-dot': '', ...(online && !stale ? {} : { 'data-mc-warn': '' }) }),
         React.createElement('span', { 'data-mc-text': '' }, online ? '在游戏中' : '未上线'),
-        React.createElement('span', { 'data-mc-sub': '' }, sub),
+        address ? React.createElement('span', { 'data-mc-sub': '', title: address }, shown) : null,
         React.createElement('button', {
           type: 'button', 'data-mc-btn': '', 'data-mc-danger': '',
           title: '强制停止：中断当前生成并让机器人退出游戏',

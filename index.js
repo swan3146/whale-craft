@@ -205,7 +205,7 @@ class McSession {
       mode: this.mode,
       online: this.bot.online,
       sub: this.bot.sub,
-      connection: this.bot._connectionProfile ?? null,
+      connection: this.bot.connectionView(),
       pendingEvents: this.events.length,
       watch: this.watchdog?.status() ?? null,
     }
@@ -283,7 +283,7 @@ class McRegistry {
       online: sess.bot.online,
       sub: sess.bot.sub,
       mode: sess.mode,
-      connection: sess.bot._connectionProfile ?? null,
+      connection: sess.bot.connectionView(),
       pendingEvents: sess.events.length,
       watching: sess.watchdog?.status() ?? null,
     }))
@@ -974,20 +974,21 @@ export function apply(ctx, config) {
           const cwd = workspaceOf(agent)
           const root = cwd ? memoryRootFor(cwd) : null
           const cur = root ? readAgentsMd(root) : { path: null, source: null, text: '' }
-          const on = mcMode && pluginConfig.get('injectWhaleCraftAgentsMd') === true
+          const sent = (agent && noticesSent.get(agent)) ?? []
           diag = {
             reason,
             workspace: cwd,
             presetId: (agent && lastPresetSeen.get(agent)) ?? null,
             agentFound: Boolean(agent),
-            promptsInstalled: Boolean(agent && promptsInstalled.has(agent)),
             serviceReady: Boolean(agentPresetsSvc) || (() => { try { return Boolean(ctx.get('agentPresets')) } catch { return false } })(),
             memoryRoot: root,
             agentsMd: { path: cur.path, exists: cur.path ? existsSync(cur.path) : false, source: cur.source, bytes: Buffer.byteLength(cur.text) },
+            // **实际投出去的**插件提示行（不是"我们打算投"）：投递是唯一通道，这里就是判据
+            notices: sent,
             segments: {
-              'memory-index': root ? memoryIndexText(memoryFor(cwd)).length : 0,
-              'mode-guidance': mcMode ? MC_MODE_GUIDANCE.length : 0,
-              'agents-md': on ? cur.text.length : 0,
+              'agents-md': sent.includes('.whale-craft/AGENTS.md') ? cur.text.length : 0,
+              'workspace-agents-md': sent.includes('AGENTS.md') ? 1 : 0,
+              'memory-index': sent.includes('.whale-craft/README.md') && root ? memoryIndexText(memoryFor(cwd)).length : 0,
             },
           }
         } catch (e) { diag = { reason, error: String(e.message) } }
@@ -1237,7 +1238,8 @@ export function apply(ctx, config) {
         connected: true,
         account: accounts.view(accounts.get(resolved.innerID)),
         ...sess.bot.status(), chunksReady: ready,
-        connection: sess.bot._connectionProfile,
+        // 连接信息（host/port/子服）已在 status() 里；这里**不再**回带
+        // `_connectionProfile`（那份含 authMode 与账号名，没必要发出去）。
         watchdog: wd.status().armed ? '已自动挂载' : '未挂载（autoArm 关闭）',
       }
     },
@@ -2100,73 +2102,24 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 全局兜底注入：**只在没有 agent 上下文**（或拿不到工作区）时兜一手，
-   * 而且那个兜底根不存在就**什么都不注入**（免得在别人机器上给每个会话塞一段空记忆提示）。
-   * 真正的"按工作区"注入在下面 `installMemoryIndex(agent)`（scoped 层会 shadow 这个全局层）。
+   * 🔴 2026-09-16 用户定的：**本插件不再往系统提示词里塞任何东西**。
    *
-   * 🔴 必须**只**通过 `ctx.inject(['systemPrompt'], cb)` 注册：
-   *    Cordis 规定「访问 `ctx.systemPrompt` 这种属性必须先 inject」
-   *    （`cannot get property "systemPrompt" without inject`）——`ctx.get()` 才豁免。
-   *    直接 `injectMemoryIndex(ctx)` 会把整棵插件树带崩（隔离实例实测踩到）。
+   * 他的原话：系统提示词在 preset 里设置好就行，宿主管组装、**会自动注入**；
+   * 插件再往系统提示里注册段是冗余。而且真机事故证明那条路**不可靠**：
+   * 宿主 `system-prompt/src/index.ts:606` 是 `contexts: runtimeContextSuppressed ? [] : [...]`，
+   * 从官方 `minimal` 复制来的 persona 带着 `includeRuntimeContext: false` / `complete: true` 时，
+   * 我们注册的 context 段会在组装时被**整个丢掉** —— 症状正是"设置页显示正常、AI 却什么都没收到"。
+   *
+   * 所以注入**只剩一条通道**：学宿主注入工作区 `AGENTS.md` 的做法，把内容当**插件提示行**
+   * 投进 `agent.inbox.nextStep`（见 `injectAgentsMdNotices`）—— 必达、在对话里看得见、
+   * 而且完全不过 systemPrompt 组装，任何 persona 都压不掉它。记忆索引（`.whale-craft/README.md`）
+   * 也走同一条路。
    */
-  const injectMemoryIndex = (scope) => {
-    scope.systemPrompt.context({
-      name: 'whale_craft:memory-index',
-      // 比宿主自留段（沙箱 110 / 审批 115 / 子 agent 120）靠后，紧贴运行期上下文
-      order: 200,
-      text: () => memoryIndexText(memory, { silentWhenMissing: true }),
-    })
-  }
-  ctx.inject(['systemPrompt'], (scope) => injectMemoryIndex(scope))
 
-  /**
-   * **每个 agent 一次**的提示词段（记忆索引 + MC 模式专属的两段）。
-   *
-   * 🔴 2026-09-16 真机事故（用户："`.whale-craft/AGENTS.md` 提示词根本没有注入"）：
-   *    这几段原来注册在 `applyMcModePolicy` 里 —— 也就是"**注册那一刻**必须已经是 MC 模式"。
-   *    可 preset 完全可能晚于 `agent/created` 才选上（在会话里点模式芯片也是选 preset！），
-   *    于是 `isMcModeAgent()` 返回 false → 直接 return → **段永远不注册** → 提示词永远不出现，
-   *    而按钮（前端按**本地 preset** 判定）照样显示 —— 症状就是"有按钮、没提示词"。
-   *
-   * 现在的做法：**注册不看模式**，`text()` 在**每次装配时**才判断是不是 MC 模式（配置开关同理）。
-   * 这样无论 preset 什么时候选上，下一轮装配就带上了；也不可能再"漏注册"。
-   */
-  const promptsInstalled = new WeakSet()
-  /** 注入日志去重（段名:会话id）：每会话每段只往日志里写一次 */
-  const injectLogged = new Set()
-  const installAgentPrompts = (agent) => {
-    if (!agent?.ctx || promptsInstalled.has(agent)) return
-    let sp = null
-    try { sp = agent.ctx.get('systemPrompt') } catch { sp = null }
-    if (!sp || typeof sp.context !== 'function') return
-    promptsInstalled.add(agent)
-
-    // ① 记忆索引（按会话工作区；scoped 注册会 shadow 全局那份）
-    const store = memoryFor(workspaceOf(agent))
-    sp.context({
-      name: 'whale_craft:memory-index',
-      order: 200,
-      text: () => memoryIndexText(store),
-    })
-
-    // ② 本模式专属指导（不是 MC 模式就返回空串 → 宿主会丢弃这一段）
-    sp.context({
-      name: 'whale_craft:mode-guidance',
-      order: 240,
-      text: () => (isMcModeAgent(agent) ? MC_MODE_GUIDANCE : ''),
-    })
-
-    // ③④ 两个 AGENTS.md **不在这里注册** —— 它们改由 `injectAgentsMdNotices()` 以
-    //     **插件提示行**投递（`agent.inbox.nextStep`，与宿主注入工作区 AGENTS.md 同一手法）：
-    //     必达（不过 systemPrompt 组装，persona 的 complete/includeRuntimeContext 压不到）
-    //     且**在对话里看得见**（折叠标题写明是哪个文件）。留在这里会投两遍。
-
-    // ⑤ "命令式"的部分（`tools.restrict` 没法动态判定）在装配时再补一次 —— 幂等，且只在真 MC 模式时排队。
-    //    装配发生在每轮开头，所以 preset 一旦选上，最迟下一轮就生效。
-    if (isMcModeAgent(agent) && !mcPolicyApplied.has(agent)) {
-      queueMicrotask(() => { try { applyMcModePolicy(agent) } catch { /* 上面已有日志 */ } })
-    }
-  }
+  /* 🔴 这里原来有一段"给每个 agent 注册两个 systemPrompt 段（记忆索引 + 模式指导）"的代码，
+   * 2026-09-16 用户要求**整段删掉**："系统提示词不用显式注入，设置好了会自动注入" ——
+   * 插件自己往系统提示里塞东西既冗余，又会被 persona 的 complete/includeRuntimeContext 压掉
+   * （见上一段）。记忆索引与模式相关的话现在都走 `injectAgentsMdNotices()` 的插件提示行。 */
 
   /**
    * 行事准则文件缺了就补一份默认。
@@ -2184,7 +2137,12 @@ export function apply(ctx, config) {
   }
 
   /**
-   * **把两个 AGENTS.md 各投一条"插件提示"**（学宿主的做法，**绝不冒充用户发言**）。
+   * **把提示词当"插件提示"投递**（学宿主的做法，**绝不冒充用户发言**）。
+   *
+   * 投三条（各一条插件提示行）：
+   *    ① `<工作区>/AGENTS.md`（开关 `injectWorkspaceAgentsMd`）—— 用户要求先投它
+   *    ② `<工作区>/.whale-craft/AGENTS.md`（开关 `injectWhaleCraftAgentsMd`）
+   *    ③ `<工作区>/.whale-craft/README.md` = **记忆总索引**（无开关：记忆是这个模式的本职）
    *
    * 🔴 为什么走这条路：宿主注入工作区 `AGENTS.md` **不用 systemPrompt** ——
    *    `packages/context/agent-instructions` 把一条消息放进 `agent.inbox.nextStep`
@@ -2206,15 +2164,16 @@ export function apply(ctx, config) {
     createUserMessage = typeof mod?.createUserMessage === 'function' ? mod.createUserMessage : null
   } catch { createUserMessage = null }
 
-  const agentsMdNoticed = new WeakSet()
+  /** agent → 实际投出去的文件（给 /api/mc/mode 与设置页报**真实投递**，不是"我们打算投"） */
+  const noticesSent = new WeakMap()
   const injectAgentsMdNotices = (agent) => {
-    if (!agent || agentsMdNoticed.has(agent)) return false
+    if (!agent || noticesSent.has(agent)) return false
     if (!agent.ctx || !isMcModeAgent(agent)) return false
     const cwd = workspaceOf(agent)
     if (!cwd) return false
     const inbox = agent.inbox
     if (!inbox || !Array.isArray(inbox.nextStep) || !createUserMessage) {
-      logLine('提示词投递：宿主没有 inbox.nextStep 或拿不到 createUserMessage → 只走 systemPrompt 那条路')
+      logLine('提示词投递：宿主没有 inbox.nextStep 或拿不到 createUserMessage → 这次投不出去')
       return false
     }
     // 顺序：**先工作区，再我们自己的**（用户指定）
@@ -2236,6 +2195,12 @@ export function apply(ctx, config) {
         text: `【Whale Craft 行事准则（${cur.source === 'custom' ? 'Master 自定义版' : '默认版'}）】\n\n${cur.text.trim()}`,
       })
     }
+    // ③ 记忆总索引（`.whale-craft/README.md`）：**每个 MC 会话都给一次**——这正是"长期记忆"的入口。
+    //    内容空（还没记过东西）也照样给：里面写着"怎么记"，第一轮就知道该往哪写。
+    {
+      const idx = memoryIndexText(memoryFor(cwd)).trim()
+      if (idx) items.push({ rel: '.whale-craft/README.md', title: '提示词注入：.whale-craft/README.md', text: idx })
+    }
     if (!items.length) return false
     let sent = 0
     for (const it of items) {
@@ -2249,7 +2214,7 @@ export function apply(ctx, config) {
       } catch (e) { logLine(`提示词投递失败（${it.rel}）：${e?.message ?? e}`) }
     }
     if (sent) {
-      agentsMdNoticed.add(agent)
+      noticesSent.set(agent, items.map((i) => i.rel))
       logLine(`提示词已投递 ${sent} 条（插件提示行，非用户发言）：${items.map((i) => i.rel).join(' → ')}`)
     }
     return sent > 0
@@ -2287,11 +2252,11 @@ export function apply(ctx, config) {
   }
 
   /**
-   * **提示词注入状态**（给 UI / `mc_diag` 看）：三段各自"会不会注入、为什么不会"。
+   * **提示词注入状态**（给 UI / `mc_diag` 看）：每条各自"投出去了没有、为什么没有"。
    *
    * 2026-09-16 加：用户在真机上反复报"没有任何我们的提示词"，而这件事**极难从外面判断**
-   * （是没进 MC 模式？开关关了？文件不在？段没注册？）。与其让人猜，不如把判据摆出来：
-   * `segments` 是最终结论，`notes` 是人话版原因。
+   * （是没进 MC 模式？开关关了？文件不在？投递失败？）。与其让人猜，不如把判据摆出来：
+   * `segments` 报**实际投递**（`noticesSent` 里真有的文件名），`notes` 是人话版原因。
    */
   const promptInjectionStatus = (agent) => {
     const cwd = workspaceOf(agent)
@@ -2305,44 +2270,47 @@ export function apply(ctx, config) {
     const wsExists = Boolean(wsAgents) && existsSync(wsAgents)
     const presetId = (agent && lastPresetSeen.get(agent)) ?? null
     // 🔴 宿主的硬规则（system-prompt/src/index.ts:606）：persona 若写了 `includeRuntimeContext: false`，
-    //    组装时 `contexts` 直接变成 `[]` —— **我们注入的段全是 context，会被整个丢掉**；
-    //    写了 `complete: true` 则"人设即全部系统提示"，其它 section 也没了。
+    //    组装时 `contexts` 直接变成 `[]`；写了 `complete: true` 则"人设即全部系统提示"。
     //    复制官方 minimal 就会带这两个开关（2026-09-16 真机事故的根因）。
+    //    ⚠️ 现在我们的提示词走**插件提示行**（inbox.nextStep），**不受它影响** —— 这条只作为
+    //    "preset 还没被修好"的提示留着（它仍会压掉宿主自己的运行期上下文）。
     const personaSuppresses = Boolean(refreshMcPresetDiag()?.complete || mcPresetDiag?.runtimeContextSuppressed)
-    const segs = {
-      'memory-index': Boolean(root),
-      'mode-guidance': mcMode,
-      'agents-md': mcMode && injectWc && Boolean(agentsFile),
-      'workspace-agents-md': mcMode && injectWs && wsExists,
-    }
-    // 被 persona 压掉 = 实际收不到 → 状态按**实际投递**算，不按"我们注册了没有"算
-    const delivered = personaSuppresses
-      ? { 'memory-index': false, 'mode-guidance': false, 'agents-md': false, 'workspace-agents-md': false }
-      : segs
+    const sent = (agent && noticesSent.get(agent)) ?? []
     return {
       mcMode,
       presetId,
       workspace: cwd ?? null,
-      promptsInstalled: Boolean(agent && promptsInstalled.has(agent)),
       switches: { injectWhaleCraftAgentsMd: injectWc, injectWorkspaceAgentsMd: injectWs },
       files: {
         agentsMd: agentsFile
           ? { path: agentsFile, exists: existsSync(agentsFile), source: cur?.source ?? null, bytes: cur ? Buffer.byteLength(cur.text) : 0 }
           : null,
         workspaceAgentsMd: wsAgents ? { path: wsAgents, exists: wsExists } : null,
+        memoryIndex: root ? { path: join(root, 'README.md'), exists: existsSync(join(root, 'README.md')) } : null,
       },
       preset: mcPresetDiag ?? null,
-      // 判据（"我们注册了"）与结论（"实际收得到"）都给出来，免得再出现"显示正常但没注入"
-      registered: segs,
-      segments: delivered,
+      // **实际投出去的文件名**（投递是唯一通道，这就是判据本身）
+      notices: sent,
+      // 保留 registered/segments 两个键名（前端与 mc_diag 在用）：现在两者同源 —— 都是"真的投了"
+      registered: {
+        'agents-md': sent.includes('.whale-craft/AGENTS.md'),
+        'workspace-agents-md': sent.includes('AGENTS.md'),
+        'memory-index': sent.includes('.whale-craft/README.md'),
+      },
+      segments: {
+        'agents-md': sent.includes('.whale-craft/AGENTS.md'),
+        'workspace-agents-md': sent.includes('AGENTS.md'),
+        'memory-index': sent.includes('.whale-craft/README.md'),
+      },
       notes: [
         ...(agent ? [] : ['拿不到当前会话（没有 agent 上下文）']),
-        ...(agent && !cwd ? ['这个会话没有选中工作区 → 提示词没地方放，插件不会注入'] : []),
-        ...(agent && cwd && !mcMode ? [`这个会话不是 MC 模式（preset=${presetId ?? '未知'} 不在 mcModePresets 里）→ 不注入专属提示词`] : []),
-        ...(personaSuppresses ? ['🔴 preset 的 persona 设置了 complete / includeRuntimeContext:false —— 宿主会把插件注入的提示词整个丢掉（重启 DSH 后本插件会自动修这个 preset）'] : []),
+        ...(agent && !cwd ? ['这个会话没有选中工作区 → 提示词没地方放，插件不会投递'] : []),
+        ...(agent && cwd && !mcMode ? [`这个会话不是 MC 模式（preset=${presetId ?? '未知'} 不在 mcModePresets 里）→ 不投递`] : []),
+        ...(mcMode && !noticesSent.has(agent) ? ['还没到投递时机（提示词在会话开始/切到 MC 模式时投一次）'] : []),
         ...(mcMode && !injectWc ? ['「注入本提示词」是关的'] : []),
         ...(mcMode && !injectWs ? ['「注入工作区 AGENTS.md」是关的'] : []),
         ...(mcMode && injectWs && !wsExists ? ['工作区根目录里没有 AGENTS.md 这个文件'] : []),
+        ...(personaSuppresses ? ['⚠️ preset 的 persona 还带着 complete / includeRuntimeContext:false（会压掉宿主自己的运行期上下文；我们的提示走插件提示行不受影响。重启 DSH 后本插件会自动修这个 preset）'] : []),
       ],
     }
   }
@@ -2399,16 +2367,15 @@ export function apply(ctx, config) {
   /**
    * 自动建出来的 preset 的**人设**（persona）。
    *
-   * 🔴 用户 2026-09-16："你这个模式的默认系统提示词居然是'You are a helpful software engineer assistant.'，
-   *    太离谱了，改成简洁但和我们 MC 有关的，但是**不要和 AGENTS 里面的重合**。"
-   *    —— 那句来自我们复制的官方 `minimal`。这里只写**身份 + 能力 + 语气**：
-   *    规矩（称呼/记忆/看门狗/指令/边界）全都由 `.whale-craft/AGENTS.md` 与 `mode-guidance` 负责，不重复。
+   * 🔴 用户给的**定稿原文**（2026-09-16，一个字都不许改）：
+   *    "你在一台真实的 Minecraft Java 版服务器里扮演一名玩家：你的"身体"是一台无头机器人，
+   *     能观察世界、移动、挖掘和建造。"
+   *
+   * 从前那句 "You are a helpful software engineer assistant." 来自我们复制的官方 `minimal`。
+   * 这里只写**身份 + 能力**；规矩（称呼/记忆/看门狗/指令/边界）全在 `.whale-craft/AGENTS.md`，不重复。
+   * 系统提示词**由宿主按这个 preset 自动注入**，插件不再自己往 systemPrompt 里塞（用户要求）。
    */
-  const MC_PERSONA_TEXT = [
-    '你在一台真实的 Minecraft Java 版服务器里扮演一名玩家：你的"身体"是一台无头机器人',
-    '（由 Whale Craft 插件驱动），能观察世界、移动、挖掘和建造。',
-    '你就是游戏里的一个玩家，不是编码助手——说话简短自然，像一起玩的人。',
-  ].join('\n')
+  const MC_PERSONA_TEXT = '你在一台真实的 Minecraft Java 版服务器里扮演一名玩家：你的"身体"是一台无头机器人，能观察世界、移动、挖掘和建造。'
 
   const expandHome = (p) => {
     const s = String(p ?? '')
@@ -2672,20 +2639,9 @@ export function apply(ctx, config) {
     return null
   }
 
-  /** MC 模式专属指导（用户要求："我们也加上我们这个模式的专门提示词注入、指导之类"） */  const MC_MODE_GUIDANCE = [
-    '【whale_craft · 麦块模式专属指导】',
-    '',
-    '你现在是"进游戏玩"的那个 Agent。约定如下：',
-    '1. **单对话**：主线信息都在这一个对话里。事件唤醒**只有** `mc_watch` 看门狗一条通道（它直接往本会话注入提示词）；',
-    '   **不要**另开会话、不要轮询、不要跨会话推送。',
-    '2. **工具分三层，用对**：`mc_*` 游戏内动作 · `mc_kit_*` 游戏外辅助（记忆/发文件/画图）· ',
-    '   `mc_admin_*` 管理配置——**MC 模式用不了**（要改配置请让用户在普通会话里改）。',
-    '3. **记忆**：根目录 `.whale-craft/`，索引是**你维护的 `README.md`**。开工前先读相关文件；',
-    '   学到新事实随手 `mc_kit_memory {action:"append"}`，并把 README 的索引补上。',
-    '   那个文件夹里**只读写文件、不执行任何东西**（本模式没有 shell，也别指望跑脚本）。',
-    '4. **服务器指令是最后手段**（还要 OP）：正经动作优先 `mc_act` / `mc_build` / `mc_move`。',
-    '5. 上线前先 `mc_entities` 看谁在线，别凭记忆写玩家名；没被要求就别在别人的建筑上乱挖乱建。',
-  ].join('\n')
+  /* 🔴 2026-09-16：这里原来有一段"麦块模式专属指导"（通过系统提示注入）。
+   * 用户要求**删掉显式注入**，而且它的内容（单对话 / 记忆 / 看门狗 / 指令是最后手段 / 别乱挖乱建）
+   * 已经全部写在 `.whale-craft/AGENTS.md`（Master 亲自给的那版）里 —— 留着就是重复。 */
 
   /** 这个 agent 是否已经应用过 MC 模式策略（WeakSet：一个 agent 只做一次） */
   const mcPolicyApplied = new WeakSet()
@@ -2716,9 +2672,9 @@ export function apply(ctx, config) {
     // 🔴 把提示词**当消息投递**（学宿主注入 AGENTS.md 的做法）—— 必达、且在对话里看得见
     try { injectAgentsMdNotices(agent) } catch (e) { logLine(`提示词投递失败：${e?.message ?? e}`) }
 
-    // ① 提示词段**不在这里注册** —— 它们在 `installAgentPrompts` 里对每个 agent 无条件注册，
-    //    由 `text()` 在装配时判断模式（见那段的注释：2026-09-16 真机事故）。
-    //    这里只做"命令式"的部分：工具可见性 + guard。
+    // 🔴 提示词只有这一条通道：`injectAgentsMdNotices` 把 AGENTS.md / 记忆索引当**插件提示行**投出去。
+    //    **不注册任何 systemPrompt 段**（用户 2026-09-16 要求：那既冗余、又会被 persona 的
+    //    complete/includeRuntimeContext 压掉）。这里只做"命令式"的部分：工具可见性 + guard。
     logLine(`MC 模式生效（preset=${lastPresetSeen.get(agent) ?? '?'}，${agent.id}）`)
 
     // ② 工具可见性：隐藏管理工具（以及配置里的白/黑名单）
@@ -2786,14 +2742,13 @@ export function apply(ctx, config) {
   //    preset 完全可能在 agent 建好之后才选上（在会话里点「MC模式」芯片），宿主为这种情况
   //    专门发 **`agent-preset/selected`**（`agent-presets/src/index.ts` 里 emit，两个位置参数：
   //    `(sessionId, presetId)`）。当时没挂它 → 策略与提示词都不会生效。
-  //    每个 agent 要做三件事：① 建/补工作区骨架 ② 注册提示词段（无条件）③ 若是 MC 模式再套权限。
+  //    每个 agent 只做两件事：① 若是 MC 模式就投提示行（在 applyMcModePolicy 里）② 套权限。
   ctx.effect(() => {
     const handlers = []
     const touch = (agent) => {
       if (!agent?.ctx) return
       // ⚠️ 这里**不再**建 `.whale-craft/` —— 建文件只发生在"首次发起 MC 模式会话"
       //    （applyMcModePolicy 里）和"点开 MC设置"（HTTP 接口里）这两个时机（用户 2026-09-16 定）。
-      try { installAgentPrompts(agent) } catch (e) { logLine(`提示词段注册失败：${e.message}`) }
       try { applyMcModePolicy(agent) } catch (e) { logLine(`MC 模式策略失败：${e.message}`) }
     }
     for (const ev of ['agent/created', 'agent/session-start']) {
@@ -2901,7 +2856,7 @@ export function apply(ctx, config) {
         velocity: b.entity.velocity, onGround: b.entity.onGround, inWater: b.entity.isInWater,
         position: { x: Math.floor(b.entity.position.x), y: Math.floor(b.entity.position.y), z: Math.floor(b.entity.position.z) },
         pendingEvents: sess.events.length, mode: sess.mode, stats: sess.bot.stats,
-        connection: sess.bot._connectionProfile ?? null,
+        connection: sess.bot.connectionView(),
         watching: sess.watchdog?.status() ?? null,
         promptInjection: injection,
       }
