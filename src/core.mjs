@@ -836,10 +836,24 @@ export class McBot extends EventEmitter {
 
   /* ───────────── 单实例锁（按实例分文件：同进程多会话不能共用一把锁） ───────────── */
 
-  get lockFile () { return join(HERE, `.instance.${this.instanceId}.json`) }
+  /**
+   * 单实例锁文件（连服时才有，断开即删）。
+   *
+   * 🔴 默认**不写插件包目录**（与日志同一个道理）：装进 `node_modules/` 后那可能是只读的，
+   *    升级时也会被覆盖。优先用调用方给的 `lockDir`（= `$DSH_HOME/whale_craft/`），
+   *    只有没给时才退回包目录（老行为，保底能用）。
+   */
+  get lockFile () {
+    const dir = this.cfg.lockDir || HERE
+    return join(dir, `.instance.${this.instanceId}.json`)
+  }
 
   writeLock () {
-    try { writeFileSync(this.lockFile, JSON.stringify({ pid: process.pid, instanceId: this.instanceId, at: new Date().toISOString(), sub: this.sub })) } catch {}
+    try {
+      const f = this.lockFile
+      if (!existsSync(dirname(f))) mkdirSync(dirname(f), { recursive: true })
+      writeFileSync(f, JSON.stringify({ pid: process.pid, instanceId: this.instanceId, at: new Date().toISOString(), sub: this.sub }))
+    } catch {}
   }
 
   releaseLock () {

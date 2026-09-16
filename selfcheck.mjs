@@ -1,4 +1,4 @@
-﻿// -*- coding: utf-8 -*-
+// -*- coding: utf-8 -*-
 /**
  * 插件自检：用假 ctx 加载 whale_craft 的 apply()，检查
  *   - Config schema 能否解析
@@ -508,6 +508,20 @@ console.log('\n--- disconnect：优雅优先 / 强断兜底 ---')
   // ③ 本来就没连接：不吊死
   const r3 = await new McBot({ instanceId: 'sc-disc-null' }).disconnect('自检-未连接')
   console.log(`  ${!r3.graceful && !r3.forced ? '✅' : '❌'} 没连接时立刻返回（不吊死，${r3.ms}ms）`)
+}
+
+// 单实例锁文件不许写进插件包目录（与日志同一条理由：装进 node_modules 后可能只读、升级会被覆盖）
+console.log('\n--- 会话锁文件落点 ---')
+{
+  const { McBot } = await import('./src/core.mjs')
+  const { join } = await import('node:path')
+  const lockDir = 'C:\\Users\\x\\.dsh\\whale_craft'
+  const withDir = new McBot({ instanceId: 'sess-A', lockDir })
+  console.log(`  ${withDir.lockFile === join(lockDir, '.instance.sess-A.json') ? '✅' : '❌'} 给了 lockDir → 锁文件落在插件的家：${withDir.lockFile}`)
+  const noDir = new McBot({ instanceId: 'sess-A' })
+  console.log(`  ${noDir.lockFile.includes('.instance.sess-A.json') ? '✅' : '❌'} 没给 lockDir 时仍能算出路径（退回包目录保底，不崩）`)
+  const src = (await import('node:fs')).readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+  console.log(`  ${/new McSession\(agentId, this\.config, this\.lockDir\)/.test(src) && /registry\.lockDir = stateDir/.test(src) ? '✅' : '❌'} index.js 把状态目录传下去了（不写插件包目录）`)
 }
 
 // ── 玩家说话要能被认出来（2026-09-16 真机事故：LAN/离线服上"喊我不应，只能 tp 我"）──

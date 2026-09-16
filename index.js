@@ -147,11 +147,13 @@ export const Config = z.object({
  * 不同会话的 McSession 互不干扰。
  */
 class McSession {
-  constructor(agentId, config) {
+  constructor(agentId, config, lockDir = null) {
     this.agentId = agentId
     this.config = config
-    // 不传固定 config：连接参数走 connect()；instanceId 让每个会话有独立的锁与日志标识
-    this.bot = new McBot({ instanceId: agentId })
+    // 不传固定 config：连接参数走 connect()；instanceId 让每个会话有独立的锁与日志标识。
+    // 🔴 lockDir = 插件的家（`$DSH_HOME/whale_craft/`）：**别把锁文件写进插件包目录**
+    //    （装进 node_modules 后可能是只读的，升级时也会被覆盖）——与日志同一条理由。
+    this.bot = new McBot({ instanceId: agentId, ...(lockDir ? { lockDir } : {}) })
     this.mode = 'standby'           // standby / active / sleep
     this.events = []                // 未消费的 MC 事件
     this.maxEvents = 200
@@ -244,6 +246,8 @@ class McRegistry {
   constructor(ctx, config) {
     this.ctx = ctx
     this.config = config
+    /** 插件状态目录（`$DSH_HOME/whale_craft/`）：会话锁文件放这里，不写插件包目录 */
+    this.lockDir = null
     /** @type {Map<string, McSession>} */
     this.sessions = new Map()
   }
@@ -252,7 +256,7 @@ class McRegistry {
   getOrCreate(agentId) {
     let sess = this.sessions.get(agentId)
     if (!sess) {
-      sess = new McSession(agentId, this.config)
+      sess = new McSession(agentId, this.config, this.lockDir)
       sess.ensureWired(this.ctx)
       this.sessions.set(agentId, sess)
       this.ctx.logger?.info?.(`[whale_craft] 新建会话实例：${agentId}`)
@@ -387,6 +391,7 @@ export function apply(ctx, config) {
    * ------------------------------------------------------------------------ */
   const dshHomePath = (() => { try { return ctx.get('dshHomePath') } catch { return undefined } })()
   const stateDir = resolveStateDir({ dshHomePath, whaleDir: process.env.WHALE_CRAFT_DIR })
+  registry.lockDir = stateDir      // 会话锁文件也放插件自己的家（别写进插件包目录）
 
   /* ── 记忆 / 提示词：挂在**会话工作区**下，不再假设"插件装在工作区里" ──────────────
    * 抽取成标准插件后，包可能装在 `node_modules/` 或任意目录，**不能**再用 `__dirname/..` 推工作区。
@@ -734,7 +739,7 @@ export function apply(ctx, config) {
    *    这样前端只管解析 JSON，不用管状态码。
    */
   let authProbe = null
-  const probeBot = () => (authProbe ??= new McBot({ instanceId: 'auth-probe' }))
+  const probeBot = () => (authProbe ??= new McBot({ instanceId: 'auth-probe', lockDir: stateDir }))
 
   /** 设置页要的那几项配置（集中一处，GET/PATCH 共用） */
   const configView = () => ({
