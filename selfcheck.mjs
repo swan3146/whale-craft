@@ -699,7 +699,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     // 🔴 2026-09-16 抽取成标准插件：记忆/提示词必须**按会话工作区**解析（插件装哪都行）
     console.log(`  ${/const workspaceOf = \(agent\) =>/.test(idx) && /agent\?\.session\?\.header\?\.cwd/.test(idx) ? '✅' : '❌'} 工作区取自 exec.agent.session.header.cwd（不再用"插件自己在哪"）`)
     console.log(`  ${/join\(cwd, '\.whale-craft'\)/.test(idx) ? '✅' : '❌'} 记忆根 = <会话工作区>/.whale-craft`)
-    console.log(`  ${/const installMemoryIndex = \(agent\)/.test(idx) && /installMemoryIndex\(agent\)/.test(idx) ? '✅' : '❌'} 记忆索引按 agent 注入（每个工作区各一份）`)
+    console.log(`  ${/const installAgentPrompts = \(agent\)/.test(idx) && /installAgentPrompts\(agent\)/.test(idx) ? '✅' : '❌'} 提示词段（含记忆索引）按 agent 注入（每个工作区各一份）`)
   }
 
   // ② 管理工具（走真实插件实例，落盘在自检临时目录）
@@ -780,6 +780,61 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   const before = guidanceCtxs.length
   fire('agent/session-start', mcAgent)
   console.log(`  ${guidanceCtxs.length === before ? '✅' : '❌'} 同一 agent 重复触发只应用一次策略`)
+
+  /* ⑦ 🔴🔴 2026-09-16 真机事故回归（用户："`.whale-craft/AGENTS.md` 提示词根本没有注入"）：
+   *    旧代码把"注册提示词段"放在 applyMcModePolicy 里 —— 只在**那一刻**是 MC 模式才注册。
+   *    而 preset 完全可能晚于 agent/created 才选上（在会话里点「MC模式」芯片就是选 preset，
+   *    宿主为此专门发 `agent-preset/selected`）。那一刻 isMcModeAgent=false → 直接 return
+   *    → **段永远不注册** → 提示词永远不出现，但按钮（前端按本地 preset）照样显示。
+   *    这条断言在旧代码上必挂：preset 后选上时必须立刻有内容。 */
+  const lateAgent = { id: 'sess-LATE', ctx: makeAgentCtx(undefined) }
+  fire('agent/created', lateAgent)                                  // 建的时候还没选 mode
+  const lateMd = guidanceCtxs.find((x) => x.preset === undefined && x.c?.name === 'whale_craft:agents-md')
+  console.log(`  ${lateMd && String(lateMd.c?.text?.() ?? '') === '' ? '✅' : '❌'} preset 未知时就已注册好提示词段（内容为空，不误注入）`)
+  presetByCtx.set(lateAgent.ctx, 'minecraft')                       // ← "用户选了 MC模式"
+  fakeCtx.agents = { get: (id) => (id === 'sess-LATE' ? lateAgent : id === 'sess-MC2' ? mcAgent : id === 'sess-P2' ? plainAgent : undefined) }
+  eventHandlers.filter((h) => h.ev === 'agent-preset/selected').forEach((h) => h.fn('sess-LATE', 'minecraft'))
+  await new Promise((r) => setTimeout(r, 0))                         // 让 installAgentPrompts ⑤ 里那个 queueMicrotask 落地
+  const lateMdAfter = String(lateMd?.c?.text?.() ?? '')
+  console.log(`  ${/Whale Craft 行事准则/.test(lateMdAfter) ? '✅' : '❌'} 🔴 模式晚选上后，**同一个段**立刻有内容（${lateMdAfter.length} 字）—— 就是那个 bug`)
+  console.log(`  ${guidanceCtxs.filter((x) => x.preset === undefined && x.c?.name === 'whale_craft:agents-md').length === 1 ? '✅' : '❌'} 补注册没有重复（段仍只有一份）`)
+  const lateRestrict = restrictCalls.find((c) => c.preset === undefined)
+  console.log(`  ${(lateRestrict?.f?.deny ?? []).includes('mc_admin_config') ? '✅' : '❌'} 模式晚选上时"命令式"的隔离也补上了（restrict 含 mc_admin_config）`)
+  console.log(`  ${eventHandlers.some((h) => h.ev === 'agent-preset/selected') ? '✅' : '❌'} 挂了宿主的 agent-preset/selected 事件（会话里切模式才生效）`)
+
+  /* ⑧ 🔴 用户："插件初始化就要检查 `.whale-craft` 是否存在，不存在则建立；README.md 是否存在，
+   *    不存在则写入默认值。"（AGENTS.md 同理：提示词页编辑的就是这个文件，文件必须先在） */
+  {
+    const { mkdtempSync, existsSync, readFileSync, writeFileSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const ws = mkdtempSync(join(tmpdir(), 'whale-ws-'))
+    const savedMemDir = process.env.WHALE_CRAFT_MEMORY_DIR
+    delete process.env.WHALE_CRAFT_MEMORY_DIR        // 让记忆根跟着**会话工作区**走（真机就是这么配的）
+    const seedAgent = { id: 'sess-SEED', session: { header: { cwd: ws } }, ctx: makeAgentCtx('minecraft') }
+    fire('agent/created', seedAgent)
+    // 刚注册的那一份就是 seedAgent 的（guidanceCtxs 是按注册顺序追加的）
+    const seedMeta = [...guidanceCtxs].reverse().find((x) => x.c?.name === 'whale_craft:agents-md')
+    const wsRoot = join(ws, '.whale-craft')
+    const wsAgents = join(wsRoot, 'AGENTS.md')
+    const wsReadme = join(wsRoot, 'README.md')
+    console.log(`  ${existsSync(wsRoot) ? '✅' : '❌'} 初始化就建出 <工作区>/.whale-craft/（${wsRoot}）`)
+    console.log(`  ${existsSync(wsAgents) ? '✅' : '❌'} 顺手把 AGENTS.md 建出来（「提示词」页编辑的就是它）`)
+    console.log(`  ${existsSync(wsReadme) ? '✅' : '❌'} README.md 不存在则写入默认骨架`)
+    const seeded = existsSync(wsAgents) ? readFileSync(wsAgents, 'utf8') : ''
+    console.log(`  ${/Whale Craft 行事准则/.test(seeded) && /mc_capabilities/.test(seeded) ? '✅' : '❌'} 建出来的 AGENTS.md = 内置默认全文（${seeded.length} 字）`)
+    writeFileSync(wsAgents, 'Master 手工改过的内容\n', 'utf8')
+    fire('agent/session-start', seedAgent)
+    console.log(`  ${/Master 手工改过的内容/.test(readFileSync(wsAgents, 'utf8')) ? '✅' : '❌'} 已存在的 AGENTS.md 不会被初始化覆盖`)
+    // 🔴 用户 2026-09-16："如果启动对话时设置要求注入，但是找不到文件，那就注入默认，同时重建文件。"
+    const { unlinkSync } = await import('node:fs')
+    unlinkSync(wsAgents)
+    const afterDelete = String(seedMeta?.c?.text?.() ?? '')
+    console.log(`  ${!existsSync(wsAgents) ? '❌' : '✅'} 注入要求还在、文件却没了 → 装配时**重建**了文件`)
+    console.log(`  ${/Whale Craft 行事准则/.test(afterDelete) ? '✅' : '❌'} 同时注入默认全文（${afterDelete.length} 字）—— 不允许"要求注入却什么都没有"`)
+    if (savedMemDir === undefined) delete process.env.WHALE_CRAFT_MEMORY_DIR
+    else process.env.WHALE_CRAFT_MEMORY_DIR = savedMemDir
+  }
 
   // ⑥ 「MC设置」入口的模式门控接口（2026-09-16 真机事故：普通会话也显示了设置按钮）
   const { EventEmitter } = await import('node:events')
@@ -936,7 +991,19 @@ console.log('\n--- 行事准则 AGENTS.md / 新开关 / 边界信息 ---')
   const custom = readAgentsMd(dir)
   console.log(`  ${custom.source === 'custom' && /我的准则/.test(custom.text) ? '✅' : '❌'} 写入后读回自定义版（${agentsMdPath(dir).split(/[\\/]/).pop()}）`)
   resetAgentsMd(dir)
-  console.log(`  ${readAgentsMd(dir).source === 'default' ? '✅' : '❌'} 「恢复默认」= 删掉自定义文件`)
+  // 🔴 2026-09-16 用户纠正："AGENTS.md 就是单纯地编辑这个文件" →
+  //    恢复默认 = 把**默认内容写回文件**（不是删掉文件让代码兜底）；source 由内容判定。
+  const { existsSync: existsSyncMd, readFileSync: readFileSyncMd } = await import('node:fs')
+  const backDefault = readAgentsMd(dir)
+  console.log(`  ${existsSyncMd(agentsMdPath(dir)) && backDefault.source === 'default' ? '✅' : '❌'} 「恢复默认」= 把默认写回文件（文件仍在，source 按内容判定）`)
+  console.log(`  ${backDefault.text === DEFAULT_AGENTS_MD ? '✅' : '❌'} 恢复后的内容逐字等于内置默认（${backDefault.text.length} 字）`)
+  const emptyDir = mkdtempSync(join(tmpdir(), 'whale-md-none-'))
+  const noFile = readAgentsMd(emptyDir)
+  console.log(`  ${noFile.source === 'default' && noFile.text.length > 100 ? '✅' : '❌'} 文件不存在时也返回默认**全文**（绝不返回空串 → 提示词不会因此消失）`)
+  writeAgentsMd(dir, DEFAULT_AGENTS_MD)
+  console.log(`  ${readAgentsMd(dir).source === 'default' ? '✅' : '❌'} 就算文件在、只要内容等于默认 → 仍算"默认版"（标签不说谎）`)
+  writeAgentsMd(dir, '# 我的准则\n\n- 一句话')
+  console.log(`  ${readAgentsMd(dir).source === 'custom' ? '✅' : '❌'} 改过内容 → 算"自定义版"`)
   const tooBig = await Promise.resolve().then(() => writeAgentsMd(dir, 'x'.repeat(200 * 1024))).catch((e) => e.message)
   console.log(`  ${/太大/.test(String(tooBig)) ? '✅' : '❌'} 超大内容被拒`)
   console.log(`  ${isAgentsMdPath('E:\\x\\.whale-craft\\AGENTS.md') && isAgentsMdPath('E:/x/whale_craft/AGENTS.md') && !isAgentsMdPath('E:/x/README.md') ? '✅' : '❌'} isAgentsMdPath 认得本文件、不误伤别的`)

@@ -12,7 +12,7 @@
  *   · **自定义**：`<工作区>/.whale-craft/AGENTS.md` —— 存在就用它，删掉就回到默认
  * ============================================================================
  */
-import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 
 const FILE = 'AGENTS.md'
@@ -86,13 +86,20 @@ export const DEFAULT_AGENTS_MD = `# Whale Craft 行事准则
 
 export function agentsMdPath (dir) { return join(dir, FILE) }
 
-/** 读当前准则：自定义文件优先，否则默认 */
+/**
+ * 读当前准则。
+ *
+ * 🔴 2026-09-16 用户纠正："AGENTS.md 本身不在配置中，不在内存中，就是单纯地编辑这个文件。"
+ *    所以 **`source` 由内容判定**（与内置默认逐字相同 = 默认），不再由"文件在不在"判定——
+ *    插件初始化会把文件建出来（内容就是默认），那时它不该被标成"Master 自定义版"。
+ */
 export function readAgentsMd (dir) {
   const p = agentsMdPath(dir)
   try {
     if (existsSync(p)) {
-      const text = readFileSync(p, 'utf8')
-      if (text.trim()) return { text, source: 'custom', path: p }
+      const raw = readFileSync(p, 'utf8')
+      const text = raw.trim() ? raw : DEFAULT_AGENTS_MD
+      return { text, source: text.trim() === DEFAULT_AGENTS_MD.trim() ? 'default' : 'custom', path: p }
     }
   } catch { /* 读不了就当没有 */ }
   return { text: DEFAULT_AGENTS_MD, source: 'default', path: p }
@@ -108,11 +115,16 @@ export function writeAgentsMd (dir, text) {
   return { saved: true, path: agentsMdPath(dir), bytes: Buffer.byteLength(body) }
 }
 
-/** 恢复默认：把自定义文件删掉 */
+/**
+ * 恢复默认：把**默认内容写回文件**（不是删文件）。
+ * 🔴 2026-09-16 用户纠正："就是单纯地编辑这个文件" —— 删了文件会让「提示词」页变成
+ *    "没有文件、由代码兜底"那套本末倒置的状态；文件永远在，才算真的在编辑一个文件。
+ */
 export function resetAgentsMd (dir) {
   const p = agentsMdPath(dir)
-  try { if (existsSync(p)) unlinkSync(p) } catch (e) { throw new Error(`删除自定义准则失败：${e.message}`) }
-  return { reset: true, path: p, defaultBytes: Buffer.byteLength(DEFAULT_AGENTS_MD) }
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+  writeFileSync(p, DEFAULT_AGENTS_MD, 'utf8')
+  return { reset: true, path: p, source: 'default', defaultBytes: Buffer.byteLength(DEFAULT_AGENTS_MD) }
 }
 
 /**

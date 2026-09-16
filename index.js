@@ -20,7 +20,7 @@
  */
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { existsSync, readdirSync, readFileSync, mkdirSync, copyFileSync, unlinkSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, unlinkSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { resolve, sep, join } from 'node:path'
 import { McBot, lossless, logLine, libraryInfo } from './src/core.mjs'
@@ -851,15 +851,39 @@ export function apply(ctx, config) {
     if (req.method === 'GET' && path === '/api/mc/mode') {
       const sessionId = url.searchParams.get('sessionId') ?? ''
       let mcMode = false
+      let agent = null
       if (sessionId) {
         try {
-          const agent = ctx.get('agents')?.get?.(sessionId)
+          agent = ctx.get('agents')?.get?.(sessionId) ?? null
           mcMode = agent ? isMcModeAgent(agent) : mcModeAgentIds.has(sessionId)
         } catch {
           mcMode = mcModeAgentIds.has(sessionId)
         }
       }
-      return sendJson(res, 200, { ok: true, sessionId, mcMode })
+      // 诊断：把"判定依据"和"各段实际长度"一并报出来。
+      // 2026-09-16 事故的教训：只回一个 false，谁都查不出是 preset 没认出来还是段没注册。
+      let diag = null
+      if (sessionId) {
+        try {
+          const root = memoryRootFor(workspaceOf(agent))
+          const cur = readAgentsMd(root)
+          const on = mcMode && pluginConfig.get('injectWhaleCraftAgentsMd') === true
+          diag = {
+            presetId: (agent && lastPresetSeen.get(agent)) ?? null,
+            agentFound: Boolean(agent),
+            promptsInstalled: Boolean(agent && promptsInstalled.has(agent)),
+            serviceReady: Boolean(agentPresetsSvc) || (() => { try { return Boolean(ctx.get('agentPresets')) } catch { return false } })(),
+            memoryRoot: root,
+            agentsMd: { path: cur.path, exists: existsSync(cur.path), source: cur.source, bytes: Buffer.byteLength(cur.text) },
+            segments: {
+              'memory-index': memoryIndexText(memoryFor(workspaceOf(agent))).length,
+              'mode-guidance': mcMode ? MC_MODE_GUIDANCE.length : 0,
+              'agents-md': on ? cur.text.length : 0,
+            },
+          }
+        } catch (e) { diag = { error: String(e.message) } }
+      }
+      return sendJson(res, 200, { ok: true, sessionId, mcMode, diag })
     }
 
     if (req.method === 'POST' && path === '/api/mc/stop') {
@@ -1888,22 +1912,114 @@ export function apply(ctx, config) {
   ctx.inject(['systemPrompt'], (scope) => injectMemoryIndex(scope))
 
   /**
-   * **按会话工作区**注入记忆索引（每个 agent 一次；scoped 注册会 shadow 全局那份）。
-   * 用 `agent.ctx.get('systemPrompt')`：`ctx.get()` 不受"必须先 inject"约束（同上面的教训）。
+   * **每个 agent 一次**的提示词段（记忆索引 + MC 模式专属的两段）。
+   *
+   * 🔴 2026-09-16 真机事故（用户："`.whale-craft/AGENTS.md` 提示词根本没有注入"）：
+   *    这几段原来注册在 `applyMcModePolicy` 里 —— 也就是"**注册那一刻**必须已经是 MC 模式"。
+   *    可 preset 完全可能晚于 `agent/created` 才选上（在会话里点模式芯片也是选 preset！），
+   *    于是 `isMcModeAgent()` 返回 false → 直接 return → **段永远不注册** → 提示词永远不出现，
+   *    而按钮（前端按**本地 preset** 判定）照样显示 —— 症状就是"有按钮、没提示词"。
+   *
+   * 现在的做法：**注册不看模式**，`text()` 在**每次装配时**才判断是不是 MC 模式（配置开关同理）。
+   * 这样无论 preset 什么时候选上，下一轮装配就带上了；也不可能再"漏注册"。
    */
-  const memoryIndexInstalled = new WeakSet()
-  const installMemoryIndex = (agent) => {
-    if (!agent?.ctx || memoryIndexInstalled.has(agent)) return
+  const promptsInstalled = new WeakSet()
+  const installAgentPrompts = (agent) => {
+    if (!agent?.ctx || promptsInstalled.has(agent)) return
     let sp = null
     try { sp = agent.ctx.get('systemPrompt') } catch { sp = null }
     if (!sp || typeof sp.context !== 'function') return
-    memoryIndexInstalled.add(agent)
+    promptsInstalled.add(agent)
+
+    // ① 记忆索引（按会话工作区；scoped 注册会 shadow 全局那份）
     const store = memoryFor(workspaceOf(agent))
     sp.context({
       name: 'whale_craft:memory-index',
       order: 200,
       text: () => memoryIndexText(store),
     })
+
+    // ② 本模式专属指导（不是 MC 模式就返回空串 → 宿主会丢弃这一段）
+    sp.context({
+      name: 'whale_craft:mode-guidance',
+      order: 240,
+      text: () => (isMcModeAgent(agent) ? MC_MODE_GUIDANCE : ''),
+    })
+
+    // ③ 行事准则 `.whale-craft/AGENTS.md`
+    // 🔴 用户 2026-09-16："如果启动对话时设置要求注入，但是找不到文件，那就**注入默认，同时重建文件**。"
+    //    所以这里不只是"读"：缺文件就顺手补一份默认（自愈），绝不允许"要求注入却什么都没有"。
+    sp.context({
+      name: 'whale_craft:agents-md',
+      order: 205,
+      text: () => {
+        if (!isMcModeAgent(agent)) return ''
+        if (pluginConfig.get('injectWhaleCraftAgentsMd') !== true) return ''
+        const dir = memoryRootFor(workspaceOf(agent))
+        if (ensureAgentsMdFile(dir)) logLine(`行事准则文件缺失 → 已重建并注入默认：${agentsMdPath(dir)}`)
+        const cur = readAgentsMd(dir)
+        const tag = cur.source === 'custom' ? 'Master 自定义版' : '默认版'
+        return `【Whale Craft 行事准则 · .whale-craft/AGENTS.md（${tag}）】\n\n${cur.text.trim()}`
+      },
+    })
+
+    // ④ 工作区 AGENTS.md：默认**不注入**；Master 在提示词页打开开关后才补一份
+    sp.context({
+      name: 'whale_craft:workspace-agents-md',
+      order: 206,
+      text: () => {
+        if (!isMcModeAgent(agent)) return ''
+        if (pluginConfig.get('injectWorkspaceAgentsMd') !== true) return ''
+        try {
+          const p = join(workspaceRootFor(agent), 'AGENTS.md')
+          if (!existsSync(p)) return ''
+          const t = readFileSync(p, 'utf8').trim()
+          return t ? `【工作区 AGENTS.md（Master 打开了"注入工作区 AGENTS.md"）】\n\n${t}` : ''
+        } catch { return '' }
+      },
+    })
+
+    // ⑤ "命令式"的部分（`tools.restrict` 没法动态判定）在装配时再补一次 —— 幂等，且只在真 MC 模式时排队。
+    //    装配发生在每轮开头，所以 preset 一旦选上，最迟下一轮就生效。
+    if (isMcModeAgent(agent) && !mcPolicyApplied.has(agent)) {
+      queueMicrotask(() => { try { applyMcModePolicy(agent) } catch { /* 上面已有日志 */ } })
+    }
+  }
+
+  /**
+   * 行事准则文件缺了就补一份默认。
+   * 用户 2026-09-16："启动对话时设置要求注入、但找不到文件" → **注入默认 + 重建文件**（自愈）。
+   * @returns {boolean} 是否刚建出来（调用方据此打一行日志）
+   */
+  const ensureAgentsMdFile = (dir) => {
+    const p = agentsMdPath(dir)
+    try {
+      if (existsSync(p)) return false
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+      writeFileSync(p, DEFAULT_AGENTS_MD, 'utf8')
+      return true
+    } catch (e) { logLine(`重建行事准则失败（${p}）：${e.message}`); return false }
+  }
+
+  /**
+   * 只建一次的工作区骨架。用户 2026-09-16："插件初始化就要检查 `.whale-craft` 是否存在，不存在则建立；
+   * README.md 是否存在，不存在则写入默认值。" —— 不能指望 AI 自己把它长出来，
+   * 尤其「MC设置 → 提示词」页编辑的就是这个文件：**文件必须先在**。
+   */
+  const seededRoots = new Set()
+  const ensureMemoryRoot = (agent) => {
+    const cwd = workspaceOf(agent)
+    const root = memoryRootFor(cwd)
+    if (seededRoots.has(root)) return
+    seededRoots.add(root)
+    try {
+      if (!existsSync(root)) {
+        mkdirSync(root, { recursive: true })
+        logLine(`已建立记忆目录：${root}`)
+      }
+      try { if (memoryFor(cwd).ensureReadme()) logLine(`已写入默认记忆索引：${join(root, 'README.md')}`) } catch (e) { logLine(`写默认索引失败：${e.message}`) }
+      if (ensureAgentsMdFile(root)) logLine(`已写入默认行事准则：${agentsMdPath(root)}`)
+    } catch (e) { logLine(`初始化记忆目录失败（${root}）：${e.message}`) }
   }
 
   /* ─────────── MC 模式：权限隔离 + 专属指导（用户 2026-09-16 要求）───────────
@@ -1918,10 +2034,20 @@ export function apply(ctx, config) {
   let agentPresetsSvc = null
   ctx.inject(['agentPresets'], (scope) => { agentPresetsSvc = scope.get('agentPresets') ?? null })
 
+  /** 诊断用：每个 agent 最近一次看到的 preset id（`/api/mc/mode` 会报出来） */
+  const lastPresetSeen = new WeakMap()
+
   const isMcModeAgent = (agent) => {
     if (!agent?.ctx) return false
     try {
-      const id = agentPresetsSvc?.composedPreset?.(agent.ctx)
+      // 服务可能晚就绪 / `ctx.inject` 没跑到 → **现场再拿一次**。
+      // 🔴 以前只认 inject 抓到的那个引用：一旦它还是 null，isMcModeAgent 就永远 false，
+      //    表现就是"按钮有、提示词没有、隔离也不生效"（2026-09-16 真机事故的同一家族）。
+      let svc = agentPresetsSvc
+      if (!svc) { try { svc = agent.ctx.get('agentPresets') } catch { svc = null } }
+      if (!svc) { try { svc = ctx.get('agentPresets') } catch { svc = null } }
+      const id = svc?.composedPreset?.(agent.ctx)
+      if (typeof id === 'string' && id) lastPresetSeen.set(agent, id)
       return pluginConfig.isMcModePreset(id)
     } catch { return false }
   }
@@ -1970,44 +2096,10 @@ export function apply(ctx, config) {
     mcPolicyApplied.add(agent)
     if (agent.id) mcModeAgentIds.add(String(agent.id))
 
-    // ① 提示词：本模式专属指导 + 行事准则（AGENTS.md）
-    try {
-      const sp = agent.ctx.get('systemPrompt')
-      if (sp && typeof sp.context === 'function') {
-        sp.context({ name: 'whale_craft:mode-guidance', order: 240, text: () => MC_MODE_GUIDANCE })
-
-        // 行事准则：`.whale-craft/AGENTS.md`（Master 可在「MC设置 → 提示词」里改；AI 不许读写）
-        // 文本是**函数**：开关/内容改了下一轮就生效，不用重建 agent。
-        sp.context({
-          name: 'whale_craft:agents-md',
-          order: 205,
-          text: () => {
-            if (pluginConfig.get('injectWhaleCraftAgentsMd') !== true) return ''
-            const cur = readAgentsMd(memoryRootFor(workspaceOf(agent)))
-            const tag = cur.source === 'custom' ? 'Master 自定义版' : '默认版'
-            return `【Whale Craft 行事准则 · .whale-craft/AGENTS.md（${tag}）】\n\n${cur.text.trim()}`
-          },
-        })
-
-        // 工作区 AGENTS.md：默认**不注入**；Master 在提示词页打开开关后才补一份
-        // （2026-09-16 实测：MC 模式下宿主本来就没注入它，所以这里是我们插件自己补）
-        sp.context({
-          name: 'whale_craft:workspace-agents-md',
-          order: 206,
-          text: () => {
-            if (pluginConfig.get('injectWorkspaceAgentsMd') !== true) return ''
-            try {
-              const p = join(workspaceRootFor(agent), 'AGENTS.md')
-              if (!existsSync(p)) return ''
-              const t = readFileSync(p, 'utf8').trim()
-              return t ? `【工作区 AGENTS.md（Master 打开了"注入工作区 AGENTS.md"）】\n\n${t}` : ''
-            } catch { return '' }
-          },
-        })
-
-        logLine(`MC 模式：已注入专属指导 + 行事准则（${agent.id}）`)
-      }
-    } catch (e) { logLine(`MC 模式提示词注入失败：${e.message}`) }
+    // ① 提示词段**不在这里注册** —— 它们在 `installAgentPrompts` 里对每个 agent 无条件注册，
+    //    由 `text()` 在装配时判断模式（见那段的注释：2026-09-16 真机事故）。
+    //    这里只做"命令式"的部分：工具可见性 + guard。
+    logLine(`MC 模式生效（preset=${lastPresetSeen.get(agent) ?? '?'}，${agent.id}）`)
 
     // ② 工具可见性：隐藏管理工具（以及配置里的白/黑名单）
     try {
@@ -2069,18 +2161,30 @@ export function apply(ctx, config) {
     })
   } catch (e) { logLine(`注册 MC 模式 guard 失败：${e.message}`) }
 
-  // agent 建立 / 首轮开始时应用策略（preset 组合可能晚于 agent/created，所以两个时机都试）
-  // 每个 agent 都要做两件事：① 注入**本工作区**的记忆索引 ② 若是 MC 模式再套权限/指导
+  // agent 建立 / 首轮开始 / **模式被选上** 时应用策略。
+  // 🔴 2026-09-16 真机事故：只挂 `agent/created` + `agent/session-start` 是不够的 ——
+  //    preset 完全可能在 agent 建好之后才选上（在会话里点「MC模式」芯片），宿主为这种情况
+  //    专门发 **`agent-preset/selected`**（`agent-presets/src/index.ts` 里 emit，两个位置参数：
+  //    `(sessionId, presetId)`）。当时没挂它 → 策略与提示词都不会生效。
+  //    每个 agent 要做三件事：① 建/补工作区骨架 ② 注册提示词段（无条件）③ 若是 MC 模式再套权限。
   ctx.effect(() => {
     const handlers = []
-    for (const ev of ['agent/created', 'agent/session-start']) {
-      try {
-        handlers.push(ctx.on(ev, ({ agent }) => {
-          try { installMemoryIndex(agent) } catch (e) { logLine(`记忆索引注入失败：${e.message}`) }
-          try { applyMcModePolicy(agent) } catch (e) { logLine(`MC 模式策略失败：${e.message}`) }
-        }))
-      } catch { /* 宿主没有这个事件就跳过 */ }
+    const touch = (agent) => {
+      if (!agent?.ctx) return
+      try { ensureMemoryRoot(agent) } catch (e) { logLine(`初始化记忆目录失败：${e.message}`) }
+      try { installAgentPrompts(agent) } catch (e) { logLine(`提示词段注册失败：${e.message}`) }
+      try { applyMcModePolicy(agent) } catch (e) { logLine(`MC 模式策略失败：${e.message}`) }
     }
+    for (const ev of ['agent/created', 'agent/session-start']) {
+      try { handlers.push(ctx.on(ev, ({ agent } = {}) => touch(agent))) } catch { /* 宿主没有这个事件就跳过 */ }
+    }
+    // 模式被选上/切换：两个位置参数，agent 要自己找回来
+    try {
+      handlers.push(ctx.on('agent-preset/selected', (sessionId, presetId) => {
+        if (pluginConfig.isMcModePreset(presetId)) mcModeAgentIds.add(String(sessionId))
+        touch(safeAgentById(sessionId))
+      }))
+    } catch { /* 老宿主没有这个事件 */ }
     return () => { for (const off of handlers) { try { off?.() } catch {} } }
   }, 'whale_craft: mc-mode policy')
 
