@@ -51,7 +51,31 @@ const presetPaths = new Map()
   for (const [id, d] of Object.entries(SHIPPED_DESC)) {
     const dir = jnTop(shippedRoot, id)
     mkdirSync(dir, { recursive: true })
-    writeFileSync(jnTop(dir, 'agent.cordis.yml'), `# ${id} composition\n`, 'utf8')
+    // ⚠️ `minimal` 要写成**像真的**那份：带 persona 行（含 `complete: true`）和一个持久 shell 组 ——
+    //    不然"复制完要改 persona / 关 shell"那两条集成断言就是假绿（2026-09-16 吃过一次假绿的亏）
+    const comp = id === 'minimal'
+      ? [
+        '# The `minimal` agent preset: a fixed-prompt, single-tool coding-agent composition.',
+        '',
+        '- id: persona',
+        "  name: '@deepseek-ai/dsh-persona'",
+        '  config:',
+        '    prefix: You are a helpful software engineer assistant.',
+        '    complete: true',
+        '    includeRuntimeContext: false',
+        '',
+        '- id: persistent-shell',
+        '  name: cordis:group',
+        '  group: true',
+        '  isolate:',
+        '    terminals: true',
+        '  config:',
+        '    - id: pty',
+        "      name: '@deepseek-ai/dsh-terminal'",
+        '',
+      ].join('\n')
+      : `# ${id} composition\n`
+    writeFileSync(jnTop(dir, 'agent.cordis.yml'), comp, 'utf8')
     writeFileSync(jnTop(dir, 'preset.yml'), `name: ${id}\ndescription: ${JSON.stringify(d)}\n`, 'utf8')
     presetPaths.set(id, jnTop(dir, 'agent.cordis.yml'))
   }
@@ -753,6 +777,25 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   console.log(`  ${/name: "MC模式"/.test(presetMeta) ? '✅' : '❌'} 建出来的 preset 显示名 = MC模式`)
   console.log(`  ${/可以加入Minecraft Java版服务器/.test(presetMeta) ? '✅' : '❌'} 🔴 简介改回自己的（不再是"极简模式"那句）：${JSON.stringify((presetMeta.split('\n').find((l) => l.startsWith('description')) ?? '').slice(0, 60))}`)
   console.log(`  ${!/极简/.test(presetMeta) ? '✅' : '❌'} 简介里没有残留极简模式的文案`)
+  // 🔴 用户 2026-09-16："默认系统提示词居然是 'You are a helpful software engineer assistant.'，太离谱了"
+  //    —— 那句来自复制的 minimal，必须换成我们自己的；顺带把 minimal 的 `complete: true` 和 shell 处理掉
+  {
+    const compFile = presetPaths.get('minecraft')
+    const comp = compFile && exTop(compFile) ? rfTop(compFile, 'utf8') : ''
+    console.log(`  ${/Minecraft Java 版服务器里扮演一名玩家/.test(comp) ? '✅' : '❌'} persona 换成我们自己的（Minecraft 玩家）`)
+    console.log(`  ${!/helpful software engineer assistant/.test(comp) ? '✅' : '❌'} 🔴 官方那句"软件助手"已不存在`)
+    console.log(`  ${!/complete: true/.test(comp) && !/includeRuntimeContext: false/.test(comp) ? '✅' : '❌'} minimal 的 complete / includeRuntimeContext 已去掉（否则会压掉其它 section）`)
+    console.log(`  ${/^-\s+id:\s*persistent-shell[\s\S]{0,120}disabled: true/m.test(comp) ? '✅' : '❌'} 🔴 持久 shell 已关掉（与"本模式没有 shell"的指导一致）`)
+    console.log(`  ${/id: pty/.test(comp) ? '✅' : '❌'} 其余结构原样保留（pty 组还在，只是被 disabled）`)
+  }
+  // 纯函数：结构不认识时要返回 null（宁可不改也不写坏 composition）
+  {
+    const C = await import('./src/config.mjs')
+    console.log(`  ${C.patchPersonaInComposition('# 没有 persona 行\n', 'x') === null ? '✅' : '❌'} 没有 persona 行 → 返回 null（不瞎改）`)
+    console.log(`  ${C.disableShellInComposition('# 没有 shell 组\n') === null ? '✅' : '❌'} 没有 shell 组 → 返回 null`)
+    const twice = C.disableShellInComposition(C.disableShellInComposition('- id: persistent-shell\n  group: true\n', '') ?? '')
+    console.log(`  ${(twice.match(/disabled: true/g) ?? []).length === 1 ? '✅' : '❌'} 关 shell 是幂等的（不会写两遍 disabled）`)
+  }
   // 🔴 **已经建好的**那份也要能修（用户那台测试机上就是旧版建出来的）：
   //    只在"简介恰好等于某个官方 preset 的简介"（明显是复制残留）时才动，用户自己写的不碰。
   const SHIPPED = ['仅提供持久 shell 的单工具编码 Agent。', '功能完整的编码 Agent，支持文件编辑、Shell、文件与网页检索、Skills、计划、目标、子代理和工作流。']
@@ -763,6 +806,15 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     const src = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
     console.log(`  ${/planPresetAction\(\{/.test(src) && /shippedDescriptionMatch: isCopiedPresetDescription\(row\?\.description, shippedDescs\)/.test(src) ? '✅' : '❌'} 已有的 MC 模式 preset 也会走一次判定（旧版建出来的能被修好）`)
     console.log(`  ${/writeMcPresetMarker\(svc, target, \{/.test(src) && /MC_PRESET_MARKER = '\.whale-craft\.json'/.test(src) ? '✅' : '❌'} 建完留下"自建标记"（下次启动才知道这份是我们建的）`)
+    // 🔴 2026-09-16 真机事故：复制 minimal 带来的 persona（含 complete:true / includeRuntimeContext:false）
+    //    会让宿主把**我们注入的 context 段整个丢掉** → "设置页显示正常、AI 却什么都没收到"
+    console.log(`  ${/patchMcPresetComposition\(svc, target\)/.test(src) && /patchMcPresetComposition\(svc, existingId\)/.test(src) ? '✅' : '❌'} 新建/重建都会把 persona 换成我们的、并关掉 shell`)
+    console.log(`  ${/stillShippedPersona/.test(src) && /You are a helpful software engineer assistant/.test(src) ? '✅' : '❌'} 旧版（无标记）那份：只在"官方那句人设还在"时才动它`)
+    console.log(`  ${/runtimeContextSuppressed \? \[\]/.test(src) ? '✅' : '❌'} 状态块注释里钉住了宿主那段 contexts: runtimeContextSuppressed ? [] （这是根因）`)
+    console.log(`  ${/registered: segs/.test(src) && /segments: delivered/.test(src) ? '✅' : '❌'} 状态块同时给"注册了没有"和"**实际收不收得到**"（不许再撒谎）`)
+    // 🔴 用户："我不要模拟用户发送啊！" —— 投递的那条必须标成 plugin/notice，且**不许** steer（空闲时会起一轮）
+    console.log(`  ${/kind: 'plugin', plugin: 'whale_craft', form: 'notice'/.test(src) ? '✅' : '❌'} 投递的消息标成 plugin/notice（插件提示行，不归到用户头上）`)
+    console.log(`  ${!/agent\.steer\(/.test(src) ? '✅' : '❌'} 🔴 插件里**没有** steer 兜底（steer 空闲会"起一轮"＝没问就替用户说话）`)
   }
 
   // 🔴 用户问的："初始化时能不能检查是不是对的，不对也重新建吗？万一用户更新插件了呢。"
@@ -900,22 +952,34 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   }
   const fire = (ev, agent) => eventHandlers.filter((h) => h.ev === ev).forEach((h) => h.fn({ agent }))
 
-  const mcAgent = { id: 'sess-MC2', session: { header: { cwd: mkdtempSync(join(tmpdir(), 'whale-mc-')) } }, ctx: makeAgentCtx('minecraft') }
-  const plainAgent = { id: 'sess-P2', session: { header: { cwd: mkdtempSync(join(tmpdir(), 'whale-pl-')) } }, ctx: makeAgentCtx('standard') }
+  const mcAgent = { id: 'sess-MC2', session: { header: { cwd: mkdtempSync(join(tmpdir(), 'whale-mc-')) } }, ctx: makeAgentCtx('minecraft'), inbox: { nextStep: [] }, steer: () => { throw new Error('不该走 steer！') } }
+  const plainAgent = { id: 'sess-P2', session: { header: { cwd: mkdtempSync(join(tmpdir(), 'whale-pl-')) } }, ctx: makeAgentCtx('standard'), inbox: { nextStep: [] } }
   fire('agent/created', mcAgent)
   fire('agent/created', plainAgent)
 
   const mcRestrict = restrictCalls.find((c) => c.preset === 'minecraft')
+  // 🔴 2026-09-16 真机事故的正解：把提示词当**插件提示**投递（宿主自己注入 AGENTS.md 也走 `inbox.nextStep`）
+  //    —— 必达（不过 systemPrompt 组装，persona 的 complete/includeRuntimeContext 压不到）
+  {
+    const msgs = mcAgent.inbox.nextStep
+    const first = msgs[0]
+    console.log(`  ${msgs.length === 1 ? '✅' : '❌'} MC 会话：提示词被投递到 inbox.nextStep（${msgs.length} 条）`)
+    console.log(`  ${first?.source?.kind === 'plugin' && first?.source?.plugin === 'whale_craft' && first?.source?.form === 'notice' ? '✅' : '❌'} 🔴 来源是 plugin/notice（**不是**用户发言）：${JSON.stringify(first?.source ?? null)}`)
+    const body = (first?.content ?? []).map((c) => c.text ?? '').join('')
+    console.log(`  ${/Whale Craft 行事准则/.test(body) && /Minecraft/.test(body) ? '✅' : '❌'} 投递内容含行事准则（${body.length} 字）`)
+    console.log(`  ${plainAgent.inbox.nextStep.length === 0 ? '✅' : '❌'} 普通会话**不投递**（只有 MC 模式才投）`)
+    const inboxBefore = mcAgent.inbox.nextStep.length
+    fire('agent/session-start', mcAgent)
+    console.log(`  ${mcAgent.inbox.nextStep.length === inboxBefore ? '✅' : '❌'} 同一会话只投一次（不刷屏）`)
+  }
   const denyList = mcRestrict?.f?.deny ?? []
   console.log(`  ${denyList.includes('mc_admin_config') ? '✅' : '❌'} MC 模式会话被隐藏管理工具：${JSON.stringify(denyList)}`)
   // ⚠️ 按 **name** 找，不按 preset 找：同一个 agent 现在会先注入 memory-index，再注入 mode-guidance
   const g = guidanceCtxs.find((x) => x.c?.name === 'whale_craft:mode-guidance')
   console.log(`  ${g?.c?.name === 'whale_craft:mode-guidance' ? '✅' : '❌'} MC 模式注入了专属指导（name=${g?.c?.name}）`)
-  const mdCtx = guidanceCtxs.find((x) => x.c?.name === 'whale_craft:agents-md')
-  const mdText = String(mdCtx?.c?.text?.() ?? '')
-  console.log(`  ${/Whale Craft 行事准则/.test(mdText) && /mc_capabilities/.test(mdText) ? '✅' : '❌'} MC 模式注入了行事准则（.whale-craft/AGENTS.md，${mdText.length} 字）`)
-  const wsCtx = guidanceCtxs.find((x) => x.c?.name === 'whale_craft:workspace-agents-md')
-  console.log(`  ${wsCtx && String(wsCtx.c.text?.() ?? '') === '' ? '✅' : '❌'} 「注入工作区 AGENTS.md」默认关 → 该段为空串（宿主会丢弃空段）`)
+  // 🔴 2026-09-16：两个 AGENTS.md **不再走 systemPrompt**（会被 persona 的 complete/includeRuntimeContext 压掉），
+  //    改成**插件提示行**投递（inbox.nextStep）—— 断言见上面那段 + 下面 ⑦。
+  console.log(`  ${!guidanceCtxs.some((x) => x.c?.name === 'whale_craft:agents-md') && !guidanceCtxs.some((x) => x.c?.name === 'whale_craft:workspace-agents-md') ? '✅' : '❌'} 两个 AGENTS.md 不再重复走 systemPrompt（只走提示行，避免投两遍）`)
   console.log(`  ${/单对话/.test(String(g?.c?.text?.() ?? '')) && /mc_kit_memory/.test(String(g?.c?.text?.() ?? '')) ? '✅' : '❌'} 指导内容含关键约定（单对话 / 记忆工具名）`)
   // 用户 2026-09-16：指导里不再写"别碰插件源码与宿主配置（那是别的会话的活）"
   console.log(`  ${!/插件源码|宿主配置|别的会话/.test(String(g?.c?.text?.() ?? '')) ? '✅' : '❌'} 指导里已删掉"别碰插件源码/宿主配置"那条`)
@@ -925,23 +989,26 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   fire('agent/session-start', mcAgent)
   console.log(`  ${guidanceCtxs.length === before ? '✅' : '❌'} 同一 agent 重复触发只应用一次策略`)
 
-  /* ⑦ 🔴🔴 2026-09-16 真机事故回归（用户："`.whale-craft/AGENTS.md` 提示词根本没有注入"）：
-   *    旧代码把"注册提示词段"放在 applyMcModePolicy 里 —— 只在**那一刻**是 MC 模式才注册。
-   *    而 preset 完全可能晚于 agent/created 才选上（在会话里点「MC模式」芯片就是选 preset，
-   *    宿主为此专门发 `agent-preset/selected`）。那一刻 isMcModeAgent=false → 直接 return
-   *    → **段永远不注册** → 提示词永远不出现，但按钮（前端按本地 preset）照样显示。
-   *    这条断言在旧代码上必挂：preset 后选上时必须立刻有内容。 */
-  const lateAgent = { id: 'sess-LATE', session: { header: { cwd: mkdtempSync(join(tmpdir(), 'whale-late-')) } }, ctx: makeAgentCtx(undefined) }
+  /* ⑦ 🔴🔴 2026-09-16 真机事故回归（两轮）：提示词必须**必达 + 看得见**。
+   *    第一轮事故：段注册绑在"那一刻是 MC 模式"上 → preset 晚选上就永远不注册。
+   *    第二轮事故（更狠）：只走 `systemPrompt.context()` —— 复制官方 `minimal` 带来的 persona
+   *    （`complete: true` / `includeRuntimeContext: false`）会让宿主把 context 段**整个丢掉**
+   *    → "设置页显示正常、AI 却什么都没收到"。现在照宿主的做法投**插件提示行**。 */
+  const lateAgent = {
+    id: 'sess-LATE',
+    session: { header: { cwd: mkdtempSync(join(tmpdir(), 'whale-late-')) } },
+    ctx: makeAgentCtx(undefined),
+    inbox: { nextStep: [] },
+  }
   fire('agent/created', lateAgent)                                  // 建的时候还没选 mode
-  const lateMd = guidanceCtxs.find((x) => x.preset === undefined && x.c?.name === 'whale_craft:agents-md')
-  console.log(`  ${lateMd && String(lateMd.c?.text?.() ?? '') === '' ? '✅' : '❌'} preset 未知时就已注册好提示词段（内容为空，不误注入）`)
+  console.log(`  ${lateAgent.inbox.nextStep.length === 0 ? '✅' : '❌'} preset 未知时不投递（不误注入）`)
   presetByCtx.set(lateAgent.ctx, 'minecraft')                       // ← "用户选了 MC模式"
   fakeCtx.agents = { get: (id) => (id === 'sess-LATE' ? lateAgent : id === 'sess-MC2' ? mcAgent : id === 'sess-P2' ? plainAgent : undefined) }
   eventHandlers.filter((h) => h.ev === 'agent-preset/selected').forEach((h) => h.fn('sess-LATE', 'minecraft'))
   await new Promise((r) => setTimeout(r, 0))                         // 让 installAgentPrompts ⑤ 里那个 queueMicrotask 落地
-  const lateMdAfter = String(lateMd?.c?.text?.() ?? '')
-  console.log(`  ${/Whale Craft 行事准则/.test(lateMdAfter) ? '✅' : '❌'} 🔴 模式晚选上后，**同一个段**立刻有内容（${lateMdAfter.length} 字）—— 就是那个 bug`)
-  console.log(`  ${guidanceCtxs.filter((x) => x.preset === undefined && x.c?.name === 'whale_craft:agents-md').length === 1 ? '✅' : '❌'} 补注册没有重复（段仍只有一份）`)
+  const lateBody = (lateAgent.inbox.nextStep[0]?.content ?? []).map((c) => c.text ?? '').join('')
+  console.log(`  ${/Whale Craft 行事准则/.test(lateBody) ? '✅' : '❌'} 🔴 模式晚选上后**立刻投递**（${lateAgent.inbox.nextStep.length} 条 / ${lateBody.length} 字）—— 就是那个 bug`)
+  console.log(`  ${lateAgent.inbox.nextStep.length === 1 ? '✅' : '❌'} 补投递没有重复（只有一条 .whale-craft/AGENTS.md）`)
   const lateRestrict = restrictCalls.find((c) => c.preset === undefined)
   console.log(`  ${(lateRestrict?.f?.deny ?? []).includes('mc_admin_config') ? '✅' : '❌'} 模式晚选上时"命令式"的隔离也补上了（restrict 含 mc_admin_config）`)
   console.log(`  ${eventHandlers.some((h) => h.ev === 'agent-preset/selected') ? '✅' : '❌'} 挂了宿主的 agent-preset/selected 事件（会话里切模式才生效）`)
@@ -955,10 +1022,8 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     const ws = mkdtempSync(join(tmpdir(), 'whale-ws-'))
     const savedMemDir = process.env.WHALE_CRAFT_MEMORY_DIR
     delete process.env.WHALE_CRAFT_MEMORY_DIR        // 让记忆根跟着**会话工作区**走（真机就是这么配的）
-    const seedAgent = { id: 'sess-SEED', session: { header: { cwd: ws } }, ctx: makeAgentCtx('minecraft') }
+    const seedAgent = { id: 'sess-SEED', session: { header: { cwd: ws } }, ctx: makeAgentCtx('minecraft'), inbox: { nextStep: [] } }
     fire('agent/created', seedAgent)
-    // 刚注册的那一份就是 seedAgent 的（guidanceCtxs 是按注册顺序追加的）
-    const seedMeta = [...guidanceCtxs].reverse().find((x) => x.c?.name === 'whale_craft:agents-md')
     const wsRoot = join(ws, '.whale-craft')
     const wsAgents = join(wsRoot, 'AGENTS.md')
     const wsReadme = join(wsRoot, 'README.md')
@@ -971,11 +1036,14 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     fire('agent/session-start', seedAgent)
     console.log(`  ${/Master 手工改过的内容/.test(readFileSync(wsAgents, 'utf8')) ? '✅' : '❌'} 已存在的 AGENTS.md 不会被初始化覆盖`)
     // 🔴 用户 2026-09-16："如果启动对话时设置要求注入，但是找不到文件，那就注入默认，同时重建文件。"
+    //    现在这条发生在**投递时**（inbox 提示）：删掉文件、再起一个新会话 → 文件被重建 + 投递默认全文
     const { unlinkSync } = await import('node:fs')
     unlinkSync(wsAgents)
-    const afterDelete = String(seedMeta?.c?.text?.() ?? '')
-    console.log(`  ${!existsSync(wsAgents) ? '❌' : '✅'} 注入要求还在、文件却没了 → 装配时**重建**了文件`)
-    console.log(`  ${/Whale Craft 行事准则/.test(afterDelete) ? '✅' : '❌'} 同时注入默认全文（${afterDelete.length} 字）—— 不允许"要求注入却什么都没有"`)
+    const seedAgent2 = { id: 'sess-SEED2', session: { header: { cwd: ws } }, ctx: makeAgentCtx('minecraft'), inbox: { nextStep: [] } }
+    fire('agent/created', seedAgent2)
+    const rebuiltBody = (seedAgent2.inbox.nextStep[0]?.content ?? []).map((c) => c.text ?? '').join('')
+    console.log(`  ${existsSync(wsAgents) ? '✅' : '❌'} 投递时发现文件不在 → **重建**了文件`)
+    console.log(`  ${/Whale Craft 行事准则/.test(rebuiltBody) ? '✅' : '❌'} 同时投递默认全文（${rebuiltBody.length} 字）—— 不允许"要求注入却什么都没有"`)
 
     // 🔴 用户 2026-09-16 改的**时机**：不是"启动时对每个会话建"，而是
     //    ① 首次发起 MC 模式会话 ② 点开「MC设置」——**别的时候（比如普通会话）不许建**。
@@ -1943,3 +2011,4 @@ console.log('\n--- 依赖面 + 打包完整性（mineflayer 是**依赖**不是"
 
 console.log('\n日志:', logs.slice(0, 6).join(' | ') || '(无)')
 process.exit(0)
+

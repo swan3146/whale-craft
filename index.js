@@ -23,12 +23,13 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, unlinkSync, statSync, renameSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
 import { resolve, sep, join, isAbsolute } from 'node:path'
 import { homedir } from 'node:os'
 import { McBot, lossless, logLine, libraryInfo } from './src/core.mjs'
 import { Watchdog, WATCH_DEFAULTS } from './src/watchdog.mjs'
 import { MemoryStore } from './src/memory.mjs'
-import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction } from './src/config.mjs'
+import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction, patchPersonaInComposition, disableShellInComposition } from './src/config.mjs'
 import { AccountStore, parseAuthlibCard, normalizeServerUrl, dashUuid } from './src/accounts.mjs'
 import { DEFAULT_AGENTS_MD, agentsMdPath, readAgentsMd, writeAgentsMd, resetAgentsMd, isAgentsMdPath } from './src/agentsmd.mjs'
 import { encodePng } from './src/png.mjs'
@@ -2155,50 +2156,10 @@ export function apply(ctx, config) {
       text: () => (isMcModeAgent(agent) ? MC_MODE_GUIDANCE : ''),
     })
 
-    // ③ 行事准则 `.whale-craft/AGENTS.md`
-    // 🔴 用户 2026-09-16："如果启动对话时设置要求注入，但是找不到文件，那就**注入默认，同时重建文件**。"
-    //    所以这里不只是"读"：缺文件就顺手补一份默认（自愈），绝不允许"要求注入却什么都没有"。
-    sp.context({
-      name: 'whale_craft:agents-md',
-      order: 205,
-      text: () => {
-        if (!isMcModeAgent(agent)) return ''
-        if (pluginConfig.get('injectWhaleCraftAgentsMd') !== true) return ''
-        const dir = memoryRootFor(workspaceOf(agent))
-        if (ensureAgentsMdFile(dir)) logLine(`行事准则文件缺失 → 已重建并注入默认：${agentsMdPath(dir)}`)
-        const cur = readAgentsMd(dir)
-        const tag = cur.source === 'custom' ? 'Master 自定义版' : '默认版'
-        const body = `【Whale Craft 行事准则 · .whale-craft/AGENTS.md（${tag}）】\n\n${cur.text.trim()}`
-        // 🔴 注入时留一行日志（每会话只记一次）：真机排查"到底注没注入"全靠它
-        if (body.length && !injectLogged.has('agents-md:' + agent.id)) {
-          injectLogged.add('agents-md:' + agent.id)
-          logLine(`提示词已注入：.whale-craft/AGENTS.md（${cur.source === 'custom' ? '自定义' : '默认'} ${body.length} 字）`)
-        }
-        return body
-      },
-    })
-
-    // ④ 工作区 AGENTS.md：默认**不注入**；Master 在提示词页打开开关后才补一份
-    sp.context({
-      name: 'whale_craft:workspace-agents-md',
-      order: 206,
-      text: () => {
-        if (!isMcModeAgent(agent)) return ''
-        if (pluginConfig.get('injectWorkspaceAgentsMd') !== true) return ''
-        try {
-          const p = join(workspaceRootFor(agent), 'AGENTS.md')
-          if (!existsSync(p)) return ''
-          const t = readFileSync(p, 'utf8').trim()
-          if (!t) return ''
-          const body = `【工作区 AGENTS.md（Master 打开了"注入工作区 AGENTS.md"）】\n\n${t}`
-          if (!injectLogged.has('workspace-agents-md:' + agent.id)) {
-            injectLogged.add('workspace-agents-md:' + agent.id)
-            logLine(`提示词已注入：工作区 AGENTS.md（${body.length} 字）`)
-          }
-          return body
-        } catch { return '' }
-      },
-    })
+    // ③④ 两个 AGENTS.md **不在这里注册** —— 它们改由 `injectAgentsMdNotices()` 以
+    //     **插件提示行**投递（`agent.inbox.nextStep`，与宿主注入工作区 AGENTS.md 同一手法）：
+    //     必达（不过 systemPrompt 组装，persona 的 complete/includeRuntimeContext 压不到）
+    //     且**在对话里看得见**（折叠标题写明是哪个文件）。留在这里会投两遍。
 
     // ⑤ "命令式"的部分（`tools.restrict` 没法动态判定）在装配时再补一次 —— 幂等，且只在真 MC 模式时排队。
     //    装配发生在每轮开头，所以 preset 一旦选上，最迟下一轮就生效。
@@ -2223,6 +2184,109 @@ export function apply(ctx, config) {
   }
 
   /**
+   * **把两个 AGENTS.md 各投一条"插件提示"**（学宿主的做法，**绝不冒充用户发言**）。
+   *
+   * 🔴 为什么走这条路：宿主注入工作区 `AGENTS.md` **不用 systemPrompt** ——
+   *    `packages/context/agent-instructions` 把一条消息放进 `agent.inbox.nextStep`
+   *    → ① **必达**（不经过 systemPrompt 组装：persona 的 `complete:true` /
+   *    `includeRuntimeContext:false` 压不到它）；② **看得见**（对话里一行折叠提示）。
+   *
+   * 用户 2026-09-16 的要求（照做，**不多做**）：
+   *    · **不加新开关** —— 就用设置里那两个：`injectWhaleCraftAgentsMd` / `injectWorkspaceAgentsMd`；
+   *    · 两个都开时**先投工作区的，再投我们自己的**；
+   *    · 每条都要让人**和 AI**一眼看出是哪个文件：折叠标题与正文首行都带**相对路径**
+   *      （`AGENTS.md` 与 `.whale-craft/AGENTS.md` 是两回事）；
+   *    · `source` 写死 `{kind:'plugin', plugin:'whale_craft', form:'notice'}` → 插件提示行，不归到用户头上；
+   *    · **不做 steer 兜底**（steer 空闲会"起一轮"＝没问就替用户说话）。
+   */
+  let createUserMessage = null
+  try {
+    const req = createRequire(import.meta.url)
+    const mod = req('@deepseek-ai/dsh-llm')
+    createUserMessage = typeof mod?.createUserMessage === 'function' ? mod.createUserMessage : null
+  } catch { createUserMessage = null }
+
+  const agentsMdNoticed = new WeakSet()
+  const injectAgentsMdNotices = (agent) => {
+    if (!agent || agentsMdNoticed.has(agent)) return false
+    if (!agent.ctx || !isMcModeAgent(agent)) return false
+    const cwd = workspaceOf(agent)
+    if (!cwd) return false
+    const inbox = agent.inbox
+    if (!inbox || !Array.isArray(inbox.nextStep) || !createUserMessage) {
+      logLine('提示词投递：宿主没有 inbox.nextStep 或拿不到 createUserMessage → 只走 systemPrompt 那条路')
+      return false
+    }
+    // 顺序：**先工作区，再我们自己的**（用户指定）
+    const items = []
+    if (pluginConfig.get('injectWorkspaceAgentsMd') === true) {
+      try {
+        const p = join(workspaceRootFor(agent), 'AGENTS.md')
+        const t = existsSync(p) ? readFileSync(p, 'utf8').trim() : ''
+        if (t) items.push({ rel: 'AGENTS.md', title: '提示词注入：AGENTS.md', text: t })
+      } catch { /* 读不到就当没有 */ }
+    }
+    if (pluginConfig.get('injectWhaleCraftAgentsMd') === true) {
+      const root = memoryRootFor(cwd)
+      ensureAgentsMdFile(root)
+      const cur = readAgentsMd(root)
+      items.push({
+        rel: '.whale-craft/AGENTS.md',
+        title: '提示词注入：.whale-craft/AGENTS.md',
+        text: `【Whale Craft 行事准则（${cur.source === 'custom' ? 'Master 自定义版' : '默认版'}）】\n\n${cur.text.trim()}`,
+      })
+    }
+    if (!items.length) return false
+    let sent = 0
+    for (const it of items) {
+      try {
+        // 正文首行照 DSH 原生的形状写相对路径 → AI 也知道这段话出自哪个文件
+        inbox.nextStep.push(createUserMessage({
+          content: [{ type: 'text', text: `Instructions from: ${it.rel}\n\n${it.text}` }],
+          source: { kind: 'plugin', plugin: 'whale_craft', form: 'notice', summary: it.title },
+        }))
+        sent++
+      } catch (e) { logLine(`提示词投递失败（${it.rel}）：${e?.message ?? e}`) }
+    }
+    if (sent) {
+      agentsMdNoticed.add(agent)
+      logLine(`提示词已投递 ${sent} 条（插件提示行，非用户发言）：${items.map((i) => i.rel).join(' → ')}`)
+    }
+    return sent > 0
+  }
+
+  /**
+   * 「MC模式」那个 preset 的**人设压制**诊断（每次现读，便宜）。
+   *
+   * 为什么需要：宿主 `system-prompt/src/index.ts:606` 写着
+   * `contexts: runtimeContextSuppressed ? [] : […]` —— persona 只要写了 `includeRuntimeContext: false`，
+   * **我们注入的段（全是 context）会在组装时被整个丢掉**；`complete: true` 再压掉别的 section。
+   * 复制官方 `minimal` 恰好带这两个开关 → "设置页显示一切正常、AI 却什么都没收到"（2026-09-16 真机）。
+   */
+  let mcPresetDiag = null
+  const refreshMcPresetDiag = () => {
+    try {
+      const svc = agentPresetsSvc
+      if (!svc) return mcPresetDiag
+      for (const id of pluginConfig.mcModePresets) {
+        const dir = mcPresetDir(svc, id)
+        const p = dir ? join(dir, 'agent.cordis.yml') : null
+        if (!p || !existsSync(p)) continue
+        const comp = readFileSync(p, 'utf8')
+        mcPresetDiag = {
+          id,
+          path: p,
+          complete: /complete:\s*true/.test(comp),
+          runtimeContextSuppressed: /includeRuntimeContext:\s*false/.test(comp),
+          personaIsOurs: /Minecraft Java 版服务器里扮演一名玩家/.test(comp),
+        }
+        return mcPresetDiag
+      }
+    } catch { /* 读不到就当没有 */ }
+    return mcPresetDiag
+  }
+
+  /**
    * **提示词注入状态**（给 UI / `mc_diag` 看）：三段各自"会不会注入、为什么不会"。
    *
    * 2026-09-16 加：用户在真机上反复报"没有任何我们的提示词"，而这件事**极难从外面判断**
@@ -2240,6 +2304,21 @@ export function apply(ctx, config) {
     const injectWs = pluginConfig.get('injectWorkspaceAgentsMd') === true
     const wsExists = Boolean(wsAgents) && existsSync(wsAgents)
     const presetId = (agent && lastPresetSeen.get(agent)) ?? null
+    // 🔴 宿主的硬规则（system-prompt/src/index.ts:606）：persona 若写了 `includeRuntimeContext: false`，
+    //    组装时 `contexts` 直接变成 `[]` —— **我们注入的段全是 context，会被整个丢掉**；
+    //    写了 `complete: true` 则"人设即全部系统提示"，其它 section 也没了。
+    //    复制官方 minimal 就会带这两个开关（2026-09-16 真机事故的根因）。
+    const personaSuppresses = Boolean(refreshMcPresetDiag()?.complete || mcPresetDiag?.runtimeContextSuppressed)
+    const segs = {
+      'memory-index': Boolean(root),
+      'mode-guidance': mcMode,
+      'agents-md': mcMode && injectWc && Boolean(agentsFile),
+      'workspace-agents-md': mcMode && injectWs && wsExists,
+    }
+    // 被 persona 压掉 = 实际收不到 → 状态按**实际投递**算，不按"我们注册了没有"算
+    const delivered = personaSuppresses
+      ? { 'memory-index': false, 'mode-guidance': false, 'agents-md': false, 'workspace-agents-md': false }
+      : segs
     return {
       mcMode,
       presetId,
@@ -2252,16 +2331,15 @@ export function apply(ctx, config) {
           : null,
         workspaceAgentsMd: wsAgents ? { path: wsAgents, exists: wsExists } : null,
       },
-      segments: {
-        'memory-index': Boolean(root),
-        'mode-guidance': mcMode,
-        'agents-md': mcMode && injectWc && Boolean(agentsFile),
-        'workspace-agents-md': mcMode && injectWs && wsExists,
-      },
+      preset: mcPresetDiag ?? null,
+      // 判据（"我们注册了"）与结论（"实际收得到"）都给出来，免得再出现"显示正常但没注入"
+      registered: segs,
+      segments: delivered,
       notes: [
         ...(agent ? [] : ['拿不到当前会话（没有 agent 上下文）']),
         ...(agent && !cwd ? ['这个会话没有选中工作区 → 提示词没地方放，插件不会注入'] : []),
         ...(agent && cwd && !mcMode ? [`这个会话不是 MC 模式（preset=${presetId ?? '未知'} 不在 mcModePresets 里）→ 不注入专属提示词`] : []),
+        ...(personaSuppresses ? ['🔴 preset 的 persona 设置了 complete / includeRuntimeContext:false —— 宿主会把插件注入的提示词整个丢掉（重启 DSH 后本插件会自动修这个 preset）'] : []),
         ...(mcMode && !injectWc ? ['「注入本提示词」是关的'] : []),
         ...(mcMode && !injectWs ? ['「注入工作区 AGENTS.md」是关的'] : []),
         ...(mcMode && injectWs && !wsExists ? ['工作区根目录里没有 AGENTS.md 这个文件'] : []),
@@ -2318,9 +2396,45 @@ export function apply(ctx, config) {
   const MC_PRESET_DESCRIPTION = '可以加入Minecraft Java版服务器，模拟玩家进行交互。'
 
   /** `~` 开头的 preset 根展开成绝对路径（宿主的 root 配置允许写 `~`） */
+  /**
+   * 自动建出来的 preset 的**人设**（persona）。
+   *
+   * 🔴 用户 2026-09-16："你这个模式的默认系统提示词居然是'You are a helpful software engineer assistant.'，
+   *    太离谱了，改成简洁但和我们 MC 有关的，但是**不要和 AGENTS 里面的重合**。"
+   *    —— 那句来自我们复制的官方 `minimal`。这里只写**身份 + 能力 + 语气**：
+   *    规矩（称呼/记忆/看门狗/指令/边界）全都由 `.whale-craft/AGENTS.md` 与 `mode-guidance` 负责，不重复。
+   */
+  const MC_PERSONA_TEXT = [
+    '你在一台真实的 Minecraft Java 版服务器里扮演一名玩家：你的"身体"是一台无头机器人',
+    '（由 Whale Craft 插件驱动），能观察世界、移动、挖掘和建造。',
+    '你就是游戏里的一个玩家，不是编码助手——说话简短自然，像一起玩的人。',
+  ].join('\n')
+
   const expandHome = (p) => {
     const s = String(p ?? '')
     return s.startsWith('~') ? join(homedir(), s.slice(1).replace(/^[/\\]+/, '')) : s
+  }
+
+  /**
+   * 复制完官方 preset 之后，把**我们自己的两处**覆盖上去：
+   *   ① persona（官方那句 "You are a helpful software engineer assistant." + `complete: true` 都不要）
+   *   ② 关掉那个持久 shell（MC 模式的指导写着"本模式没有 shell"，两边必须一致）
+   * @returns {boolean} 是否改成功（false = 结构不认识 → 保持原样，日志里说明）
+   */
+  const patchMcPresetComposition = (svc, id) => {
+    try {
+      const dir = mcPresetDir(svc, id)
+      if (!dir) return false
+      const p = join(dir, 'agent.cordis.yml')
+      if (!existsSync(p)) return false
+      const cur = readFileSync(p, 'utf8')
+      const withPersona = patchPersonaInComposition(cur, MC_PERSONA_TEXT)
+      if (withPersona === null) { logLine('MC 模式 preset：composition 里没找到 persona 行 → 保持原样（人设还是官方那句）'); return false }
+      const finalText = disableShellInComposition(withPersona) ?? withPersona
+      if (finalText === cur) return false
+      writeFileSync(p, finalText, 'utf8')
+      return true
+    } catch (e) { logLine(`改 preset 的 persona/shell 失败（不影响挂载）：${e.message}`); return false }
   }
 
   /** preset 目录（用户可写根下那个），拿不到就 null */
@@ -2453,11 +2567,27 @@ export function apply(ctx, config) {
         }
         if (plan.action === 'meta') {
           const fixed = writeMcPresetMetadata(svc, existingId)
-          logLine(fixed
-            ? `MC 模式 preset「${existingId}」${plan.reason} → 已修好显示名/简介`
-            : `MC 模式 preset「${existingId}」${plan.reason}，但自动修改失败（请手动编辑 preset.yml）`)
-          // 旧版建的那份没有标记 → 修完补一个，下次才算"我们的"
-          if (marker === null) writeMcPresetMarker(svc, existingId, { source: marker?.source ?? source, composition })
+          // 旧版（没有自建标记）建的那份：**只在组成与某个官方源逐字相同**时才动 persona/shell ——
+          // 「简介是复制残留」+「组成没被改过」两条同时成立，才敢认它是我们早期复制出来的。
+          let fixedComp = false
+          if (marker === null && composition !== null) {
+            // 🔴 判据不看"和官方源逐字相同"（DSH 一升级就比不上了），而看**那句官方 persona 还在不在**
+            //    —— 这才是真正有害的状态（它带着 complete:true / includeRuntimeContext:false，
+            //    会把我们注入的 context 段整个压掉）。用户改过人设的 preset 不会被碰。
+            const stillShippedPersona = /You are a helpful software engineer assistant\./.test(composition)
+              && /complete:\s*true/.test(composition)
+            if (stillShippedPersona) fixedComp = patchMcPresetComposition(svc, existingId)
+          }
+          logLine(`MC 模式 preset「${existingId}」${plan.reason} → 已修好显示名/简介`
+            + `${fixedComp ? '，并把 persona 换成 MC 的、关掉了 shell' : ''}`
+            + `${fixed ? '' : '（⚠️ 写入失败，请手动编辑 preset.yml）'}`)
+          // 旧版建的那份没有标记 → 修完补一个（hash 取**修完**之后的组成），下次才算"我们的"
+          if (marker === null) {
+            writeMcPresetMarker(svc, existingId, {
+              source: marker?.source ?? source,
+              composition: compositionOf(rows.get(existingId)) ?? composition,
+            })
+          }
           return
         }
         // plan.action === 'rebuild'：先备份整个目录，再用官方接口重新复制一遍
@@ -2468,6 +2598,7 @@ export function apply(ctx, config) {
             renameSync(dir, backup)
           }
           await svc.copy(String(marker?.source ?? source), existingId, MC_PRESET_NAME)
+          patchMcPresetComposition(svc, existingId)
           writeMcPresetMetadata(svc, existingId)
           writeMcPresetMarker(svc, existingId, { source: marker?.source ?? source, composition: compositionOf(rows.get(String(marker?.source ?? source ?? ''))) })
           logLine(`MC 模式 preset「${existingId}」${plan.reason} → 已重建${backup ? `（旧的备份在 ${backup}）` : ''}`)
@@ -2491,6 +2622,8 @@ export function apply(ctx, config) {
         return
       }
       await svc.copy(source, target, MC_PRESET_NAME)
+      // 复制完立刻打我们的补丁：persona 换成 MC 的、关掉那个 shell（否则就是"软件助手"+一个 pwsh）
+      const patched = patchMcPresetComposition(svc, target)
       // copy() 会**保留源 preset 的简介**（官方只改 name）→ 必须把元数据改回来，否则简介跟极简模式一样
       const meta = writeMcPresetMetadata(svc, target)
       // 留个"这是我们建的"标记（含规格版本 + 组成 hash）→ 下次启动才能"检查不对就重建"
@@ -2499,7 +2632,8 @@ export function apply(ctx, config) {
         composition: compositionOf((await svc.list())?.find?.((p) => String(p?.id ?? '') === target)),
       })
       logLine(`已自动创建「${MC_PRESET_NAME}」preset：复制官方 ${source} → ${target}`
-        + `${meta ? '（并把简介改成"可以加入Minecraft Java版服务器…"）' : '（⚠️ 简介没改成，请手动编辑 preset.yml）'}`
+        + `${meta ? '（简介已改）' : '（⚠️ 简介没改成，请手动编辑 preset.yml）'}`
+        + `${patched ? '（persona 已换成 MC 的、shell 已关）' : '（⚠️ persona/shell 没改成，请手动看一眼 agent.cordis.yml）'}`
         + `${marked ? '' : '（⚠️ 没留下自建标记，下次不会自动维护它）'}`
         + `；想改就编辑 ${expandHome(String(svc.roots?.find?.((r) => r?.trust === 'user')?.path ?? '$DSH_HOME/.agent-presets'))}/${target}/`
         + `，想关掉自动创建设 ensureMcPreset=false`)
@@ -2579,6 +2713,8 @@ export function apply(ctx, config) {
     mcPolicyApplied.add(agent)
     if (agent.id) mcModeAgentIds.add(String(agent.id))
     ensureMemoryRoot(agent)        // ← 首次发起 MC 模式会话 = 建 `.whale-craft/`（README / AGENTS.md）的时机
+    // 🔴 把提示词**当消息投递**（学宿主注入 AGENTS.md 的做法）—— 必达、且在对话里看得见
+    try { injectAgentsMdNotices(agent) } catch (e) { logLine(`提示词投递失败：${e?.message ?? e}`) }
 
     // ① 提示词段**不在这里注册** —— 它们在 `installAgentPrompts` 里对每个 agent 无条件注册，
     //    由 `text()` 在装配时判断模式（见那段的注释：2026-09-16 真机事故）。

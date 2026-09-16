@@ -95,6 +95,7 @@ export const DEFAULT_CONFIG = {
    * （极简工具面）；**已存在就绝不动**。关掉它就回到"要自己建 preset"。
    */
   ensureMcPreset: true,
+
 }
 
 /**
@@ -129,8 +130,66 @@ export function isCopiedPresetDescription (desc, shippedDescriptions) {
 /**
  * 自动建 preset 的"规格版本"。**改这个数字 = 下次启动会把我们自己建的那份刷新一遍。**
  * （用来解决用户问的："初始化时能不能检查是不是对的，不对也重新建吗？万一用户更新插件了呢。"）
+ *
+ * 历史：1 = 复制官方 minimal；**2 = 顺手把 persona 换成我们自己的 + 关掉那个 shell**
+ *      （复制 minimal 会把"极简模式"的 persona（You are a helpful software engineer assistant.）
+ *      和它的持久 shell 一起带过来，而 MC 模式的指导里明写"本模式没有 shell" —— 自相矛盾）。
  */
-export const MC_PRESET_SPEC = 1
+export const MC_PRESET_SPEC = 2
+
+/**
+ * 把 composition 里的 **persona 行**换成我们自己的（纯函数，好测）。
+ *
+ * 只动 `- id: persona` 那一段：保留它的 `id` / `name`，**整段重建 `config`** ——
+ * 因为官方 `minimal` 里带着 `complete: true`（"人设即全部系统提示"，会压掉所有其它 section）
+ * 与 `includeRuntimeContext: false`，这两个都不该出现在 MC 模式里。
+ *
+ * @param {string} text composition 文本（`agent.cordis.yml`）
+ * @param {string} personaText 我们的人设正文
+ * @returns {string|null} 改好的文本；找不到 persona 行 → null（调用方据此跳过并记日志）
+ */
+export function patchPersonaInComposition (text, personaText) {
+  const lines = String(text ?? '').split('\n')
+  const start = lines.findIndex((l) => /^-\s+id:\s*persona\s*$/.test(l))
+  if (start < 0) return null
+  let end = lines.length
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^-\s/.test(lines[i])) { end = i; break }
+  }
+  const row = lines.slice(start, end)
+  const idLine = row.find((l) => /^-\s+id:/.test(l)) ?? '- id: persona'
+  const nameLine = row.find((l) => /^\s+name:/.test(l)) ?? "  name: '@deepseek-ai/dsh-persona'"
+  const body = String(personaText).replace(/\s+$/, '').split('\n')
+  const block = [
+    idLine,
+    nameLine,
+    '  config:',
+    '    prefix: |-',
+    ...body.map((l) => '      ' + l),
+  ]
+  return [...lines.slice(0, start), ...block, ...lines.slice(end)].join('\n')
+}
+
+/**
+ * 把 composition 里那个"持久 shell"组分**关掉**（纯函数）。
+ *
+ * 为什么：官方 `minimal` 的全部意义就是"给一个持久 shell"，复制它会让 MC 模式的模型
+ * 看到 `pwsh`/`bash` 工具；而 MC 模式的专属指导写着"本模式没有 shell，也别指望跑脚本"。
+ * 两者必须一致 —— 我们选择关掉 shell（MC 模式只玩游戏）。
+ * 已经写着 `disabled:` 的就不动。
+ */
+export function disableShellInComposition (text) {
+  const lines = String(text ?? '').split('\n')
+  const start = lines.findIndex((l) => /^-\s+id:\s*persistent-shell\s*$/.test(l))
+  if (start < 0) return null
+  let end = lines.length
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^-\s/.test(lines[i])) { end = i; break }
+  }
+  for (let i = start; i < end; i++) if (/^\s+disabled:/.test(lines[i])) return lines.join('\n')   // 已经有了
+  lines.splice(start + 1, 0, '  disabled: true')
+  return lines.join('\n')
+}
 
 /**
  * 初始化时该对 MC 模式 preset 做什么 —— **纯函数**，好测。
