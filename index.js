@@ -735,6 +735,13 @@ export function apply(ctx, config) {
         const existing = accounts.listAuthServers().find((s) => s.url === url)
         serverId = existing ? existing.id : accounts.addAuthServer({ name: body.serverName ?? null, url }).id
       }
+      // 选了缓存里的服务器、但把**名字**改了 → 顺手改名（名字只给人看，id 不动）。
+      // 不填就不动：`addAuthServer` 默认拿域名当名字，用户想改成"认证服务器"这种看得懂的就靠这一步。
+      if (serverId && body.serverName) {
+        const cur = accounts.listAuthServers().find((s) => s.id === serverId)
+        const nm = String(body.serverName).trim()
+        if (cur && nm && nm !== cur.name) accounts.renameAuthServer(serverId, nm)
+      }
       const acc = accounts.add({
         type: body.type, name: body.name, uuid: body.uuid ?? null,
         serverId, login: body.login ?? null,

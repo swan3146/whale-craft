@@ -292,8 +292,24 @@ export class AccountStore {
     return { ...srv }
   }
 
-  /** 删认证服务器。**没有"内置不可删"这回事**（预置的也能删）；被账户占用的不许删。 */
-  removeAuthServer (id) {
+  /**
+   * 改认证服务器的**显示名**（2026-09-16 用户要求：缓存标签里要看得懂，别显示一串网址）。
+   * `addAuthServer` 不给名字时默认用域名——所以建完之后得能改。
+   * ⚠️ **id 绝不变**：账户是靠 `serverId` 引用它的；名字只是给人看的。
+   */
+  renameAuthServer (id, name) {
+    const srv = this.data.authServers.find((s) => s.id === id)
+    if (!srv) throw new Error(`没有这个认证服务器：${id}`)
+    const nm = String(name ?? '').trim()
+    if (!nm) throw new Error('名字不能为空')
+    if (nm === srv.name) return { ...srv }
+    if (this.data.authServers.some((s) => s.id !== id && s.name === nm)) throw new Error(`已经有同名认证服务器：${nm}`)
+    srv.name = nm
+    this.save()
+    return { ...srv }
+  }
+
+  /** 删认证服务器。**没有"内置不可删"这回事**（预置的也能删）；被账户占用的不许删。 */  removeAuthServer (id) {
     const i = this.data.authServers.findIndex((s) => s.id === id)
     if (i < 0) throw new Error(`没有这个认证服务器：${id}`)
     const used = this.data.accounts.filter((a) => a.serverId === id).map((a) => a.name)

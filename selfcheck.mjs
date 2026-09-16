@@ -847,6 +847,26 @@ console.log('\n--- MC账户：账户库 / 凭据隔离 / 工具 ---')
   const dup = await Promise.resolve().then(() => store.addAuthServer({ url: 'https://auth.example.com/yggdrasil' })).catch((e) => e.message)
   console.log(`  ${/已经加过/.test(String(dup)) ? '✅' : '❌'} 重复地址被拒：${String(dup).slice(0, 26)}`)
   console.log(`  ${store.listAuthServers().length === 2 ? '✅' : '❌'} 已添加的服务器被记住：${store.listAuthServers().map((s) => s.name).join(' / ')}`)
+  // 🔴 用户 2026-09-16：认证服务器的**名字**是给人看的（缓存标签里显示它），要能改；
+  //    `addAuthServer` 不给名字时默认拿**域名**当名字，所以"建完再改名"是必须的。
+  const renamedSrv = store.renameAuthServer(srv.id, '认证服务器')
+  console.log(`  ${renamedSrv.name === '认证服务器' && renamedSrv.id === srv.id && renamedSrv.url === srv.url ? '✅' : '❌'} 认证服务器可改名，且 **id 不变**（账户是引用 id 的）`)
+  const dupName = await Promise.resolve().then(() => store.renameAuthServer(srv.id, 'LittleSkin')).catch((e) => e.message)
+  console.log(`  ${/已经有同名/.test(String(dupName)) ? '✅' : '❌'} 改成已存在的名字被拒：${String(dupName).slice(0, 30)}`)
+  const emptyName = await Promise.resolve().then(() => store.renameAuthServer(srv.id, '   ')).catch((e) => e.message)
+  console.log(`  ${/名字不能为空/.test(String(emptyName)) ? '✅' : '❌'} 空名字被拒`)
+  const sameName = store.renameAuthServer(srv.id, '认证服务器')
+  console.log(`  ${sameName.name === '认证服务器' ? '✅' : '❌'} 名字没变时是幂等的（不抛错）`)
+
+  // 接口层：建账户时把 serverName 落到认证服务器（新建给名字 / 选中已有但改了名 → 改名）
+  {
+    const { readFileSync } = await import('node:fs')
+    const { fileURLToPath } = await import('node:url')
+    const idx = readFileSync(fileURLToPath(new URL('./index.js', import.meta.url)), 'utf8')
+    const at = idx.indexOf("path === '/api/mc/accounts' && req.method === 'POST'")
+    const seg = at >= 0 ? idx.slice(at, at + 2000) : ''
+    console.log(`  ${/body\.serverName/.test(seg) && /renameAuthServer/.test(seg) ? '✅' : '❌'} 建账户接口把 serverName 落进认证服务器（含改名）`)
+  }
   // 🔴 用户 2026-09-16：LittleSkin 只是**预置**（不是"内置"）——**能删**，而且删了不会被 ensureDefaults 复活
   const delPreset = await Promise.resolve().then(() => store.removeAuthServer('littleskin')).catch((e) => ({ error: e.message }))
   console.log(`  ${delPreset?.removed === 'littleskin' ? '✅' : '❌'} 预置的 LittleSkin 也能删（没有"内置不可删"这回事）`)
@@ -1421,11 +1441,21 @@ console.log('\n--- 客户端 bundle（client.js 静态检查）---')
     ['三种账户各有独立界面', /function TypePicker/.test(code) && /function OfflineForm/.test(code) && /function YggdrasilForm/.test(code)],
     ['第三方新建：服务器 → 名字 → 账号 → 密码', (() => {
       const a = code.indexOf("label: '认证服务器'")
-      const b = code.indexOf("label: '游戏内名字（可留空，登录后按档案名）")
+      const b = code.indexOf("label: '服务器名字（留空就用域名）'")
       const c = code.indexOf("label: '账号（邮箱）'")
       const d = code.indexOf("label: '密码'")
       return a > 0 && a < b && b < c && c < d
     })()],
+    // 🔴 用户 2026-09-16 纠正：第三方表单问的必须是**认证服务器的名字**（缓存标签要看得懂），
+    //    不是"游戏内名字"——角色名由认证服返回，问用户填没有意义（登录后必被覆盖）。
+    ['第三方表单只问"服务器名字"，不问"游戏内名字"', (() => {
+      const a = code.indexOf('function YggdrasilForm')
+      const b = code.indexOf('function AccountsPane')
+      const seg = a >= 0 && b > a ? code.slice(a, b) : ''
+      return /服务器名字/.test(seg) && !/游戏内名字/.test(seg)
+    })()],
+    ['服务器名字会随账户一起提交（serverName）', /serverName/.test(code)],
+    ['改过名字才带 serverName（没改就别无谓地改名请求）', /nm !== pickedSrv\.name \? \{ serverName: nm \}/.test(code)],
     ['第三方新建有**看得见的**拽托接受区', /data-wc-drop/.test(code) && /把 authlib-injector 卡片拖到这里/.test(code)],
     ['拖卡片后自动选中并填进输入框', /onAddCard\(card\)[\s\S]{0,160}setUrl\(srv\.url\)/.test(code)],
     ['已缓存服务器 = 可点填充 + × 删除的标签', /data-wc-tagpick/.test(code) && /data-wc-tagx/.test(code)],

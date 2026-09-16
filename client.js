@@ -818,12 +818,15 @@ select[data-wc-in]{appearance:none;padding-right:22px;
      * （LittleSkin 也只是预置的缓存项，一样能删）。
      * 输入框下面有一块**看得见的虚线拽托区**：把 authlib-injector 卡片拖进来即可。
      * 手打一个新地址也行——建账户时后端会顺手把它记住。
+     *
+     * 🔴 2026-09-16 用户纠正：这里要问的是**认证服务器的名字**（缓存标签里显示它，才看得懂），
+     *    **不是**"游戏内名字"——角色名是认证服返回的档案名，问用户填毫无意义（登录后被覆盖）。
      */
     function YggdrasilForm(props) {
       const { servers = [], busyKey } = props
       const [picked, setPicked] = React.useState(null)
       const [url, setUrl] = React.useState('')
-      const [name, setName] = React.useState('')
+      const [srvName, setSrvName] = React.useState('')
       const [login, setLogin] = React.useState('')
       const [asDefault, setAsDefault] = React.useState(false)
       const [dragging, setDragging] = React.useState(false)
@@ -840,7 +843,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         const card = dt ? (dt.getData('text') || dt.getData('text/plain') || '') : ''
         if (!card.trim()) return
         Promise.resolve(props.onAddCard(card)).then((srv) => {
-          if (srv?.url) { setUrl(srv.url); setPicked(srv.id ?? null) }
+          if (srv?.url) { setUrl(srv.url); setPicked(srv.id ?? null); setSrvName(srv.name || '') }
         })
       }
 
@@ -848,15 +851,19 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         const u = url.trim()
         const p = passRef.current ? passRef.current.value : ''
         if (!u || !login.trim() || !p) return
-        // 名字留空就先用账号名（去掉邮箱里的非法字符）；登录成功后会被档案名覆盖
-        const fallback = login.trim().replace(/[^\w\u4e00-\u9fa5.]/g, '').slice(0, 32) || 'MC'
+        const nm = srvName.trim()
+        // 账户显示名：先按账号名兜一个（登录/刷新成功后会被档案名覆盖）
+        const fallback = login.trim().split('@')[0].replace(/[^\w\u4e00-\u9fa5.]/g, '').slice(0, 32) || 'MC'
         props.onCreate({
           type: 'yggdrasil',
-          name: name.trim() || fallback,
+          name: fallback,
           login: login.trim(),
           password: p,
           default: asDefault,
-          ...(pickedSrv && pickedSrv.url === u ? { serverId: pickedSrv.id } : { serverUrl: u }),
+          // 选中的就是缓存里那条 → 用 serverId（改了名字才带上 serverName，让后端改名）
+          ...(pickedSrv && pickedSrv.url === u
+            ? { serverId: pickedSrv.id, ...(nm && nm !== pickedSrv.name ? { serverName: nm } : {}) }
+            : { serverUrl: u, ...(nm ? { serverName: nm } : {}) }),
         }, 'new:yggdrasil').then((ok) => { if (ok) props.onDone() })
       }
 
@@ -872,7 +879,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             },
             h('button', {
               type: 'button', 'data-wc-tagpick': '', title: s.url || s.name,
-              onClick: () => { setPicked(s.id); setUrl(s.url) },
+              onClick: () => { setPicked(s.id); setUrl(s.url); setSrvName(s.name || '') },
             }, s.name || s.url),
             h('button', {
               type: 'button', 'data-wc-tagx': '', title: '从缓存里删掉',
@@ -894,11 +901,12 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             onDragLeave: () => setDragging(false),
             onDrop: onDropCard,
           }, busyKey === 'server:card' ? '正在解析卡片…' : '把 authlib-injector 卡片拖到这里')),
-        // 名字紧随服务器：一眼就能看到（别埋在最下面，窗口矮/放大时会被挤出去）
-        h(Field, { label: '游戏内名字（可留空，登录后按档案名）' },
+        // 服务器的**名字**紧随服务器那一栏：留空就用域名；填了它，缓存标签里才看得懂
+        // （2026-09-16 用户纠正：这里**不是**"游戏内名字"——角色名由认证服返回，不用问用户）
+        h(Field, { label: '服务器名字（留空就用域名）' },
           h('input', {
-            'data-wc-in': '', value: name, disabled: busy, placeholder: 'DeepSeek',
-            onChange: (e) => setName(e.target.value),
+            'data-wc-in': '', value: srvName, disabled: busy, placeholder: '例如：LittleSkin',
+            onChange: (e) => setSrvName(e.target.value),
           })),
         h(Field, { label: '账号（邮箱）' },
           h('input', {
