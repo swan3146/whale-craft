@@ -18,9 +18,10 @@
 ## 使用
 
 1. 创建新对话，选中「MC模式」。
-2. 如有必要，进入「MC设置」修改玩家名称，或使用第三方皮肤站登录。
-3. 对你的 AI 说「进 xx 服务器」。
-4. 在对话窗口下命令，或直接在游戏里聊天。
+2. **选中或新建一个工作区**（记忆与提示词都放在它的 `.whale-craft/` 里）。
+3. 如有必要，进入「MC设置」修改玩家名称，或使用第三方皮肤站登录。
+4. 对你的 AI 说「进 xx 服务器」。
+5. 在对话窗口下命令，或直接在游戏里聊天。
 
 > 想让 AI 进**局域网房间**？直接说"找个局域网服务器"——它用 `mc_lan` 听广播 + 扫本机网段，
 > 拿到地址后用 `mc_connect` 进去（对方要先在游戏里「对局域网开放」）。
@@ -260,9 +261,10 @@ This installs the package and appends `whale_craft` to `dsh.profile.bundles`.
 ### Use
 
 1. Start a new conversation and pick the **MC mode** preset.
-2. Optionally set the player name in **MC Settings**, or sign in with a third-party (Yggdrasil) account.
-3. Tell your agent which server to join.
-4. Give orders in the chat, or talk to the bot directly in game.
+2. **Pick or create a workspace** — memory and the prompt live in its `.whale-craft/`.
+3. Optionally set the player name in **MC Settings**, or sign in with a third-party (Yggdrasil) account.
+4. Tell your agent which server to join.
+5. Give orders in the chat, or talk to the bot directly in game.
 
 ### Where things live
 
