@@ -110,7 +110,7 @@ dsh plugin --profile web add whale_craft
 | `mcModePresets` | 哪些 preset 算"MC 模式"（权限隔离的判据） | `["minecraft","whale_craft"]` |
 | `mcMode.allowOtherTools` | MC 模式白名单里**额外**放行的其它工具（默认只给 `mc_*` / `mc_kit_*` / 文件工具） | `[]` |
 | `mcMode.hideAdminTools` | 是否把 `mc_admin_*` 也放进白名单（默认隐藏，另有 guard 硬拒） | `true` |
-| `injectWhaleCraftAgentsMd` | 是否把 `.whale-craft/AGENTS.md` 注入 MC 模式会话 | `true` |
+| `injectWhaleCraftAgentsMd` | 是否把 `.whale-craft/RULES.md`（行事准则）注入 MC 模式会话 | `true` |
 | `injectWorkspaceAgentsMd` | 是否**额外**注入工作区的 `AGENTS.md` | `false` |
 | `memoryDir` | 记忆根目录（`null` = 会话工作区的 `.whale-craft/`） | `null` |
 | `ensureMcPreset` | 启动时若 `mcModePresets` 里**一个 preset 都不存在**，就复制官方 `minimal` 建一个「MC模式」（已存在则绝不动） | `true` |
@@ -176,11 +176,11 @@ dsh plugin --profile web add whale_craft
    但**不是**主要交付路：`read_image` 只在工具行里渲染图（要展开），`present` 要等轮末。
 4. **`mc_admin_*` 看不见也调不动**（白名单 + `guard` 硬拒）。
 5. 收到 2–3 条**插件提示行**（在对话里看得见、可折叠，**不是**用户发言）：
-   `.whale-craft/AGENTS.md`（行事准则，可在「MC设置 → 提示词」里改）、**版本硬提示词**、`.whale-craft/README.md`（记忆总索引），
+   `.whale-craft/RULES.md`（行事准则，可在「MC设置 → 提示词」里改）、**版本硬提示词**、`.whale-craft/README.md`（记忆总索引），
    以及可选的（默认关）工作区 `AGENTS.md`。
 6. 系统提示词 = preset 自己的 persona（宿主按 preset 自动注入，**插件不插手**）。
 7. 版本硬提示词是**硬编码、随插件版本发布、不可编辑、无开关**的：说明"本版本哪些工具还不成熟、优先用什么、
-   怎么把图给用户看"，并写明优先级 **用户明确的要求 > `.whale-craft/AGENTS.md` > 本条版本提示**。
+   怎么把图给用户看"（正文只两条、不含版本号，版本由来源行与折叠标题携带）。
    「MC设置 → 提示词」页里可以展开看它的原文。
 
 > 插件本身**不带 preset 目录**（`~/.dsh/.agent-presets/<名字>/` 需要你自己放一份 persona）。

@@ -80,7 +80,7 @@ export const DEFAULT_CONFIG = {
   memoryDir: null,
   /** 「MC设置 → 指令白名单」页的开关：允许所有服务器指令（默认关 = 只放行白名单里的） */
   allowAllCommands: false,
-  /** 是否把 **whale-craft 自己的**行事准则（`.whale-craft/AGENTS.md`）注入给 MC 模式的 agent */
+  /** 是否把 **whale-craft 自己的**行事准则（`.whale-craft/RULES.md`）注入给 MC 模式的 agent */
   injectWhaleCraftAgentsMd: true,
   /**
    * 是否**额外**注入**工作区**的 `AGENTS.md`（默认关）。

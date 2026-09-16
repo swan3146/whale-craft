@@ -1,4 +1,4 @@
-// -*- coding: utf-8 -*-
+﻿// -*- coding: utf-8 -*-
 /**
  * 插件自检：用假 ctx 加载 whale_craft 的 apply()，检查
  *   - Config schema 能否解析
@@ -1301,7 +1301,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     console.log(`  ${first?.source?.kind === 'plugin' && first?.source?.plugin === 'whale_craft' && first?.source?.form === 'notice' ? '✅' : '❌'} 🔴 来源是 plugin/notice（**不是**用户发言）：${JSON.stringify(first?.source ?? null)}`)
     const body = (first?.content ?? []).map((c) => c.text ?? '').join('')
     console.log(`  ${/Whale Craft 行事准则/.test(body) && /Minecraft/.test(body) ? '✅' : '❌'} 第 1 条 = 行事准则（${body.length} 字），首行写明文件：${JSON.stringify(body.split('\n')[0])}`)
-    console.log(`  ${/^Instructions from: \.whale-craft\/AGENTS\.md$/.test(body.split('\n')[0] ?? '') ? '✅' : '❌'} 正文首行是 "Instructions from: .whale-craft/AGENTS.md"（与 DSH 原生同形状）`)
+    console.log(`  ${/^Instructions from: \.whale-craft\/RULES\.md$/.test(body.split('\n')[0] ?? '') ? '✅' : '❌'} 正文首行是 "Instructions from: .whale-craft/RULES.md"（与 DSH 原生同形状）`)
     // 第 2 条 = **版本硬提示词**（硬编码、随版本发布、无开关、排在行事准则之后）
     const bodyV = (second?.content ?? []).map((c) => c.text ?? '').join('')
     console.log(`  ${second?.source?.form === 'notice' && /^Instructions from: whale_craft@/.test(bodyV.split('\n')[0] ?? '') ? '✅' : '❌'} 第 2 条 = 版本提示（来源行 ${JSON.stringify((bodyV.split('\n')[0] ?? '').slice(0, 46))}…）`)
@@ -1399,16 +1399,16 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     const seedAgent = { id: 'sess-SEED', session: { header: { cwd: ws } }, ctx: makeAgentCtx('minecraft'), inbox: { nextStep: [] } }
     fire('agent/created', seedAgent)
     const wsRoot = join(ws, '.whale-craft')
-    const wsAgents = join(wsRoot, 'AGENTS.md')
+    const wsAgents = join(wsRoot, 'RULES.md')
     const wsReadme = join(wsRoot, 'README.md')
     console.log(`  ${existsSync(wsRoot) ? '✅' : '❌'} 初始化就建出 <工作区>/.whale-craft/（${wsRoot}）`)
-    console.log(`  ${existsSync(wsAgents) ? '✅' : '❌'} 顺手把 AGENTS.md 建出来（「提示词」页编辑的就是它）`)
+    console.log(`  ${existsSync(wsAgents) ? '✅' : '❌'} 顺手把 RULES.md 建出来（「提示词」页编辑的就是它）`)
     console.log(`  ${existsSync(wsReadme) ? '✅' : '❌'} README.md 不存在则写入默认骨架`)
     const seeded = existsSync(wsAgents) ? readFileSync(wsAgents, 'utf8') : ''
-    console.log(`  ${/Whale Craft 行事准则/.test(seeded) && /mc_capabilities/.test(seeded) ? '✅' : '❌'} 建出来的 AGENTS.md = 内置默认全文（${seeded.length} 字）`)
+    console.log(`  ${/Whale Craft 行事准则/.test(seeded) && /mc_capabilities/.test(seeded) ? '✅' : '❌'} 建出来的 RULES.md = 内置默认全文（${seeded.length} 字）`)
     writeFileSync(wsAgents, 'Master 手工改过的内容\n', 'utf8')
     fire('agent/session-start', seedAgent)
-    console.log(`  ${/Master 手工改过的内容/.test(readFileSync(wsAgents, 'utf8')) ? '✅' : '❌'} 已存在的 AGENTS.md 不会被初始化覆盖`)
+    console.log(`  ${/Master 手工改过的内容/.test(readFileSync(wsAgents, 'utf8')) ? '✅' : '❌'} 已存在的 RULES.md 不会被初始化覆盖`)
     // 🔴 用户 2026-09-16："如果启动对话时设置要求注入，但是找不到文件，那就注入默认，同时重建文件。"
     //    现在这条发生在**投递时**（inbox 提示）：删掉文件、再起一个新会话 → 文件被重建 + 投递默认全文
     const { unlinkSync } = await import('node:fs')
@@ -1507,7 +1507,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   fakeCtx.agents = { get: (id) => (id === 'sess-WSOK' ? wsAgent : id === 'sess-NOWS' ? noWsAgent2 : undefined) }
   const okCfg = await callMc2('GET', '/api/mc/config?sessionId=sess-WSOK')
   console.log(`  ${okCfg.json?.ok === true ? '✅' : '❌'} 有工作区 → 设置接口放行`)
-  console.log(`  ${(await import('node:fs')).existsSync((await import('node:path')).join(ws3, '.whale-craft', 'AGENTS.md')) ? '✅' : '❌'} 🔴 **点开设置**这个时机就把该工作区的 .whale-craft/AGENTS.md 备好了`)
+  console.log(`  ${(await import('node:fs')).existsSync((await import('node:path')).join(ws3, '.whale-craft', 'RULES.md')) ? '✅' : '❌'} 🔴 **点开设置**这个时机就把该工作区的 .whale-craft/RULES.md 备好了`)
 
   // 🔴 2026-09-16 真机反馈："新对话还没开始（服务端还没这个会话），可工作区明明选了"——
   //    所以允许客户端**直接报工作区**（只认绝对路径 + 真实存在的目录）。
@@ -1624,8 +1624,8 @@ console.log('\n--- MC账户：账户库 / 凭据隔离 / 工具 ---')
   console.log(`  ${/没有这个账户/.test(String(ghost)) ? '✅' : '❌'} mc_connect 指名不存在的账户报错清晰`)
 }
 
-// ── 行事准则 AGENTS.md / 新开关 / 边界信息工具 ──
-console.log('\n--- 行事准则 AGENTS.md / 新开关 / 边界信息 ---')
+// ── 行事准则 RULES.md / 新开关 / 边界信息工具 ──
+console.log('\n--- 行事准则 RULES.md / 新开关 / 边界信息 ---')
 {
   const { DEFAULT_AGENTS_MD, agentsMdPath, readAgentsMd, writeAgentsMd, resetAgentsMd, isAgentsMdPath } = await import('./src/agentsmd.mjs')
   const { mkdtempSync } = await import('node:fs')
@@ -1663,6 +1663,41 @@ console.log('\n--- 行事准则 AGENTS.md / 新开关 / 边界信息 ---')
   console.log(`  ${/太大/.test(String(tooBig)) ? '✅' : '❌'} 超大内容被拒`)
   console.log(`  ${isAgentsMdPath('E:\\x\\.whale-craft\\AGENTS.md') && isAgentsMdPath('E:/x/whale_craft/AGENTS.md') && !isAgentsMdPath('E:/x/README.md') ? '✅' : '❌'} isAgentsMdPath 认得本文件、不误伤别的`)
 
+  /* 🔴 改名（2026-09-16 致命 bug）：行事准则从 `.whale-craft/AGENTS.md` → `.whale-craft/RULES.md`。
+   *    原因：宿主的 agent-instructions 把 `AGENTS.md` 当候选指令文件 —— 任何会话只要 read/write/edit 过
+   *    `.whale-craft/` 下的文件，宿主就把那份当**工作区指令**注入（非 MC 会话也被污染、MC 会话投两遍、
+   *    而且我们的注入开关关不掉它）。新名字不在宿主候选里，注入只剩我们这一条通道。 */
+  {
+    const { mkdtempSync: mkTmp, writeFileSync: writeTmp, existsSync: ex, readFileSync: rd } = await import('node:fs')
+    const { tmpdir: td } = await import('node:os')
+    const { join: jn } = await import('node:path')
+    const { agentsMdPath: aPath, legacyAgentsMdPath: lPath, migrateLegacyAgentsMd, isAgentsMdPath: isIt } = await import('./src/agentsmd.mjs')
+
+    console.log(`  ${aPath('/d').endsWith('RULES.md') && !aPath('/d').endsWith('AGENTS.md') ? '✅' : '❌'} 存储文件名是 RULES.md：${aPath('/d')}`)
+    console.log(`  ${isIt('E:/x/.whale-craft/RULES.md') && isIt('E:\\x\\.whale-craft\\RULES.md') && isIt('RULES.md') ? '✅' : '❌'} 守卫认得新名字（绝对/Windows/裸名）`)
+    console.log(`  ${isIt('E:/x/.whale-craft/AGENTS.md') && isIt('AGENTS.md') ? '✅' : '❌'} 🔴 守卫**也认老名字**（迁移前/用户手放的都要挡住，否则 AI 又造出一个宿主会认的文件）`)
+    console.log(`  ${!isIt('E:/x/.whale-craft/README.md') && !isIt('E:/x/.whale-craft/my-notes.md') ? '✅' : '❌'} 不误伤 README.md / 别的记忆文件`)
+
+    // 迁移：老文件在、新文件不在 → 内容搬过去 + 老文件改名备份
+    const d1 = mkTmp(jn(td(), 'whale-rules-mig1-'))
+    writeTmp(jn(d1, 'AGENTS.md'), '# 我自己写的准则\n\n- 一条\n', 'utf8')
+    const m1 = migrateLegacyAgentsMd(d1)
+    console.log(`  ${m1.migrated && ex(aPath(d1)) && rd(aPath(d1), 'utf8').includes('我自己写的准则') ? '✅' : '❌'} 迁移：老 AGENTS.md 的内容搬进 RULES.md`)
+    console.log(`  ${!ex(lPath(d1)) && ex(m1.backup ?? '') ? '✅' : '❌'} 🔴 老文件名**被改名为带时间戳的备份**（它只要还在，宿主就还会把它当工作区指令注入）`)
+    console.log(`  ${migrateLegacyAgentsMd(d1).migrated === false ? '✅' : '❌'} 迁移是幂等的（第二次什么都不做）`)
+
+    // 两个都在 → 以新文件为准，老文件照样备份改名
+    const d2 = mkTmp(jn(td(), 'whale-rules-mig2-'))
+    writeTmp(jn(d2, 'AGENTS.md'), '老内容\n', 'utf8')
+    writeTmp(jn(d2, 'RULES.md'), '新内容\n', 'utf8')
+    const m2 = migrateLegacyAgentsMd(d2)
+    console.log(`  ${m2.migrated && rd(aPath(d2), 'utf8').trim() === '新内容' && !ex(lPath(d2)) ? '✅' : '❌'} 两个都在 → **以新文件为准**，老文件备份改名（不覆盖新内容）`)
+
+    // 宿主候选名红线：我们生成的任何文件都不许叫这几个名字
+    const { DEFAULT_AGENTS_MD: def } = await import('./src/agentsmd.mjs')
+    console.log(`  ${!/\.whale-craft\/AGENTS\.md/.test(def) && /\.whale-craft\/RULES\.md/.test(def) ? '✅' : '❌'} 默认行事准则正文里自指的文件名也是 RULES.md（否则等于教它去读一个不存在的文件）`)
+  }
+
   // 开关：允许所有指令
   await tools.get('mc_admin_config').execute({ action: 'set', path: 'allowAllCommands', value: true }, A)
   const anyCmd = await tools.get('mc_command').execute({ command: '/definitely-not-whitelisted' }, A).catch((e) => e.message)
@@ -1676,8 +1711,9 @@ console.log('\n--- 行事准则 AGENTS.md / 新开关 / 边界信息 ---')
   const wcDefault = await tools.get('mc_admin_config').execute({ action: 'get', path: 'injectWhaleCraftAgentsMd' }, A)
   console.log(`  ${wsDefault.value === false && wcDefault.value === true ? '✅' : '❌'} 注入默认：whale-craft 开、工作区关`)
 
-  const memMd = await tools.get('mc_kit_memory').execute({ action: 'read', path: 'AGENTS.md' }, A).catch((e) => e.message)
-  console.log(`  ${/不能通过记忆工具读写/.test(String(memMd)) ? '✅' : '❌'} 记忆工具拒绝读写 AGENTS.md`)
+  const memMd = await tools.get('mc_kit_memory').execute({ action: 'read', path: 'RULES.md' }, A).catch((e) => e.message)
+  const memMdOld = await tools.get('mc_kit_memory').execute({ action: 'read', path: 'AGENTS.md' }, A).catch((e) => e.message)
+  console.log(`  ${/不能通过记忆工具读写/.test(String(memMd)) && /不能通过记忆工具读写/.test(String(memMdOld)) ? '✅' : '❌'} 记忆工具拒绝读写行事准则（RULES.md 与老名 AGENTS.md 都挡）`)
 
   // 边界信息工具
   const caps = await tools.get('mc_capabilities').execute({}, A)

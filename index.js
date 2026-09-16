@@ -33,7 +33,7 @@ import { Watchdog, WATCH_DEFAULTS } from './src/watchdog.mjs'
 import { MemoryStore } from './src/memory.mjs'
 import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction, patchPersonaInComposition, disableShellInComposition, patchToolGroupsIntoComposition, MC_PRESET_TOOL_GROUPS } from './src/config.mjs'
 import { AccountStore, parseAuthlibCard, normalizeServerUrl, dashUuid } from './src/accounts.mjs'
-import { DEFAULT_AGENTS_MD, agentsMdPath, readAgentsMd, writeAgentsMd, resetAgentsMd, isAgentsMdPath } from './src/agentsmd.mjs'
+import { DEFAULT_AGENTS_MD, agentsMdPath, legacyAgentsMdPath, migrateLegacyAgentsMd, readAgentsMd, writeAgentsMd, resetAgentsMd, isAgentsMdPath } from './src/agentsmd.mjs'
 import { encodePng } from './src/png.mjs'
 import { ImageEngine, imageEngineAvailable, imageEngineError } from './src/image.mjs'
 import {
@@ -382,7 +382,7 @@ export function apply(ctx, config) {
     if (!store) {
       migrateWorkspaceState(cwd)
       // 🔴 `create:false`：**读**记忆不该顺手把 `.whale-craft/` 建出来。
-      //    建目录/建 AGENTS.md 只发生在"首次发起 MC 模式会话"与"点开 MC设置"这两个时机
+      //    建目录/建行事准则（RULES.md）只发生在"首次发起 MC 模式会话"与"点开 MC设置"这两个时机
       //    （用户 2026-09-16 定），由 `ensureMemoryRoot` 显式做。
       store = new MemoryStore(root, { create: false })
       memoryCache.set(root, store)
@@ -725,7 +725,7 @@ export function apply(ctx, config) {
     /**
      * 「MC设置」这组接口的**工作区闸门**（用户 2026-09-16）：
      *   · **没有选中工作区 → 拒绝**（400），不猜、也不落到 `$DSH_HOME` 兜底目录；
-     *   · 顺带承担"**点开 MC设置**"这个时机：把该工作区的 `.whale-craft/`（README.md / AGENTS.md）备好。
+     *   · 顺带承担"**点开 MC设置**"这个时机：把该工作区的 `.whale-craft/`（README.md / RULES.md）备好。
      */
     /**
      * 「MC设置」这组接口的**工作区闸门**（用户 2026-09-16）：
@@ -856,8 +856,8 @@ export function apply(ctx, config) {
       return ok(configView())
     }
 
-    /* ── 提示词 AGENTS.md（「MC设置 → 提示词」页）：读 / 存 / 恢复默认 ──
-     * 🔴 它是**按会话工作区**的（`<工作区>/.whale-craft/AGENTS.md`），所以前端要带 sessionId。
+    /* ── 提示词（「MC设置 → 提示词」页 = `.whale-craft/RULES.md`）：读 / 存 / 恢复默认 ──
+     * 🔴 它是**按会话工作区**的（`<工作区>/.whale-craft/RULES.md`），所以前端要带 sessionId。
      * 🔴 没有选中工作区 → **拒绝**（用户 2026-09-16）；有工作区则顺带把文件备好（点开设置即建）。 */
     if (path === '/api/mc/agents-md') {
       const gate = await gateOf(body)
@@ -1026,7 +1026,7 @@ export function apply(ctx, config) {
             // **实际投出去的**插件提示行（不是"我们打算投"）：投递是唯一通道，这里就是判据
             notices: sent,
             segments: {
-              'agents-md': sent.includes('.whale-craft/AGENTS.md') ? cur.text.length : 0,
+              'agents-md': sent.includes('.whale-craft/RULES.md') ? cur.text.length : 0,
               'workspace-agents-md': sent.includes('AGENTS.md') ? 1 : 0,
               'memory-index': sent.includes('.whale-craft/README.md') && root ? memoryIndexText(memoryFor(cwd)).length : 0,
             },
@@ -2243,6 +2243,11 @@ export function apply(ctx, config) {
   const ensureAgentsMdFile = (dir) => {
     const p = agentsMdPath(dir)
     try {
+      // 先把老名字（`.whale-craft/AGENTS.md`）迁走 —— 只要那个文件名还在，宿主就会把它
+      // 当"工作区指令"注入任何碰过本目录的会话（含非 MC 会话），而我们的开关关不掉它。
+      const mig = migrateLegacyAgentsMd(dir)
+      if (mig.migrated) logLine(`行事准则已改名迁移：${legacyAgentsMdPath(dir)} → ${p}（老文件备份为 ${mig.backup}）`)
+      else if (mig.reason) logLine(`行事准则迁移失败（不影响使用）：${mig.reason}`)
       if (existsSync(p)) return false
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
       writeFileSync(p, DEFAULT_AGENTS_MD, 'utf8')
@@ -2255,7 +2260,7 @@ export function apply(ctx, config) {
    *
    * 投三条（各一条插件提示行）：
    *    ① `<工作区>/AGENTS.md`（开关 `injectWorkspaceAgentsMd`）—— 用户要求先投它
-   *    ② `<工作区>/.whale-craft/AGENTS.md`（开关 `injectWhaleCraftAgentsMd`）
+   *    ② `<工作区>/.whale-craft/RULES.md`（开关 `injectWhaleCraftAgentsMd`）
    *    ③ `<工作区>/.whale-craft/README.md` = **记忆总索引**（无开关：记忆是这个模式的本职）
    *
    * 🔴 为什么走这条路：宿主注入工作区 `AGENTS.md` **不用 systemPrompt** ——
@@ -2304,8 +2309,8 @@ export function apply(ctx, config) {
       ensureAgentsMdFile(root)
       const cur = readAgentsMd(root)
       items.push({
-        rel: '.whale-craft/AGENTS.md',
-        title: '提示词注入：.whale-craft/AGENTS.md',
+        rel: '.whale-craft/RULES.md',
+        title: '提示词注入：.whale-craft/RULES.md',
         text: `【Whale Craft 行事准则（${cur.source === 'custom' ? 'Master 自定义版' : '默认版'}）】\n\n${cur.text.trim()}`,
       })
     }
@@ -2421,13 +2426,13 @@ export function apply(ctx, config) {
       },
       // 保留 registered/segments 两个键名（前端与 mc_diag 在用）：现在两者同源 —— 都是"真的投了"
       registered: {
-        'agents-md': sent.includes('.whale-craft/AGENTS.md'),
+        'agents-md': sent.includes('.whale-craft/RULES.md'),
         'workspace-agents-md': sent.includes('AGENTS.md'),
         'version-prompt': sent.some((r) => String(r).startsWith('whale_craft@')),
         'memory-index': sent.includes('.whale-craft/README.md'),
       },
       segments: {
-        'agents-md': sent.includes('.whale-craft/AGENTS.md'),
+        'agents-md': sent.includes('.whale-craft/RULES.md'),
         'workspace-agents-md': sent.includes('AGENTS.md'),
         'version-prompt': sent.some((r) => String(r).startsWith('whale_craft@')),
         'memory-index': sent.includes('.whale-craft/README.md'),
@@ -2446,7 +2451,7 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 在**选中工作区**里备好 `.whale-craft/`（缺 README.md / AGENTS.md 就补默认）。
+   * 在**选中工作区**里备好 `.whale-craft/`（缺 README.md / RULES.md 就补默认）。
    *
    * 🔴 用户 2026-09-16 定的**时机**：**不是**启动时对每个会话建，只在两个时刻建：
    *    ① **首次发起 MC 模式会话**（`applyMcModePolicy` 跑的时候）
@@ -2502,7 +2507,7 @@ export function apply(ctx, config) {
    *     能观察世界、移动、挖掘和建造。"
    *
    * 从前那句 "You are a helpful software engineer assistant." 来自我们复制的官方 `minimal`。
-   * 这里只写**身份 + 能力**；规矩（称呼/记忆/看门狗/指令/边界）全在 `.whale-craft/AGENTS.md`，不重复。
+   * 这里只写**身份 + 能力**；规矩（称呼/记忆/看门狗/指令/边界）全在 `.whale-craft/RULES.md`，不重复。
    * 系统提示词**由宿主按这个 preset 自动注入**，插件不再自己往 systemPrompt 里塞（用户要求）。
    */
   const MC_PERSONA_TEXT = '你在一台真实的 Minecraft Java 版服务器里扮演一名玩家：你的"身体"是一台无头机器人，能观察世界、移动、挖掘和建造。'
@@ -2848,11 +2853,11 @@ export function apply(ctx, config) {
     rememberWorkspace(workspaceOf(agent))     // 发布区按"工作区目录名"寻址 → 得先记住它
     mcPolicyApplied.add(agent)
     if (agent.id) mcModeAgentIds.add(String(agent.id))
-    ensureMemoryRoot(agent)        // ← 首次发起 MC 模式会话 = 建 `.whale-craft/`（README / AGENTS.md）的时机
+    ensureMemoryRoot(agent)        // ← 首次发起 MC 模式会话 = 建 `.whale-craft/`（README / RULES.md）的时机
     // 🔴 把提示词**当消息投递**（学宿主注入 AGENTS.md 的做法）—— 必达、且在对话里看得见
     try { injectAgentsMdNotices(agent) } catch (e) { logLine(`提示词投递失败：${e?.message ?? e}`) }
 
-    // 🔴 提示词只有这一条通道：`injectAgentsMdNotices` 把 AGENTS.md / 记忆索引当**插件提示行**投出去。
+    // 🔴 提示词只有这一条通道：`injectAgentsMdNotices` 把 RULES.md（+工作区 AGENTS.md）/ 版本提示 / 记忆索引当**插件提示行**投出去。
     //    **不注册任何 systemPrompt 段**（用户 2026-09-16 要求：那既冗余、又会被 persona 的
     //    complete/includeRuntimeContext 压掉）。这里只做"命令式"的部分：工具可见性 + guard。
     logLine(`MC 模式生效（preset=${lastPresetSeen.get(agent) ?? '?'}，${agent.id}）`)
@@ -2925,7 +2930,7 @@ export function apply(ctx, config) {
           return 'MC 模式不允许读凭据备忘目录（secrets/）；账号密码在「MC设置 → 账户」里维护，AI 不需要也不应该看到。'
         }
         if (isAgentsMdPath(text)) {
-          return 'AGENTS.md 是给 Master 编辑的行事准则，AI 不能读写它（要改请在「MC设置 → 提示词」里改）。'
+          return '行事准则（.whale-craft/RULES.md）是给 Master 编辑的，AI 不能读写它（要改请在「MC设置 → 提示词」里改）。'
         }
       }
 

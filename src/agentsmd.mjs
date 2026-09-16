@@ -1,21 +1,34 @@
-// -*- coding: utf-8 -*-
+﻿// -*- coding: utf-8 -*-
 /**
- * whale_craft / agentsmd.mjs —— 本模式的「行事准则」AGENTS.md
+ * whale_craft / agentsmd.mjs —— 本模式的「行事准则」RULES.md
  * ============================================================================
  * 用户 2026-09-16 的要求：
- *   · 不再注入工作区的 AGENTS.md，改为注入 **`.whale-craft/AGENTS.md`**（本文件就是它的默认内容）
+ *   · 不再注入工作区的 AGENTS.md，改为注入 **`.whale-craft/RULES.md`**（本文件就是它的默认内容）
  *   · Master 可以在「MC设置 → 提示词」页里编辑它，并有**恢复默认**
  *   · **MCAI 不能读写它**（它是给 AI 看的规矩，不是给 AI 改的）
  *
  * 两份内容：
  *   · **默认**：打包在插件里的这份（`DEFAULT_AGENTS_MD`）
- *   · **自定义**：`<工作区>/.whale-craft/AGENTS.md` —— 存在就用它，删掉就回到默认
+ *   · **自定义**：`<工作区>/.whale-craft/RULES.md` —— 存在就用它，删掉就回到默认
  * ============================================================================
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 
-const FILE = 'AGENTS.md'
+const FILE = 'RULES.md'
+/**
+ * 老名字。
+ *
+ * 🔴 2026-09-16 改名原因（用户抓到的致命 bug）：文件名原来叫 `AGENTS.md`，而**宿主的
+ *    `@deepseek-ai/dsh-agent-instructions` 恰好把 `AGENTS.md` 当候选指令文件**
+ *    （`DEFAULT_INSTRUCTION_FILE_CANDIDATES = ['AGENTS.md', 'CLAUDE.md']`）：
+ *    任何会话只要 `read`/`write`/`edit` 过 `.whale-craft/` 下的文件，宿主就会把这个目录里的
+ *    `AGENTS.md` 当**工作区指令**注入**那个会话** —— MC 会话被投两遍，非 MC 会话也被污染，
+ *    而且我们那个"注入本提示词"的开关**关不掉**它。
+ *    改叫 `RULES.md`（不在宿主候选名里）之后，注入只剩我们这一条通道。
+ *    老文件见到就**搬内容 + 备份改名**（见 `migrateLegacyAgentsMd`），否则宿主照旧会认它。
+ */
+const LEGACY_FILE = 'AGENTS.md'
 const MAX_BYTES = 128 * 1024
 
 /** 默认「行事准则」（2026-09-16 第二版：Master 亲自给的全文） */
@@ -36,11 +49,11 @@ export const DEFAULT_AGENTS_MD = `# Whale Craft 行事准则
 ## 记忆
 
 
-你可以在 .whale-craft/ 文件夹（即本 AGENTS.md 文件所在文件夹）下记录文档、svg图像等文件来留存记忆。你始终需要阅读 .whale-craft/README.md 来获取对所有 Whale Craft 实例重要的信息。同理，这类信息你也应当记录在该 README.md 文件中。
+你可以在 .whale-craft/ 文件夹（即本 RULES.md 文件所在文件夹）下记录文档、svg图像等文件来留存记忆。你始终需要阅读 .whale-craft/README.md 来获取对所有 Whale Craft 实例重要的信息。同理，这类信息你也应当记录在该 README.md 文件中。
 
 一般地，你需要分门别类地整理信息，将不同分组的信息放在 .whale-craft/ 的不同子文件夹下。比如，按照用户让你进入的不同服务器分组。分组的索引同样要记录在 .whale-craft/README.md 中。
 
-你不能修改 .whale-craft/AGENTS.md，即本文件。
+你不能修改 .whale-craft/RULES.md，即本文件。
 
 ## 边界信息
 
@@ -88,6 +101,39 @@ export const DEFAULT_AGENTS_MD = `# Whale Craft 行事准则
 
 export function agentsMdPath (dir) { return join(dir, FILE) }
 
+/** 老名字的路径（`AGENTS.md`）：只用于迁移与守卫，不再作为存储位置 */
+export function legacyAgentsMdPath (dir) { return join(dir, LEGACY_FILE) }
+
+/**
+ * 把老的 `.whale-craft/AGENTS.md` 迁到新名字（**幂等**，只在需要时动）。
+ *
+ * 规则（用户 2026-09-16）：
+ *   · 新文件不存在、老文件在 → 把老内容写进 `RULES.md`，再把老文件**改名为带时间戳的备份**
+ *     （改名而不是删除：内容不丢；而且那个名字只要还在，宿主就还会把它当工作区指令注入）；
+ *   · 新文件在、老文件也在 → **以新文件为准**，老的照样备份改名（同样是为了不让宿主认它）；
+ *   · 只有老的、内容为空 → 仍然按上面处理（新文件会拿到默认内容，因为 readAgentsMd 对空文件回退默认）。
+ * @returns {{migrated:boolean, backup?:string, reason?:string}}
+ */
+export function migrateLegacyAgentsMd (dir) {
+  const legacy = legacyAgentsMdPath(dir)
+  const next = agentsMdPath(dir)
+  try {
+    if (!existsSync(legacy)) return { migrated: false }
+    const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
+    const backup = `${legacy}.bak-${stamp}`
+    if (!existsSync(next)) {
+      const raw = readFileSync(legacy, 'utf8')
+      const text = raw.trim() ? raw : DEFAULT_AGENTS_MD
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+      writeFileSync(next, text.endsWith('\n') ? text : text + '\n', 'utf8')
+    }
+    renameSync(legacy, backup)
+    return { migrated: true, backup }
+  } catch (e) {
+    return { migrated: false, reason: e.message }
+  }
+}
+
 /**
  * 读当前准则。
  *
@@ -130,8 +176,13 @@ export function resetAgentsMd (dir) {
 }
 
 /**
- * 这个路径是不是本文件（给"MCAI 不许读写"的守卫用）。
- * 认两种写法：`.whale-craft/AGENTS.md`、以及插件包里的 `whale_craft/AGENTS.md`。
+ * 这个路径是不是本文件（给"AI 不许读写"的守卫用）。
+ *
+ * 认三类写法：
+ *   · 新名字：`.whale-craft/RULES.md`（以及在插件包里的 `whale_craft/RULES.md`）；
+ *   · **老名字**：`.whale-craft/AGENTS.md` —— 迁移完成前/用户手放的文件也要挡住，
+ *     否则 AI 用老名字写一份出来，宿主又把它当工作区指令注入（正是改名要躲开的那件事）；
+ *   · 工作区根上的 `AGENTS.md`（那是给 Master 编辑的、属于 DSH 原生的东西，同样不许 AI 动）。
  */
 export function isAgentsMdPath (text) {
   // ⚠️ 传进来的通常是工具参数的 JSON 串，Windows 路径里的 `\` 已被转义成 `\\`：
@@ -139,9 +190,9 @@ export function isAgentsMdPath (text) {
   const s = String(text ?? '')
     .replace(/\\\\/g, '\\')
     .replace(/\\"/g, '"')
-  // ① `.whale-craft/AGENTS.md` / `whale_craft/AGENTS.md` ② 或者干脆就是个裸 `AGENTS.md`
-  //    （记忆工具里的相对路径 "AGENTS.md" 就是那份，必须一起挡）
-  if (/[/\\]\.?whale[-_]craft[/\\]AGENTS\.md/i.test(s)) return true
-  if (/[/\\]whale_craft[/\\]AGENTS\.md/i.test(s)) return true
-  return /(^|[/\\"'\s])AGENTS\.md(["'\s]|$)/i.test(s)
+  // ① `.whale-craft/RULES.md` / `whale_craft/RULES.md`（含老名字 AGENTS.md）
+  if (/[/\\]\.?whale[-_]craft[/\\](?:RULES|AGENTS)\.md/i.test(s)) return true
+  if (/[/\\]whale_craft[/\\](?:RULES|AGENTS)\.md/i.test(s)) return true
+  // ② 裸文件名（记忆工具里的相对路径就是这种）
+  return /(^|[/\\"'\s])(?:RULES|AGENTS)\.md(["'\s]|$)/i.test(s)
 }

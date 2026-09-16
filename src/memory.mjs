@@ -35,8 +35,8 @@ const MAX_TEXT_BYTES = 256 * 1024          // 文本写入上限
 const MAX_BLOB_BYTES = 16 * 1024 * 1024    // 任意文件（含图片）存入上限
 const GLOBAL_DIR = '_global'
 const README_FILE = 'README.md'
-/** 插件自己的文件（根目录下的）不算"记忆"：索引、账户库、全局配置 */
-const PLUGIN_FILES = new Set([README_FILE, 'AGENTS.md', 'accounts.json', 'config.json'])
+/** 插件自己的文件（根目录下的）不算"记忆"：索引、行事准则（新名/老名）、账户库、全局配置 */
+const PLUGIN_FILES = new Set([README_FILE, 'RULES.md', 'AGENTS.md', 'accounts.json', 'config.json'])
 const MAX_DEPTH = 5
 
 /** 目录/文件名允许的字符：中英文、数字、`._-`、空格（首尾空格与点会被拒）。 */
@@ -111,8 +111,9 @@ export class MemoryStore {
     if (raw.startsWith('/') || /^[A-Za-z]:/.test(raw)) throw new Error('path 必须是相对路径（如 mc.example.com/landmarks.md）')
     const parts = raw.split('/').filter((p) => p !== '')
     // 行事准则由 Master 在「MC设置 → 提示词」里维护，**AI 不许读写**（读写都从这条路断掉）
-    if (parts.length === 1 && /^AGENTS\.md$/i.test(parts[0])) {
-      throw new Error('AGENTS.md 不能通过记忆工具读写——它是给 Master 编辑的行事准则（在「MC设置 → 提示词」里改）')
+    // ⚠️ 新旧两个名字都要挡：`RULES.md` 是现在的存储名，`AGENTS.md` 是改名前的（残留的文件同样不许碰）
+    if (parts.length === 1 && /^(?:RULES|AGENTS)\.md$/i.test(parts[0])) {
+      throw new Error('行事准则（.whale-craft/RULES.md）不能通过记忆工具读写——它是给 Master 编辑的（在「MC设置 → 提示词」里改）')
     }
     if (parts.length === 0) throw new Error('path 不能为空')
     if (parts.some((p) => p === '..' || p === '.')) throw new Error('path 不允许包含 . 或 ..')
