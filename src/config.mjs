@@ -113,6 +113,19 @@ export function pickPresetTarget (wanted) {
 /** 复制源的优先级：越简的工具面越适合 MC 模式（MC 的 persona/指导由插件注入） */
 export const PREFERRED_PRESET_SOURCES = ['minimal', 'standard', 'ptc']
 
+/**
+ * 这个简介是不是"复制来的"？（等于某个官方 preset 的简介）
+ *
+ * 官方 `copy()` **只改 name、保留源 preset 的 description**（见 `agent-presets/src/authoring.ts`），
+ * 所以自动建出来的 MC 模式会带一句极简模式/标准模式的简介 —— 用户 2026-09-16 报的正是这个。
+ * 只在**明显是复制残留**时才修：用户自己写过的简介（不等于任何官方简介）一律不碰。
+ */
+export function isCopiedPresetDescription (desc, shippedDescriptions) {
+  const d = String(desc ?? '').trim()
+  if (!d) return false
+  return (shippedDescriptions ?? []).some((x) => String(x ?? '').trim() === d)
+}
+
 /** 从现有 preset 里挑复制源：先按优先级，再退到宿主的默认 preset；都没有就 null */
 export function pickPresetSource (ids, defaultId = null) {
   const set = new Set((ids ?? []).map((x) => String(x ?? '')))

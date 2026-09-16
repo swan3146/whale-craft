@@ -513,6 +513,24 @@ select[data-wc-in]{appearance:none;padding-right:22px;
     }
 
     /**
+     * 当前会话（或新对话页那个 blank 会话）**选中的工作区**。
+     * 🔴 2026-09-16：新对话页还没开聊时，会话在服务端可能还没落盘 ——
+     *    但**工作区是已经选好了的**，所以把它一起报给服务端（`cwd` 兜底参数），
+     *    免得"明明选了工作区却被拒绝"。服务端只认绝对路径且必须真实存在的目录。
+     */
+    function useWorkspaceCwd(props) {
+      const sessionId = props?.sessionId ?? props?.session?.id
+      const useSessions = props?.useSessions
+      const sess = typeof useSessions === 'function' ? useSessions : null
+      return sess && sessionId
+        ? sess((state) => {
+          const v = state?.byId?.[sessionId]?.cwd
+          return typeof v === 'string' && v ? v : undefined
+        })
+        : undefined
+    }
+
+    /**
      * 标题条上的「MC设置」按钮（order 45，落在状态条左边）。
      * 只在**已有会话**里出现；新会话页那个是下面 `McSettingsDockEntry`。
      *
@@ -525,6 +543,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
      * ================================================================== */
     function McSettingsEntry(props) {
       const show = useMcSettingsGate(props, false)
+      const wsCwd = useWorkspaceCwd(props)
       if (!show) return null
 
       return React.createElement(
@@ -537,7 +556,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           title: 'MC设置：账户、提示词与指令白名单',
           onClick: openSettings,
         }, 'MC设置'),
-        React.createElement(McSettingsModal, null),
+        React.createElement(McSettingsModal, { ...props, wsCwd }),
       )
     }
 
@@ -628,6 +647,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
      */
     function McSettingsDockEntry(props) {
       const show = useMcSettingsGate(props, true)
+      const wsCwd = useWorkspaceCwd(props)
 
       React.useEffect(() => {
         if (!show) return undefined
@@ -635,7 +655,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       }, [show])
 
       if (!show) return null
-      return React.createElement(McSettingsModal, null)
+      return React.createElement(McSettingsModal, { ...props, wsCwd })
     }
 
     /* ==================================================================
@@ -1140,7 +1160,13 @@ select[data-wc-in]{appearance:none;padding-right:22px;
        * （没有选中工作区就 400 拒绝，见 index.js `settingsGate`）。
        * 统一走 query（GET/POST/PATCH/DELETE 服务端都认），省得每个 body 都塞一遍。
        */
-      const withSid = (p) => p + (p.includes('?') ? '&' : '?') + 'sessionId=' + encodeURIComponent(sessionId ?? '')
+      const wsCwd = props?.wsCwd ?? null
+      const withSid = (p) => {
+        const q = []
+        if (sessionId) q.push('sessionId=' + encodeURIComponent(sessionId))
+        if (wsCwd) q.push('cwd=' + encodeURIComponent(wsCwd))
+        return q.length ? p + (p.includes('?') ? '&' : '?') + q.join('&') : p
+      }
       const [open, setOpen] = React.useState(false)
       const [tab, setTab] = React.useState('accounts')
       const [accounts, setAccounts] = React.useState([])

@@ -20,13 +20,14 @@
  */
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, unlinkSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, unlinkSync, statSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { resolve, sep, join } from 'node:path'
+import { resolve, sep, join, isAbsolute } from 'node:path'
+import { homedir } from 'node:os'
 import { McBot, lossless, logLine, libraryInfo } from './src/core.mjs'
 import { Watchdog, WATCH_DEFAULTS } from './src/watchdog.mjs'
 import { MemoryStore } from './src/memory.mjs'
-import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource } from './src/config.mjs'
+import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES } from './src/config.mjs'
 import { AccountStore, parseAuthlibCard, normalizeServerUrl, dashUuid } from './src/accounts.mjs'
 import { DEFAULT_AGENTS_MD, agentsMdPath, readAgentsMd, writeAgentsMd, resetAgentsMd, isAgentsMdPath } from './src/agentsmd.mjs'
 import { encodePng } from './src/png.mjs'
@@ -751,19 +752,41 @@ export function apply(ctx, config) {
      *   · **没有选中工作区 → 拒绝**（400），不猜、也不落到 `$DSH_HOME` 兜底目录；
      *   · 顺带承担"**点开 MC设置**"这个时机：把该工作区的 `.whale-craft/`（README.md / AGENTS.md）备好。
      */
-    const settingsGate = async (sessionId) => {
+    /**
+     * 「MC设置」这组接口的**工作区闸门**（用户 2026-09-16）：
+     *   · 优先按 sessionId 找会话的工作区；
+     *   · 新对话页那个会话可能**还没落盘**（客户端已经选好工作区了）→ 允许客户端直接报 `cwd`；
+     *   · 都没有 → 拒绝（400），不猜、也不落到 `$DSH_HOME` 兜底目录。
+     *   · 顺带承担"**点开 MC设置**"这个时机：把该工作区的 `.whale-craft/` 备好。
+     */
+    const usableWorkspace = (p) => {
+      const s = String(p ?? '').trim()
+      if (!s || !isAbsolute(s)) return null
+      try { return statSync(s).isDirectory() ? s : null } catch { return null }
+    }
+    const settingsGate = async (sessionId, cwdHint) => {
       const sid = String(sessionId ?? '').trim()
-      if (!sid) {
-        return { ok: false, error: '缺少 sessionId：这组接口只在某个会话里可用（要用它的工作区放记忆与提示词）。' }
-      }
-      const cwd = await workspaceOfSession(sid)
+      let cwd = sid ? await workspaceOfSession(sid) : null
+      let from = cwd ? 'session' : null
       if (!cwd) {
-        return { ok: false, error: '这个会话**没有选中工作区**，「MC设置」不可用：请先在会话里选定一个工作区（记忆与提示词都放在那里）。' }
+        cwd = usableWorkspace(cwdHint)
+        if (cwd) from = 'client'
+      }
+      if (!cwd) {
+        return {
+          ok: false,
+          error: sid
+            ? '这个会话**没有选中工作区**，「MC设置」不可用：请先在会话里选定一个工作区（记忆与提示词都放在那里）。'
+            : '缺少 sessionId：这组接口只在某个会话里可用（要用它的工作区放记忆与提示词）；新对话页请先选好工作区。',
+        }
       }
       ensureMemoryRootForCwd(cwd)
-      return { ok: true, cwd }
+      return { ok: true, cwd, from }
     }
-    const gateOf = (b) => settingsGate(url.searchParams.get('sessionId') ?? b?.sessionId)
+    const gateOf = (b) => settingsGate(
+      url.searchParams.get('sessionId') ?? b?.sessionId,
+      url.searchParams.get('cwd') ?? b?.cwd,
+    )
 
     if (path === '/api/mc/accounts' && req.method === 'GET') {
       const gate = await gateOf()
@@ -2215,6 +2238,42 @@ export function apply(ctx, config) {
 
   /** 自动创建 preset 时的显示名（preset.yml 里的 `name:`） */
   const MC_PRESET_NAME = 'MC模式'
+  /**
+   * 自动建出来的 preset 的简介。
+   * 🔴 用户 2026-09-16 报："MC 模式的简介变成了和极简模式一样"——
+   *    因为官方 `copy()` **只改 name、保留源 preset 的 description**（`copyComposition` 里的注释写得很清楚）。
+   *    所以复制完必须把**元数据**改回来（`preset.yml` 是显示文本，不是 composition，可以自己写）。
+   */
+  const MC_PRESET_DESCRIPTION = '可以加入Minecraft Java版服务器，模拟玩家进行交互。'
+
+  /** `~` 开头的 preset 根展开成绝对路径（宿主的 root 配置允许写 `~`） */
+  const expandHome = (p) => {
+    const s = String(p ?? '')
+    return s.startsWith('~') ? join(homedir(), s.slice(1).replace(/^[/\\]+/, '')) : s
+  }
+
+  /**
+   * 把 `preset.yml`（显示名 / 简介 / 排序）写回去。
+   * ⚠️ 只写**元数据**：composition（`agent.cordis.yml`）一根手指都不碰 ——
+   *    官方 authoring 只允许"整目录复制"，但显示文本本来就是给人改的。
+   */
+  const writeMcPresetMetadata = (svc, id) => {
+    try {
+      const roots = Array.isArray(svc?.roots) ? svc.roots : []
+      const userRoot = roots.find((r) => r?.trust === 'user')?.path
+      if (!userRoot) return false
+      const dir = join(expandHome(userRoot), id)
+      if (!existsSync(dir)) return false
+      const body = [
+        `name: ${JSON.stringify(MC_PRESET_NAME)}`,
+        `description: ${JSON.stringify(MC_PRESET_DESCRIPTION)}`,
+        'order: 5',
+        '',
+      ].join('\n')
+      writeFileSync(join(dir, 'preset.yml'), body, 'utf8')
+      return true
+    } catch (e) { logLine(`写 preset 简介失败（不影响使用）：${e.message}`); return false }
+  }
 
   /** 宿主 agentPresets 服务（可能晚就绪 → 必须走 inject 等，别用 apply 时的 ctx.get） */
   let agentPresetsSvc = null
@@ -2249,7 +2308,23 @@ export function apply(ctx, config) {
       const list = await svc.list()
       const ids = new Set((list ?? []).map((p) => String(p?.id ?? '')).filter(Boolean))
       const wanted = pluginConfig.mcModePresets
-      if (wanted.some((id) => ids.has(id))) return                       // 已经有了，什么都不做
+      const existingId = wanted.find((id) => ids.has(id))
+      if (existingId) {
+        // 已经有 MC 模式 preset → **绝不覆盖 composition**。
+        // 但**我们自己复制出来的**那份可能带着源 preset 的简介（官方 copy() 只改 name）——
+        // 只在"简介恰好等于某个官方 preset 的简介"（明显是复制残留）时修一次显示文本。
+        const cur = (list ?? []).find((p) => String(p?.id ?? '') === existingId)
+        const shippedDescs = (list ?? [])
+          .filter((p) => PREFERRED_PRESET_SOURCES.includes(String(p?.id ?? '')))
+          .map((p) => p?.description)
+        if (isCopiedPresetDescription(cur?.description, shippedDescs)) {
+          const fixed = writeMcPresetMetadata(svc, existingId)
+          logLine(fixed
+            ? `MC 模式 preset「${existingId}」的简介还是复制来的（"${String(cur.description).slice(0, 18)}…"）→ 已改成"${MC_PRESET_DESCRIPTION}"`
+            : `MC 模式 preset「${existingId}」的简介是复制来的，但自动修改失败（请手动编辑 preset.yml）`)
+        }
+        return
+      }
 
       // preset id 必须是目录名（宿主 `PRESET_ID = /^[a-z0-9][a-z0-9-]*$/`）——
       // 所以默认名单里的 `whale_craft`（下划线）**永远不可能是 preset id**，只能建 `minecraft` 这种。
@@ -2264,8 +2339,12 @@ export function apply(ctx, config) {
         return
       }
       await svc.copy(source, target, MC_PRESET_NAME)
+      // copy() 会**保留源 preset 的简介**（官方只改 name）→ 必须把元数据改回来，否则简介跟极简模式一样
+      const meta = writeMcPresetMetadata(svc, target)
       logLine(`已自动创建「${MC_PRESET_NAME}」preset：复制官方 ${source} → ${target}`
-        + `（id=${target}；想改就编辑 $DSH_HOME/.agent-presets/${target}/，想关掉自动创建设 ensureMcPreset=false）`)
+        + `${meta ? '（并把简介改成"可以加入Minecraft Java版服务器…"）' : '（⚠️ 简介没改成，请手动编辑 preset.yml）'}`
+        + `；想改就编辑 ${expandHome(String(svc.roots?.find?.((r) => r?.trust === 'user')?.path ?? '$DSH_HOME/.agent-presets'))}/${target}/`
+        + `，想关掉自动创建设 ensureMcPreset=false`)
     } catch (e) {
       logLine(`自动创建 MC 模式 preset 失败（不影响其它功能）：${e?.message ?? e}`)
     }

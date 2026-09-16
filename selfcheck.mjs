@@ -32,6 +32,11 @@ const eventHandlers = []       // ctx.on 注册的事件（agent/created 等）
 const presetByCtx = new Map()  // 模拟宿主 agentPresets：agent.ctx → preset id
 const presetRows = ['minimal', 'standard', 'ptc']   // 模拟"现有哪些 preset"（官方随包那三个）
 const presetCopyCalls = []     // 自动建 preset 时对宿主 copy() 的调用
+const { mkdtempSync: mkTop, existsSync: exTop, readFileSync: rfTop } = await import('node:fs')
+const { tmpdir: tdTop } = await import('node:os')
+const { join: jnTop } = await import('node:path')
+/** 假"用户可写 preset 根"：自动建 preset 时把目录 / preset.yml 真写在这里，好断言内容 */
+const presetUserRoot = mkTop(jnTop(tdTop(), 'whale-presets-'))
 
 // ── 超时保护单元验证（"停不下来"根因修复的核心机制）──
 console.log('--- withTimeout / raceAbort 单元验证 ---')
@@ -94,8 +99,15 @@ const fakeCtx = {
     composedPreset: (agentCtx) => presetByCtx.get(agentCtx),
     authorable: true,
     defaultId: 'standard',
+    roots: [{ path: presetUserRoot, trust: 'user' }],
     list: async () => presetRows.map((id) => ({ id, trust: 'shipped', path: `/presets/${id}/agent.cordis.yml` })),
-    copy: async (from, id, name) => { presetCopyCalls.push([from, id, name]); presetRows.push(id) },
+    copy: async (from, id, name) => {
+      presetCopyCalls.push([from, id, name])
+      presetRows.push(id)
+      // 假宿主也真的把目录复制出来，这样插件随后写 preset.yml（简介）才有地方落
+      const { mkdirSync } = await import('node:fs')
+      mkdirSync(jnTop(presetUserRoot, id), { recursive: true })
+    },
   },
   webServer: { register: (route) => { registeredRoutes.push(route); return () => {} } },
   // 必须在 apply 之前就在，否则归档保护的包装装不上
@@ -678,7 +690,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   }
 
   // ① 配置存储本身
-  const { PluginConfig, pickPresetTarget, pickPresetSource } = await import('./src/config.mjs')
+  const { PluginConfig, pickPresetTarget, pickPresetSource, isCopiedPresetDescription } = await import('./src/config.mjs')
 
   /* 🔴 2026-09-16 用户定：**没有 MC 模式 preset 就自动建一个**。
    * 起因：preset 属于用户的 $DSH_HOME/.agent-presets/，插件不塞目录 → 新机器上没人建过
@@ -694,6 +706,23 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     await new Promise((r) => setTimeout(r, 0))
   }
   console.log(`  ${presetCopyCalls.length === 1 ? '✅' : '❌'} 只建一次（重复触发不再复制）`)
+  // 🔴 用户 2026-09-16 报的 bug："MC 模式的简介变成了和极简模式一样" ——
+  //    官方 copy() **只改 name、保留源 description**，所以复制完必须把 preset.yml 改回来。
+  const presetMetaFile = jnTop(presetUserRoot, 'minecraft', 'preset.yml')
+  const presetMeta = exTop(presetMetaFile) ? rfTop(presetMetaFile, 'utf8') : ''
+  console.log(`  ${/name: "MC模式"/.test(presetMeta) ? '✅' : '❌'} 建出来的 preset 显示名 = MC模式`)
+  console.log(`  ${/可以加入Minecraft Java版服务器/.test(presetMeta) ? '✅' : '❌'} 🔴 简介改回自己的（不再是"极简模式"那句）：${JSON.stringify((presetMeta.split('\n').find((l) => l.startsWith('description')) ?? '').slice(0, 60))}`)
+  console.log(`  ${!/极简/.test(presetMeta) ? '✅' : '❌'} 简介里没有残留极简模式的文案`)
+  // 🔴 **已经建好的**那份也要能修（用户那台测试机上就是旧版建出来的）：
+  //    只在"简介恰好等于某个官方 preset 的简介"（明显是复制残留）时才动，用户自己写的不碰。
+  const SHIPPED = ['仅提供持久 shell 的单工具编码 Agent。', '功能完整的编码 Agent，支持文件编辑、Shell、文件与网页检索、Skills、计划、目标、子代理和工作流。']
+  console.log(`  ${isCopiedPresetDescription(SHIPPED[0], SHIPPED) && isCopiedPresetDescription(SHIPPED[1], SHIPPED) ? '✅' : '❌'} 认得出"复制残留"的简介（等于某个官方简介）`)
+  console.log(`  ${!isCopiedPresetDescription('Whale Craft插件提供加入MC Java版服务器模拟玩家交互的能力', SHIPPED) && !isCopiedPresetDescription('', SHIPPED) && !isCopiedPresetDescription(undefined, SHIPPED) ? '✅' : '❌'} 用户自己写的简介 / 空 / 缺省 → **不动**（不覆盖人家改过的）`)
+  {
+    const { readFileSync } = await import('node:fs')
+    const src = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+    console.log(`  ${/isCopiedPresetDescription\(cur\?\.description, shippedDescs\)/.test(src) ? '✅' : '❌'} 已有的 MC 模式 preset 也会走一次这个判断（旧版建出来的能被修好）`)
+  }
   console.log(`  ${pickPresetTarget(['minecraft', 'whale_craft']) === 'minecraft' ? '✅' : '❌'} 目标 id 取的是**合法目录名**（minecraft）`)
   console.log(`  ${pickPresetTarget(['whale_craft']) === null ? '✅' : '❌'} 🔴 \`whale_craft\` 带下划线、**不可能是 preset id** → 宁可不建也不硬来（null）`)
   console.log(`  ${pickPresetSource(['minimal', 'standard']) === 'minimal' && pickPresetSource(['ptc'], 'ptc') === 'ptc' && pickPresetSource([], 'standard') === null ? '✅' : '❌'} 复制源优先 minimal → standard → ptc，再退到宿主默认，都没有就 null`)
@@ -970,6 +999,16 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   const okCfg = await callMc2('GET', '/api/mc/config?sessionId=sess-WSOK')
   console.log(`  ${okCfg.json?.ok === true ? '✅' : '❌'} 有工作区 → 设置接口放行`)
   console.log(`  ${(await import('node:fs')).existsSync((await import('node:path')).join(ws3, '.whale-craft', 'AGENTS.md')) ? '✅' : '❌'} 🔴 **点开设置**这个时机就把该工作区的 .whale-craft/AGENTS.md 备好了`)
+
+  // 🔴 2026-09-16 真机反馈："新对话还没开始（服务端还没这个会话），可工作区明明选了"——
+  //    所以允许客户端**直接报工作区**（只认绝对路径 + 真实存在的目录）。
+  const hintWs = (await import('node:fs')).mkdtempSync((await import('node:path')).join((await import('node:os')).tmpdir(), 'whale-hint-'))
+  const hintOk = await callMc2('GET', '/api/mc/config?sessionId=sess-UNKNOWN&cwd=' + encodeURIComponent(hintWs))
+  console.log(`  ${hintOk.json?.ok === true ? '✅' : '❌'} 新对话页：会话还没落盘、但客户端报了对的工作区 → **放行**`)
+  const hintAbs = await callMc2('GET', '/api/mc/config?sessionId=sess-UNKNOWN&cwd=' + encodeURIComponent('relative/dir'))
+  console.log(`  ${hintAbs.json?.ok === false ? '✅' : '❌'} 报的不是绝对路径 → 拒绝`)
+  const hintGone = await callMc2('GET', '/api/mc/config?sessionId=sess-UNKNOWN&cwd=' + encodeURIComponent(jnTop(tdTop(), 'definitely-not-here-xyz')))
+  console.log(`  ${hintGone.json?.ok === false ? '✅' : '❌'} 报的目录不存在 → 拒绝`)
   if (memDirBefore === undefined) delete process.env.WHALE_CRAFT_MEMORY_DIR
   else process.env.WHALE_CRAFT_MEMORY_DIR = memDirBefore
 }
@@ -1678,6 +1717,10 @@ console.log('\n--- 客户端 bundle（client.js 静态检查）---')
     //    ——"一次性请求失败 = 入口永久消失"那个坑不能再踩）
     ['没工作区才隐藏入口（服务端明确 no-workspace；失败不隐藏）', /diag\?\.reason === 'no-workspace'/.test(code) && /catch\(\(\) => \{ if \(alive\) setDeniedNoWorkspace\(false\) \}\)/.test(code)],
     ['设置接口全都带上 sessionId（服务端要用它定位工作区）', /const withSid = \(p\) =>/.test(code) && /apiGet\(withSid\('\/api\/mc\/accounts'\)\)/.test(code) && /apiPatch\(withSid\('\/api\/mc\/config'\)/.test(code) && !/api(Get|Patch|Post|Delete)\('\/api\/mc\/(accounts|config|authservers)'/.test(code)],
+    // 🔴 2026-09-16 真机 bug：两个入口都把模态框写成 `createElement(McSettingsModal, null)`
+    //    → sessionId 永远是 undefined → 点开设置就报"缺少 sessionId"。
+    ['模态框真的拿到了 props（不是 null）', !/React\.createElement\(McSettingsModal, null\)/.test(code) && /React\.createElement\(McSettingsModal, \{ \.\.\.props, wsCwd \}\)/.test(code)],
+    ['新对话页会把已知工作区一起报上去（cwd 兜底）', /function useWorkspaceCwd\(props\)/.test(code) && /q\.push\('cwd=' \+ encodeURIComponent\(wsCwd\)\)/.test(code)],
     ['服务端兜底只给标题条且带重试（不是一次性请求）', /const needServer = !known && !wantBlank/.test(code) && /\+\+tries < 20/.test(code) && /setTimeout\(tick, 3000\)/.test(code)],
     ['名单来自 /api/mc/config 的 mcModePresets（带默认值兜底）', /mcModePresets/.test(code) && /MC_PRESETS_FALLBACK/.test(code)],
     ['判不了就不渲染（return null）', /if \(!show\) return null/.test(code)],
