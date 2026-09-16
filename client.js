@@ -142,6 +142,10 @@ window.__ModuleLoader__.load({
 /* 「提示词」页顶部的注入状态（2026-09-16）：一眼看出会不会注入、为什么不会 */
 [data-wc-injectstatus]{font-size:12px;line-height:18px;color:var(--dsh-text-2,#9aa0a6);margin:0 0 8px;}
 [data-wc-injectstatus] [data-wc-note]{font-size:11px;line-height:16px;color:var(--dsh-text-3,#7a8085);margin-top:2px;}
+[data-wc-verprompt]{margin:0 0 10px;font-size:12px;color:var(--dsh-text-2,#9aa0a6);}
+[data-wc-verprompt] summary{cursor:pointer;}
+[data-wc-verprompt] pre{margin:6px 0 0;padding:8px 10px;border-radius:6px;white-space:pre-wrap;
+  background:var(--dsw-alias-bg-overlay);color:var(--dsh-text-1,#e6e6e6);font:inherit;font-size:11px;line-height:16px;}
 [data-wc-acctsub]{font-size:11px;line-height:16px;min-width:0;overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap;color:var(--dsw-alias-label-tertiary);}
 [data-wc-acctacts]{flex:none;display:flex;align-items:center;gap:2px;}
@@ -1163,6 +1167,13 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         ),
         React.createElement('div', { 'data-wc-sec': '' },
           React.createElement('div', { 'data-wc-h': '' }, '注入'),
+          // 版本硬提示词：随插件版本发布、不可编辑，但用户有权知道它说了什么
+          injectStatus?.versionPrompt
+            ? React.createElement('details', { 'data-wc-verprompt': '' },
+              React.createElement('summary', {},
+                `本版本内置提示（随插件版本更新，不可编辑）：whale_craft v${injectStatus.versionPrompt.version}`),
+              React.createElement('pre', {}, String(injectStatus.versionPrompt.text ?? '')))
+            : null,
           React.createElement(Switch, {
             label: '注入本提示词',
             on: injectWc === true,

@@ -1,4 +1,4 @@
-﻿// -*- coding: utf-8 -*-
+// -*- coding: utf-8 -*-
 /**
  * 插件自检：用假 ctx 加载 whale_craft 的 apply()，检查
  *   - Config schema 能否解析
@@ -227,6 +227,13 @@ console.log('\n--- 工具面（share 移除 / present 接入）---')
   console.log(`  ${/MC_PRESET_TOOL_GROUPS/.test(idx) && /availableToolGroups\(\)/.test(idx) ? '✅' : '❌'} 复制/重建 preset 时会补齐 MC 模式需要的工具组（tool-fs / tool-jobs / present）`)
   console.log(`  ${/const ensureToolGroupsInPreset/.test(idx) && /ensureToolGroupsInPreset\(svc, existingId\)/.test(idx) ? '✅' : '❌'} 🔴 **已存在的** preset（含本机手写那份）也会被补齐那几组（不动别的行）`)
   console.log(`  ${/这些工具包在本部署的 preset 里没人引用/.test(idx) ? '✅' : '❌'} 加组之前先探"这个部署里有没有那个包"（免得把 preset 弄挂）`)
+  // 两种"让用户看到图"的方式（用户 2026-09-16 定：AI 显式写进 .whale-craft/，两条路都要有）
+  console.log(`  ${/const outDir = join\(memoryRootFor\(workspaceOf\(exec\?\.agent\)\), 'out'\)/.test(idx) ? '✅' : '❌'} mc_kit_image 默认输出落在**记忆夹**（.whale-craft/out/）`)
+  console.log(`  ${/\.whale-craft\/out\/mc-map-/.test(idx) ? '✅' : '❌'} mc_map 的图也落记忆夹（jail 里 read_image 够得着）`)
+  console.log(`  ${/read_image \{file_path:"\$\{rel\}"\}/.test(idx) && /present \{files:\[\{path:"\$\{rel\}"\}\]\}/.test(idx) ? '✅' : '❌'} 🔴 出图后同时给出两条交付路：read_image（当场图片卡片）+ present（轮末文件卡片）`)
+  console.log(`  ${/versionPromptText/.test(idx) && /versionPromptTitle/.test(idx) ? '✅' : '❌'} 版本硬提示词已接进投递（正文 + 带版本与短哈希的折叠标题）`)
+  const cli = readFileSync(new URL('./client.js', import.meta.url), 'utf8')
+  console.log(`  ${/data-wc-verprompt/.test(cli) && /本版本内置提示/.test(cli) ? '✅' : '❌'} 「提示词」页只读展示版本内置提示（用户有权知道它说了什么）`)
 }
 
 /** 造一个假的 exec（带会话身份），工具靠它路由到各自的实例 */
@@ -1163,13 +1170,21 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     const msgs = mcAgent.inbox.nextStep
     const first = msgs[0]
     const second = msgs[1]
-    console.log(`  ${msgs.length === 2 ? '✅' : '❌'} MC 会话：提示词被投递到 inbox.nextStep（${msgs.length} 条：行事准则 + 记忆索引）`)
+    const third = msgs[2]
+    console.log(`  ${msgs.length === 3 ? '✅' : '❌'} MC 会话：提示词被投递到 inbox.nextStep（${msgs.length} 条：行事准则 + 版本提示 + 记忆索引）`)
     console.log(`  ${first?.source?.kind === 'plugin' && first?.source?.plugin === 'whale_craft' && first?.source?.form === 'notice' ? '✅' : '❌'} 🔴 来源是 plugin/notice（**不是**用户发言）：${JSON.stringify(first?.source ?? null)}`)
     const body = (first?.content ?? []).map((c) => c.text ?? '').join('')
     console.log(`  ${/Whale Craft 行事准则/.test(body) && /Minecraft/.test(body) ? '✅' : '❌'} 第 1 条 = 行事准则（${body.length} 字），首行写明文件：${JSON.stringify(body.split('\n')[0])}`)
     console.log(`  ${/^Instructions from: \.whale-craft\/AGENTS\.md$/.test(body.split('\n')[0] ?? '') ? '✅' : '❌'} 正文首行是 "Instructions from: .whale-craft/AGENTS.md"（与 DSH 原生同形状）`)
-    const body2 = (second?.content ?? []).map((c) => c.text ?? '').join('')
-    console.log(`  ${second?.source?.form === 'notice' && /^Instructions from: \.whale-craft\/README\.md$/.test(body2.split('\n')[0] ?? '') ? '✅' : '❌'} 第 2 条 = 记忆索引（.whale-craft/README.md），同样是插件提示行`)
+    // 第 2 条 = **版本硬提示词**（硬编码、随版本发布、无开关、排在行事准则之后）
+    const bodyV = (second?.content ?? []).map((c) => c.text ?? '').join('')
+    console.log(`  ${second?.source?.form === 'notice' && /^Instructions from: whale_craft@/.test(bodyV.split('\n')[0] ?? '') ? '✅' : '❌'} 第 2 条 = 版本提示（来源行 ${JSON.stringify((bodyV.split('\n')[0] ?? '').slice(0, 46))}…）`)
+    console.log(`  ${/mc_move/.test(bodyV) && /mc_command/.test(bodyV) && /\/setblock/.test(bodyV) ? '✅' : '❌'} 版本提示正文点了工具名与指令名（mc_move / mc_command / /setblock）`)
+    console.log(`  ${/用户当前明确的要求 > .*AGENTS\.md`?\s*> 本条版本提示/.test(bodyV) ? '✅' : '❌'} 🔴 正文写清优先级：用户要求 > AGENTS.md > 版本提示（免得和用户偏好打架）`)
+    const vTitle = String(second?.source?.summary ?? '')
+    console.log(`  ${/v\d+\.\d+\.\d+/.test(vTitle) && /（[0-9a-f]{8}）$/.test(vTitle) ? '✅' : '❌'} 折叠标题带版本号 + 短哈希：${vTitle}`)
+    const body2 = (third?.content ?? []).map((c) => c.text ?? '').join('')
+    console.log(`  ${third?.source?.form === 'notice' && /^Instructions from: \.whale-craft\/README\.md$/.test(body2.split('\n')[0] ?? '') ? '✅' : '❌'} 第 3 条 = 记忆索引（.whale-craft/README.md），同样是插件提示行`)
     console.log(`  ${/长期记忆/.test(body2) && /mc_kit_memory/.test(body2) ? '✅' : '❌'} 记忆索引正文含"怎么记/怎么读"（${body2.length} 字）—— 不需要再单独往系统提示里塞一段`)
     console.log(`  ${plainAgent.inbox.nextStep.length === 0 ? '✅' : '❌'} 普通会话**不投递**（只有 MC 模式才投）`)
     const inboxBefore = mcAgent.inbox.nextStep.length
@@ -1218,7 +1233,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   eventHandlers.filter((h) => h.ev === 'agent-preset/selected').forEach((h) => h.fn('sess-LATE', 'minecraft'))
   const lateBody = (lateAgent.inbox.nextStep[0]?.content ?? []).map((c) => c.text ?? '').join('')
   console.log(`  ${/Whale Craft 行事准则/.test(lateBody) ? '✅' : '❌'} 🔴 模式晚选上后**立刻投递**（${lateAgent.inbox.nextStep.length} 条 / ${lateBody.length} 字）—— 就是那个 bug`)
-  console.log(`  ${lateAgent.inbox.nextStep.length === 2 ? '✅' : '❌'} 补投递没有重复（行事准则 + 记忆索引，各一条）`)
+  console.log(`  ${lateAgent.inbox.nextStep.length === 3 ? '✅' : '❌'} 补投递没有重复（行事准则 + 版本提示 + 记忆索引，各一条）`)
   const lateRestrict = restrictCalls.find((c) => c.preset === undefined)
   console.log(`  ${Array.isArray(lateRestrict?.f?.allow) && !lateRestrict.f.allow.includes('pwsh') ? '✅' : '❌'} 模式晚选上时工具白名单也补上了（allow 有 ${lateRestrict?.f?.allow?.length ?? 0} 个、无 pwsh）`)
   console.log(`  ${eventHandlers.some((h) => h.ev === 'agent-preset/selected') ? '✅' : '❌'} 挂了宿主的 agent-preset/selected 事件（会话里切模式才生效）`)

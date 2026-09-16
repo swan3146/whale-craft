@@ -1,4 +1,4 @@
-﻿/**
+/**
  * whale_craft —— DSH 原生 Minecraft Agent 插件（host 半端）
  * ============================================================================
  * 目标：把"我"接进 MC 做成**一等公民**，而不是外挂一个 MCP 子进程。
@@ -24,9 +24,10 @@ import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, copyFi
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
-import { resolve, sep, join, isAbsolute } from 'node:path'
+import { resolve, sep, join, isAbsolute, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { McBot, lossless, logLine, libraryInfo } from './src/core.mjs'
+import { versionPromptText, versionPromptTitle, versionPromptSource } from './src/version-prompt.mjs'
 import { Watchdog, WATCH_DEFAULTS } from './src/watchdog.mjs'
 import { MemoryStore } from './src/memory.mjs'
 import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction, patchPersonaInComposition, disableShellInComposition, patchToolGroupsIntoComposition, MC_PRESET_TOOL_GROUPS } from './src/config.mjs'
@@ -1603,15 +1604,17 @@ export function apply(ctx, config) {
         } else {
           out.image.attachmentError = '宿主没有 attachments 服务'
         }
-        // ② 顺手落盘（落到**本会话工作区**的 out/），配合 `present` 交付给用户 / 用 read_image 再看
+        // ② 顺手落盘：**落到记忆文件夹的 out/**（`.whale-craft/out/`）—— 那是文件工具够得着的地方，
+        //    用户有两种看到它的方式：当场的 `read_image`（图片卡片）或轮末的 `present`（文件卡片）。
         try {
           const { writeFileSync, mkdirSync } = await import('node:fs')
-          const dir = join(workspaceRootFor(exec?.agent), 'out')
-          if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-          const file = `${dir}mc-map-${Date.now()}.png`
+          const rel = `.whale-craft/out/mc-map-${Date.now()}.png`
+          const file = join(workspaceRootFor(exec?.agent), rel)
+          mkdirSync(dirname(file), { recursive: true })
           writeFileSync(file, png)
-          out.image.file = file
-          out.image.hint = '想让用户看到这张图：用 present {files:[{path:"out/mc-map-….png"}]} 交付它（本地用户点开就能看）'
+          out.image.file = rel
+          out.image.hint = `想让用户**当场**看到：read_image {file_path:"${rel}"}（会话里会出现图片卡片）；`
+            + `想当"产出文件"交付：present {files:[{path:"${rel}"}]}（本轮末尾出现文件卡片，可打开源文件）`
         } catch (e) { out.image.fileError = e.message }
       }
       return out
@@ -1852,7 +1855,9 @@ export function apply(ctx, config) {
       + '· render  SVG → PNG（可给 width/height/scale；svg 文本或 svgPath 二选一）\n'
       + '· grid    把多张图按网格拼成**可继续编辑的 SVG 文本**（省掉重复写 N 个 <image> 和算坐标）\n'
       + '· save    把 SVG 文本或 PNG 字节落盘\n'
-      + '产出的 PNG 落在**本会话工作区**里；想让用户看到，就用 `present {files:[{path:"out/xxx.png"}]}` 交付它。',
+      + '输出**默认落在记忆文件夹**（`.whale-craft/out/`）—— 那里才是文件工具够得着的地方。'
+      + '要让用户看到图，两条路都在：`read_image {file_path:".whale-craft/out/x.png"}` → **当场**出现图片卡片；'
+      + '`present {files:[{path:".whale-craft/out/x.png"}]}` → 本轮末尾出现文件卡片（可预览/可打开源文件）。',
     parameters: {
       action: { type: 'string', description: 'info / embed / render / grid / save' },
       path: { type: 'string', description: '输入文件（info/embed 用）' },
@@ -1877,10 +1882,15 @@ export function apply(ctx, config) {
         throw new Error(`图像引擎不可用：${imageEngineError() ?? 'sharp 未解析到'}`)
       }
       const action = String(args.action ?? '').toLowerCase()
-      const needOut = (dflt) => {
-        const p = args.out ? inWs(args.out) : inWs(dflt)
-        return p
-      }
+      /**
+       * 输出路径。**默认落在记忆文件夹里**（`<工作区>/.whale-craft/out/`）——
+       * 🔴 用户 2026-09-16 定的：AI 要**显式写进 `.whale-craft/`**，因为那才是文件工具够得着的地方：
+       *    · `read_image .whale-craft/out/x.png` → **当场**在会话里渲染成图片卡片（用户点开那一行就能看）；
+       *    · `present {files:[".whale-craft/out/x.png"]}` → 该轮末尾的文件卡片（可预览/可打开）。
+       *    写到工作区 `out/` 的话，jail 不让 `read_image` 读，用户就只剩"自己开文件"这一条路了。
+       */
+      const outDir = join(memoryRootFor(workspaceOf(exec?.agent)), 'out')
+      const needOut = (name) => (args.out ? inWs(args.out) : join(outDir, name))
 
       switch (action) {
         case 'info':
@@ -1904,7 +1914,7 @@ export function apply(ctx, config) {
             svgPath: args.svgPath ? inWs(args.svgPath) : null,
             width: args.width, height: args.height, scale: args.scale,
           })
-          const out = needOut('out/mc-image.png')
+          const out = needOut('mc-image.png')
           const saved = ImageEngine.save(out, r.png)
           return { rendered: `${r.width}x${r.height}`, ...saved, hint: '想让用户看到就用 present 交付这个文件' }
         }
@@ -1915,7 +1925,7 @@ export function apply(ctx, config) {
             cols: args.cols, cell: args.cell, gap: args.gap,
             labels: args.labels, title: args.title,
           })
-          const out = needOut('out/mc-grid.svg')
+          const out = needOut('mc-grid.svg')
           ImageEngine.save(out, r.svg)
           return {
             svg: `${r.width}x${r.height}`, cells: r.cells, layout: `${r.cols}x${r.rows}`,
@@ -1927,7 +1937,7 @@ export function apply(ctx, config) {
 
         case 'save': {
           if (!args.svg && !args.path) throw new Error('save 需要 svg（文本）或 path（要复制的文件）')
-          const out = needOut('out/mc-image.svg')
+          const out = needOut('mc-image.svg')
           if (args.svg) { const s = ImageEngine.save(out, String(args.svg)); return { ...s, kind: 'svg' } }
           const src = inWs(args.path)
           const { readFileSync } = await import('node:fs')
@@ -2152,7 +2162,14 @@ export function apply(ctx, config) {
         text: `【Whale Craft 行事准则（${cur.source === 'custom' ? 'Master 自定义版' : '默认版'}）】\n\n${cur.text.trim()}`,
       })
     }
-    // ③ 记忆总索引（`.whale-craft/README.md`）：**每个 MC 会话都给一次**——这正是"长期记忆"的入口。
+    // ③ **版本硬提示词**（随插件版本发布、硬编码、不给开关）：紧跟行事准则之后，
+    //    读起来就是"对这个版本的工具成熟度的补充说明"。见 src/version-prompt.mjs。
+    items.push({
+      rel: versionPromptSource(PLUGIN_VERSION),
+      title: versionPromptTitle(PLUGIN_VERSION),
+      text: versionPromptText(PLUGIN_VERSION),
+    })
+    // ④ 记忆总索引（`.whale-craft/README.md`）：**每个 MC 会话都给一次**——这正是"长期记忆"的入口。
     //    内容空（还没记过东西）也照样给：里面写着"怎么记"，第一轮就知道该往哪写。
     {
       const idx = memoryIndexText(memoryFor(cwd)).trim()
@@ -2248,15 +2265,24 @@ export function apply(ctx, config) {
       preset: mcPresetDiag ?? null,
       // **实际投出去的文件名**（投递是唯一通道，这就是判据本身）
       notices: sent,
+      // 版本硬提示词（随版本发布、无开关）：界面上只读展示（正文也带上，方便用户看它到底说了什么）
+      versionPrompt: {
+        version: PLUGIN_VERSION,
+        title: versionPromptTitle(PLUGIN_VERSION),
+        text: versionPromptText(PLUGIN_VERSION),
+        bytes: Buffer.byteLength(versionPromptText(PLUGIN_VERSION)),
+      },
       // 保留 registered/segments 两个键名（前端与 mc_diag 在用）：现在两者同源 —— 都是"真的投了"
       registered: {
         'agents-md': sent.includes('.whale-craft/AGENTS.md'),
         'workspace-agents-md': sent.includes('AGENTS.md'),
+        'version-prompt': sent.some((r) => String(r).startsWith('whale_craft@')),
         'memory-index': sent.includes('.whale-craft/README.md'),
       },
       segments: {
         'agents-md': sent.includes('.whale-craft/AGENTS.md'),
         'workspace-agents-md': sent.includes('AGENTS.md'),
+        'version-prompt': sent.some((r) => String(r).startsWith('whale_craft@')),
         'memory-index': sent.includes('.whale-craft/README.md'),
       },
       notes: [
