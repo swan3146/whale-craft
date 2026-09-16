@@ -1410,12 +1410,34 @@ console.log('\n--- 看门狗 job 结算 ---')
   console.log(`  ${kills.length === 0 ? '✅' : '❌'} 不回头 kill 自己（避免自我递归）：kill 调用 ${kills.length} 次`)
   console.log(`  ${wd.armed === false ? '✅' : '❌'} job 被取消后看门狗也已停`)
 
-  // 反向：AI 主动 disarm → 应该真去 kill 那个 job
+  // 反向：AI 主动 disarm → 应该真去 kill 那个 job **并且把 done 结算掉**
+  // 🔴 2026-09-16 真机 bug：原来只断言了"会去 kill job"，没断言结算 →
+  //    于是"强制关闭后 UI 一直显示还有 1 个后台任务 / 正在停止"漏了过去。
   const wd2 = mk()
   wd2.arm()
+  const hooks2 = hooks
+  let settled2 = null
+  hooks2.done.then((v) => { settled2 = v })
   kills.length = 0
   wd2.disarm('AI 主动关闭')
+  await new Promise((r) => setTimeout(r, 30))
   console.log(`  ${kills.includes('job-1') ? '✅' : '❌'} AI 主动 disarm 会去 kill job（${kills.join(',') || '没调'}）`)
+  console.log(`  ${settled2 ? '✅' : '❌'} 🔴 **主动** disarm 也结算了 done（否则宿主的 job 永远停在 stopping）：status=${settled2?.status}`)
+
+  // 宿主随后回调 cancel()（我们 kill 之后宿主一定会走这一步）→ 幂等，不能报错也不能重复结算
+  let secondSettle = 0
+  hooks2.done.then(() => { secondSettle++ })
+  let cancelThrew = null
+  try { hooks2.cancel('宿主随后取消') } catch (e) { cancelThrew = e }
+  await new Promise((r) => setTimeout(r, 30))
+  console.log(`  ${!cancelThrew ? '✅' : '❌'} 再次进 disarm（已停用状态）不抛错：${cancelThrew ? cancelThrew.message : 'ok'}`)
+  console.log(`  ${kills.length === 1 ? '✅' : '❌'} 已停用后不再重复 kill（kill 调用仍 ${kills.length} 次）`)
+
+  // 极端：没 arm 过就直接 disarm（例如重复点"强制停止"）也不能抛
+  const wd3 = mk()
+  let threw = null
+  try { wd3.disarm('没在跑也要能调') } catch (e) { threw = e }
+  console.log(`  ${!threw ? '✅' : '❌'} 未启动时 disarm 幂等不抛错`)
 }
 
 // ── 结构不变量：会话事件队列只能有一个写入方 ──

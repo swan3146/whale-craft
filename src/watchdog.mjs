@@ -258,7 +258,16 @@ export class Watchdog {
    *   （否则自我递归，而且 job 会卡在 stopping 永远不结算）。
    */
   disarm (reason = '主动关闭', { notify = false, fromJob = false } = {}) {
-    if (!this.armed) return { alreadyOff: true, ...this.status() }
+    // 🔴 **不管谁发起的，done 都必须结算**（2026-09-16 真机 bug：强制关闭后 UI 一直显示
+    //    "还有 1 个后台任务 / 正在停止"）。
+    //    旧代码只有 `fromJob` 那条路结算：我们**主动** disarm 时先 `jobs.kill()` 请宿主停 →
+    //    宿主回调我们的 `cancel()` → 又进这里，可那时 `armed` 已 false →
+    //    在下面的提前 return 里**跳过结算** → `done` 永不 resolve → 宿主的 job 永远停在 'stopping'。
+    //    `#settleJob` 是幂等的（先清 `_resolveJob` 再 resolve），所以两条路都结算也只结算一次。
+    if (!this.armed) {
+      this.#settleJob(reason)
+      return { alreadyOff: true, ...this.status() }
+    }
     const jobId = this.jobId
     this.#teardown(reason)
 
@@ -266,9 +275,8 @@ export class Watchdog {
     if (jobId && !fromJob) {
       try { this.ctx.get('jobs')?.kill(jobId, this.agent, reason) } catch {}
     }
-    // 🔴 必须结算 job 的 done —— 否则 job 永远停在 'stopping'，
-    //    job_list 里挂着不动、job_kill 永远"请求中"（曾经的真 bug：_resolveJob 存了从没调用）
-    if (fromJob) this.#settleJob(reason)
+    // 结算 done —— 否则 job 永远停在 'stopping'，job_list 里挂着不动、job_kill 永远"请求中"
+    this.#settleJob(fromJob ? `被取消（${reason}）` : `已停止（${reason}）`)
 
     if (notify && this.config.notifyOnDisarm) {
       this.#inject(`【看门狗已关闭｜${reason}】你已经不在 Minecraft 里了，事件监听停止。`
