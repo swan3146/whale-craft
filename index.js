@@ -29,7 +29,7 @@ import { homedir } from 'node:os'
 import { McBot, lossless, logLine, libraryInfo } from './src/core.mjs'
 import { Watchdog, WATCH_DEFAULTS } from './src/watchdog.mjs'
 import { MemoryStore } from './src/memory.mjs'
-import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction, patchPersonaInComposition, disableShellInComposition } from './src/config.mjs'
+import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction, patchPersonaInComposition, disableShellInComposition, patchPresentIntoComposition } from './src/config.mjs'
 import { AccountStore, parseAuthlibCard, normalizeServerUrl, dashUuid } from './src/accounts.mjs'
 import { DEFAULT_AGENTS_MD, agentsMdPath, readAgentsMd, writeAgentsMd, resetAgentsMd, isAgentsMdPath } from './src/agentsmd.mjs'
 import { encodePng } from './src/png.mjs'
@@ -319,66 +319,6 @@ function ensureWatchdog (ctx, sess, agent, promptSignal = null) {
 }
 
 
-/* ============================ 文件托管上传（给用户发图/发文件） ============================ */
-
-const MIME_BY_EXT = {
-  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
-  '.webp': 'image/webp', '.svg': 'image/svg+xml', '.avif': 'image/avif', '.bmp': 'image/bmp',
-  '.pdf': 'application/pdf', '.txt': 'text/plain', '.md': 'text/markdown', '.json': 'application/json',
-  '.html': 'text/html', '.csv': 'text/csv', '.zip': 'application/zip',
-}
-
-function mimeFor (name) {
-  const i = String(name).lastIndexOf('.')
-  return i < 0 ? 'application/octet-stream' : (MIME_BY_EXT[String(name).slice(i).toLowerCase()] ?? 'application/octet-stream')
-}
-
-/**
- * 把一段字节上传到 dsh-file-host，拿回**公网可访问的直链**。
- *
- * 为什么要插件自己传：那个玩游戏的会话 preset 里**没有 shell**，跑不了
- * `node dsh-file-host/upload.mjs`。插件跑在宿主进程里，可以走**回环**
- * （`127.0.0.1:<本实例端口>/serve/file-host/api/upload`）绕过外网 WAF。
- *
- * @returns {Promise<{shareId:string, galleryUrl:string, items:Array, markdown:string}>}
- */
-async function uploadToFileHost (ctx, { data, name, title, ttlMs }) {
-  const port = ctx.webServer?.port
-  if (!port) throw new Error('拿不到本实例端口（ctx.webServer.port），无法上传')
-  const base = `http://127.0.0.1:${port}/serve/file-host`
-
-  const form = new FormData()
-  if (title) form.append('title', String(title))
-  if (ttlMs) form.append('ttl', String(ttlMs))
-  // ⚠️ 必须用**拷贝后**的 buffer 构造 Blob：Node 里池化 Buffer（byteOffset≠0、底层 8KB 池）
-  //    走 fetch 的 FormData 序列化会丢文件。这是 dsh-file-host 记过的坑。
-  const copied = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
-  form.append('file', new Blob([copied], { type: mimeFor(name) }), name)
-
-  const res = await fetch(`${base}/api/upload`, { method: 'POST', body: form })
-  const body = await res.json().catch(() => null)
-  if (!res.ok || !body?.ok) {
-    throw new Error(`上传失败（HTTP ${res.status}）：${JSON.stringify(body?.error ?? body).slice(0, 200)}`)
-  }
-  const value = body.value ?? {}
-  const items = (value.items ?? []).map((i) => ({ id: i.id, name: i.name, url: i.url, bytes: i.bytes }))
-  const first = items[0]
-  const isImage = /^image\//.test(mimeFor(name))
-  return {
-    shareId: value.shareId,
-    galleryUrl: value.galleryUrl,
-    expiresAt: value.expiresAt ?? null,
-    items,
-    // 图片给现成的内联语法；文件只能给可点链接（聊天里没有文件卡片语法）
-    markdown: first ? (isImage ? `![${first.name ?? name}](${first.url})` : `[${first.name ?? name}](${first.url})`) : null,
-    note: first
-      ? (isImage
-          ? '把 markdown 那串**原样写进你的回复**，图片就会在对话里内联显示。'
-          : '这是文件（非图片），聊天里没有文件卡片语法，只能给可点链接。')
-      : '没有返回 items，可能服务端异常。',
-  }
-}
-
 /* ============================ 插件主体 ============================ */
 
 export function apply(ctx, config) {
@@ -451,7 +391,7 @@ export function apply(ctx, config) {
   const pluginConfig = new PluginConfig(stateDir)
   /** 无会话上下文时用的兜底记忆库（`capabilities` / 扩展 api / 全局注入用） */
   const memory = memoryFor(null)
-  /** 这个会话的工作区根（mc_kit_share / mc_kit_image / 地图落盘用）；拿不到就给个兜底目录 */
+  /** 这个会话的工作区根（mc_kit_image / 地图落盘用）；拿不到就给个兜底目录 */
   const workspaceRootFor = (agent) => workspaceOf(agent) ?? join(stateDir, 'workspace')
 
   /**
@@ -1078,6 +1018,19 @@ export function apply(ctx, config) {
   const MC_FILE_TOOLS = ['read', 'write', 'edit', 'glob', 'grep', 'read_image']
 
   /**
+   * MC 模式白名单里的**交付工具**：`present`（宿主 `@deepseek-ai/dsh-tool-present`）。
+   *
+   * 🔴 用户 2026-09-16 定的：删掉 `mc_kit_share`（它其实是在调宿主另装的 dsh-file-host，插件本身
+   *    没有文件服务器），改用 DSH 自带的交付机制 —— `present` 会往会话里写 `deliverables/presented`，
+   *    Web 端 `ui-deliverables` 在该轮末尾渲染**产出文件卡片**（可预览、可打开），正文里写成行内代码的
+   *    文件名也会变成可点链接。也就是说："让本地用户看到文件"这件事，宿主本来就提供。
+   *    它按 preset 挂载（随附 Web 的 standard/ptc/cordis 有，minimal 没有）—— 我们负责
+   *    ①把 `tool-present` 组补进 MC 模式的 preset ②把它放进白名单。
+   * 交付路径由 guard 限在**本会话工作区**内（`.whale-craft/` 与 `out/` 都在里面）。
+   */
+  const MC_PRESENT_TOOL = 'present'
+
+  /**
    * 从一次工具调用里取"要碰的路径"：是文件工具才返回（不是 → null；是但没给路径 → 空串）。
    * 路径参数名按宿主用 `path`，也兼容 harness 的 `file_path`；glob/grep 的目录参数同样是 `path`。
    */
@@ -1088,6 +1041,14 @@ export function apply(ctx, config) {
     const v = args.path ?? args.file_path ?? args.dir ?? args.directory
     if (v === undefined || v === null) return ''
     return String(v)
+  }
+
+  /** `present` 那次调用里要交付的文件路径列表（不是 present → null） */
+  const presentPaths = (exec) => {
+    if (String(exec?.name ?? '') !== MC_PRESENT_TOOL) return null
+    const files = exec?.arguments?.files
+    if (!Array.isArray(files)) return []
+    return files.map((f) => String(f?.path ?? '')).filter(Boolean)
   }
 
   /** 我们自己注册的工具名（MC 模式做工具白名单时要带上它们，否则会被 restrict 一并滤掉） */
@@ -1484,7 +1445,7 @@ export function apply(ctx, config) {
           note: '凭据只存本机 DSH 凭据库；AI 只能看到账户基本信息（innerID/ID/名字/UUID/服务器），看不到密码或 token。',
         },
         tools: {
-          namespaces: { mc_: '游戏内', mc_kit_: '游戏外辅助（记忆/发文件/画图）', mc_admin_: '管理（MC 模式看不见也调不动）' },
+          namespaces: { mc_: '游戏内', mc_kit_: '游戏外辅助（记忆/画图/交付）', mc_admin_: '管理（MC 模式看不见也调不动）' },
           count: ourToolNames.length,
           names: [...ourToolNames],
         },
@@ -1589,7 +1550,7 @@ export function apply(ctx, config) {
     name: 'mc_map',
     description: '看周围地形。format="chars"（默认）返回**字符地形图**（无视觉也能读：'
       + '@ 是我 · ~ 水 · . 沙 · " 草木 · T 木构 · : 石/建筑 · _ 土/农田 · # 白 · ? 未加载）；'
-      + 'format="image" 额外生成**俯视图像**（**模型有视觉时直接能看**，也能在回复里发给用户）；'
+      + 'format="image" 额外生成**俯视图像**（**模型有视觉时直接能看**，也会落盘到工作区，可再用 present 交付）；'
       + 'format="both" 两者都给。字符图省 token 且坐标精确；形状/外观问题用图像。',
     parameters: {
       radius: { type: 'number', description: '半径（默认 32，上限 96）' },
@@ -1598,8 +1559,6 @@ export function apply(ctx, config) {
       yBottom: { type: 'number', description: '向下搜索深度（默认 -24）' },
       format: { type: 'string', description: 'chars（默认）/ image / both' },
       scale: { type: 'number', description: '图像每格放大倍数（默认 4，1–16）' },
-      share: { type: 'boolean', description: 'true=生成图像后**直接上传**，返回可直接发给用户的内联 markdown' },
-      shareTitle: { type: 'string', description: 'share 时的标题（默认「Minecraft 地图」）' },
     },
     output: {
       schema: { type: 'object', properties: {}, additionalProperties: true },
@@ -1644,7 +1603,7 @@ export function apply(ctx, config) {
         } else {
           out.image.attachmentError = '宿主没有 attachments 服务'
         }
-        // ② 顺手落盘（落到**本会话工作区**的 out/ 或兜底目录），便于发给用户 / 用 read_image 再看
+        // ② 顺手落盘（落到**本会话工作区**的 out/），配合 `present` 交付给用户 / 用 read_image 再看
         try {
           const { writeFileSync, mkdirSync } = await import('node:fs')
           const dir = join(workspaceRootFor(exec?.agent), 'out')
@@ -1652,17 +1611,7 @@ export function apply(ctx, config) {
           const file = `${dir}mc-map-${Date.now()}.png`
           writeFileSync(file, png)
           out.image.file = file
-          // ③ share:true 时**直接上传**，把现成的内联 markdown 给出去——
-          //    免得 AI 还要多调一次 mc_kit_share（它没有 shell，不会自己上传）
-          if (args.share) {
-            try {
-              const shared = await uploadToFileHost(ctx, {
-                data: png, name: 'mc-map.png', title: args.shareTitle ?? 'Minecraft 地图',
-              })
-              out.image.share = shared
-              out.image.markdown = shared.markdown
-            } catch (e) { out.image.shareError = e.message }
-          }
+          out.image.hint = '想让用户看到这张图：用 present {files:[{path:"out/mc-map-….png"}]} 交付它（本地用户点开就能看）'
         } catch (e) { out.image.fileError = e.message }
       }
       return out
@@ -1870,41 +1819,16 @@ export function apply(ctx, config) {
     },
   }))
 
-  /* ── 给用户发图片/文件（插件自己走回环上传，会话不需要 shell）── */
-
-  ctx.tools.register(asTool({
-    name: 'mc_kit_share',
-    description: '把工作区里的一个文件上传到托管服务，得到**能直接发给用户的公网链接**。\n'
-      + '· 图片（png/jpg/svg/webp…）→ 返回值里的 `markdown` 字段是现成的内联语法，'
-      + '把它**原样写进你的回复**，图片就会在对话里内联显示（这是用户要的效果）。\n'
-      + '· 非图片文件 → 没有卡片语法，只能给可点链接。\n'
-      + '· 默认 24h 过期自动清理。path 必须在工作区内。',
-    parameters: {
-      path: { type: 'string', required: true, description: '要上传的文件路径（工作区内；绝对或相对工作区）' },
-      title: { type: 'string', description: '这一批的标题（展示用）' },
-      ttlMs: { type: 'number', description: '有效期毫秒（默认服务端 24h）' },
-    },
-    output: text(),
-    timeoutMs: 90_000,
-    async execute(args, exec) {
-      // 路径按**本会话工作区**解析（插件装在哪与此无关）
-      const raw = String(args.path ?? '').trim()
-      if (!raw) throw new Error('path 不能为空')
-      const abs = insideWorkspace(raw, exec?.agent)
-      const { readFileSync, statSync } = await import('node:fs')
-      if (!existsSync(abs)) throw new Error(`文件不存在：${abs}`)
-      const st = statSync(abs)
-      if (!st.isFile()) throw new Error(`不是文件：${abs}`)
-
-      const data = readFileSync(abs)
-      const name = abs.split(/[\\/]/).pop()
-      return await uploadToFileHost(ctx, { data, name, title: args.title, ttlMs: args.ttlMs })
-    },
-  }))
-
   /* ── 图像：SVG 为编辑语言（写/引图/光栅化/保存）──
    * 用户的思路：SVG 是文本，AI 本来就会写——拼网格/画框/加文字（含中文）都在 SVG 里表达，
    * 我们只补它做不到的两件事：**把外部图片塞进 SVG**（embed）和 **SVG→PNG**（render）。
+   *
+   * 🔴 2026-09-16：**删掉了 mc_kit_share**（以及 mc_map 的 share 参数）。原因：它不是"我们实现的
+   *    上传"，而是去调宿主实例里另装的 `dsh-file-host`（`/serve/file-host/api/upload`）——
+   *    插件本身没有文件服务器，开源出去别人也没有那个条目，等于提供一个"看着能用、实际 404"的工具。
+   *    要"让本地用户看到文件"，DSH 自带的正路是 **`present`**（`deliverables/presented` → Web 的
+   *    产出文件卡片：可预览、可打开；正文里写行内代码的文件名也会变成可点链接）。
+   *    所以现在只负责**把图落到工作区**，交付交给 `present`。
    * ------------------------------------------------------------------------ */
 
   /** 把用户给的路径解析到**这个会话的工作区**内（不许越界） */
@@ -1928,7 +1852,7 @@ export function apply(ctx, config) {
       + '· render  SVG → PNG（可给 width/height/scale；svg 文本或 svgPath 二选一）\n'
       + '· grid    把多张图按网格拼成**可继续编辑的 SVG 文本**（省掉重复写 N 个 <image> 和算坐标）\n'
       + '· save    把 SVG 文本或 PNG 字节落盘\n'
-      + '产出的 PNG 可以直接 mc_kit_share 发给用户。',
+      + '产出的 PNG 落在**本会话工作区**里；想让用户看到，就用 `present {files:[{path:"out/xxx.png"}]}` 交付它。',
     parameters: {
       action: { type: 'string', description: 'info / embed / render / grid / save' },
       path: { type: 'string', description: '输入文件（info/embed 用）' },
@@ -1982,7 +1906,7 @@ export function apply(ctx, config) {
           })
           const out = needOut('out/mc-image.png')
           const saved = ImageEngine.save(out, r.png)
-          return { rendered: `${r.width}x${r.height}`, ...saved, hint: '要发给用户就 mc_kit_share 这个文件' }
+          return { rendered: `${r.width}x${r.height}`, ...saved, hint: '想让用户看到就用 present 交付这个文件' }
         }
 
         case 'grid': {
@@ -2416,10 +2340,11 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 复制完官方 preset 之后，把**我们自己的两处**覆盖上去：
+   * 复制完官方 preset 之后，把**我们自己的三处**覆盖上去：
    *   ① persona（官方那句 "You are a helpful software engineer assistant." + `complete: true` 都不要）
    *   ② 关掉那个持久 shell（MC 模式的指导写着"本模式没有 shell"，两边必须一致）
-   * @returns {boolean} 是否改成功（false = 结构不认识 → 保持原样，日志里说明）
+   *   ③ 补上 `present`（显式文件交付）组 —— 删掉 mc_kit_share 之后，"让用户看到文件"走宿主自带机制
+   * @returns {boolean} 是否改动过（false = 结构不认识 / 无需改动，日志里说明）
    */
   const patchMcPresetComposition = (svc, id) => {
     try {
@@ -2430,11 +2355,52 @@ export function apply(ctx, config) {
       const cur = readFileSync(p, 'utf8')
       const withPersona = patchPersonaInComposition(cur, MC_PERSONA_TEXT)
       if (withPersona === null) { logLine('MC 模式 preset：composition 里没找到 persona 行 → 保持原样（人设还是官方那句）'); return false }
-      const finalText = disableShellInComposition(withPersona) ?? withPersona
+      let finalText = disableShellInComposition(withPersona) ?? withPersona
+      if (presentToolAvailable()) finalText = patchPresentIntoComposition(finalText) ?? finalText
       if (finalText === cur) return false
       writeFileSync(p, finalText, 'utf8')
       return true
-    } catch (e) { logLine(`改 preset 的 persona/shell 失败（不影响挂载）：${e.message}`); return false }
+    } catch (e) { logLine(`改 preset 的 persona/shell/present 失败（不影响挂载）：${e.message}`); return false }
+  }
+
+  /**
+   * 这份部署里**有没有 `@deepseek-ai/dsh-tool-present`**？
+   *
+   * 为什么要探一下：`present` 是按 preset 挂载的，而"这个包在不在"取决于 DSH 版本与随附 bundle。
+   * 给一份**装不到这个包**的 preset 加组 = 让那份 preset 直接挂不起来（MC 模式整个坏掉）——
+   * 比"少一个交付工具"糟得多。判据很直接：**随附的 preset 里有没有人引用它**
+   * （随附 Web 的 standard/ptc/cordis 有，minimal 没有）。
+   */
+  let presentAvailable = null
+  const presentToolAvailable = () => {
+    if (presentAvailable !== null) return presentAvailable
+    presentAvailable = false
+    try {
+      const svc = agentPresetsSvc
+      for (const row of svc?.list?.() ?? []) {
+        const text = compositionOf(row)
+        if (text && /@deepseek-ai\/dsh-tool-present/.test(text)) { presentAvailable = true; break }
+      }
+    } catch { /* 读不到就当没有 */ }
+    if (!presentAvailable) logLine('没在随附 preset 里看到 @deepseek-ai/dsh-tool-present → 不给 MC 模式的 preset 加 present 组（免得那份 preset 挂不起来）')
+    return presentAvailable
+  }
+
+  /** 给**已存在**的 preset 补 present 组（用 `leave`/`meta` 分支时用；不动别的行） */
+  const ensurePresentGroupInPreset = (svc, id) => {
+    try {
+      if (!presentToolAvailable()) return false
+      const dir = mcPresetDir(svc, id)
+      if (!dir) return false
+      const p = join(dir, 'agent.cordis.yml')
+      if (!existsSync(p)) return false
+      const cur = readFileSync(p, 'utf8')
+      const next = patchPresentIntoComposition(cur)
+      if (next === null) return false
+      writeFileSync(p, next, 'utf8')
+      logLine(`已给 MC 模式 preset（${id}）补上 present 组（显式文件交付）`)
+      return true
+    } catch (e) { logLine(`补 present 组失败（不影响挂载）：${e.message}`); return false }
   }
 
   /** preset 目录（用户可写根下那个），拿不到就 null */
@@ -2563,6 +2529,9 @@ export function apply(ctx, config) {
         })
         if (plan.action === 'leave') {
           logLine(`MC 模式 preset「${existingId}」检查通过，不动它（${plan.reason}）`)
+          // 只有一件例外：**补 present 组**（显式文件交付）—— 删掉 mc_kit_share 之后，这是
+          // "让本地用户看到产出文件"的唯一正路；只做"没有才加"，不动别的行。
+          ensurePresentGroupInPreset(svc, existingId)
           return
         }
         if (plan.action === 'meta') {
@@ -2588,6 +2557,7 @@ export function apply(ctx, config) {
               composition: compositionOf(rows.get(existingId)) ?? composition,
             })
           }
+          ensurePresentGroupInPreset(svc, existingId)
           return
         }
         // plan.action === 'rebuild'：先备份整个目录，再用官方接口重新复制一遍
@@ -2726,6 +2696,7 @@ export function apply(ctx, config) {
         ...ourToolNames.filter((n) => !n.startsWith('mc_admin_')),
         ...(hideAdminTools ? [] : adminNames),
         ...MC_FILE_TOOLS,
+        MC_PRESENT_TOOL,
         ...allowOtherTools,
       ]
       // 🔴 `tools.restrict()` 对**不认识的工具名是抛错**的（宿主 index.ts:1078 拿 restrictableNames 校验）。
@@ -2795,6 +2766,20 @@ export function apply(ctx, config) {
         const prefix = root.endsWith(sep) ? root : root + sep
         if (abs !== root && !abs.startsWith(prefix)) {
           return `MC 模式只能在记忆文件夹（${root}）里读写文件；这个路径在外面：${rel}`
+        }
+      }
+
+      // ④ `present`：**只能交付本会话工作区内的文件**（`.whale-craft/` 与 `out/` 都在里面）。
+      //    宿主自己也要求"文件已存在且在工作区里"，这里只是把边界说清、给可读的拒绝理由。
+      const delivering = presentPaths(exec)
+      if (delivering !== null) {
+        const wsRoot = workspaceRootFor(exec?.agent)
+        const prefix = wsRoot.endsWith(sep) ? wsRoot : wsRoot + sep
+        for (const rel of delivering) {
+          const abs = resolve(wsRoot, rel)
+          if (abs !== wsRoot && !abs.startsWith(prefix)) {
+            return `present 只能交付本会话工作区（${wsRoot}）里的文件；这个路径在外面：${rel}`
+          }
         }
       }
       return undefined

@@ -134,12 +134,12 @@ dsh plugin --profile web add whale_craft
 
 ---
 
-## 工具（28 个，三层命名空间）
+## 工具（27 个，三层命名空间）
 
 | 层 | 数量 | 工具 |
 | --- | --- | --- |
 | **游戏内** `mc_*` | 24 | `mc_status` `mc_connect` `mc_lan` `mc_accounts` `mc_capabilities` `mc_disconnect` `mc_stop` `mc_config` `mc_sessions` `mc_diag` `mc_say` `mc_events` `mc_watch` `mc_map` `mc_scan` `mc_entities` `mc_inventory` `mc_move` `mc_act` `mc_dig` `mc_build` `mc_give` `mc_sequence` `mc_command` |
-| **游戏外辅助** `mc_kit_*` | 3 | `mc_kit_memory`（记忆树）· `mc_kit_share`（传文件拿链接）· `mc_kit_image`（SVG→PNG / 引图 / 拼网格） |
+| **游戏外辅助** `mc_kit_*` | 2 | `mc_kit_memory`（记忆树：按服/主题定位、`key` 覆盖、搜索、删除、把文件与图片**存进记忆**）· `mc_kit_image`（SVG→PNG / 引图 / 拼网格） |
 | **管理** `mc_admin_*` | 1 | `mc_admin_config`（读写全局配置；**MC 模式看不见、也调不动**） |
 
 几个设计点：
@@ -147,7 +147,8 @@ dsh plugin --profile web add whale_craft
 - `mc_give` 走**协议级** `set_creative_slot`（创造模式即可，**不需要 OP**）；
 - `mc_sequence` 给"连串动作"（最多 64 步），比让模型写脚本稳；
 - `mc_command` 是**最后手段**（要 OP，且受白名单限制）；
-- `mc_map` 的 `format:"image"` 会渲染一张真地形图并作为**图片附件**回给模型；
+- `mc_map` 的 `format:"image"` 会渲染一张真地形图并作为**图片附件**回给模型（同时落盘到工作区 `out/`）；
+  想让**用户**看到它，用 DSH 自带的 **`present`** 交付（见下条）——本插件不提供任何上传/图床工具。
 - `mc_lan` 找**局域网房间**：听 `224.0.2.60:4445` 的"对局域网开放"广播，再扫本机所在网段
   （自己手写的 STATUS ping，拿版本 / MOTD / 人数）。🔴 **只允许内网网段**，公网直接拒；
   主机数 / 端口数 / 并发 / 超时全有上限——它是"看看谁开了房间"，不是扫描器。
@@ -162,18 +163,24 @@ dsh plugin --profile web add whale_craft
 
 1. **工具白名单**（`tools.restrict({allow})`，无条件生效）：只看得见
    `mc_*` / `mc_kit_*` 自己的工具 + **文件工具**（`read` / `write` / `edit` / `glob` / `grep` / `read_image`）
-   + 配置里额外允许的其它工具。宿主的 `pwsh` / `subagent` / `workflow` / `serve_*` 之类**一个都看不见**
+   + **`present`**（显式文件交付，见下条）+ 配置里额外允许的其它工具。
+   宿主的 `pwsh` / `subagent` / `workflow` / `serve_*` 之类**一个都看不见**
    （早期版本用的是"只 deny 自家管理工具"的黑名单，等于没隔离——已修）。
 2. **文件工具被关进记忆文件夹**：`read`/`write`/`edit`/`glob`/`grep`/`read_image` 的路径由全局 `guard`
    硬限在 `<工作区>/.whale-craft/` 内（不给路径 = 扫整个工作区 = 拒绝）。
-3. **`mc_admin_*` 看不见也调不动**（白名单 + `guard` 硬拒）。
-4. 收到 2–3 条**插件提示行**（在对话里看得见、可折叠，**不是**用户发言）：
+3. **交付产出文件走 DSH 自带的 `present`**：它会把文件声明成"本轮交付"，Web 端在轮末渲染**文件卡片**
+   （可预览、可打开），正文里写成行内代码的文件名也会变成可点链接。路径由 `guard` 限在**本会话工作区**内
+   （`out/` 与 `.whale-craft/` 都在里面）。插件**不提供**任何上传/图床工具，也不依赖任何外部文件服务；
+   如果这份 DSH 里没有 `@deepseek-ai/dsh-tool-present`（随附 preset 里没人引用它），插件**不会**往 preset 里加它。
+4. **`mc_admin_*` 看不见也调不动**（白名单 + `guard` 硬拒）。
+5. 收到 2–3 条**插件提示行**（在对话里看得见、可折叠，**不是**用户发言）：
    `.whale-craft/AGENTS.md`（行事准则，可在「MC设置 → 提示词」里改）、`.whale-craft/README.md`（记忆总索引）、
    以及可选的（默认关）工作区 `AGENTS.md`。
-5. 系统提示词 = preset 自己的 persona（宿主按 preset 自动注入，**插件不插手**）。
+6. 系统提示词 = preset 自己的 persona（宿主按 preset 自动注入，**插件不插手**）。
 
 > 插件本身**不带 preset 目录**（`~/.dsh/.agent-presets/<名字>/` 需要你自己放一份 persona）。
-> 只要 preset id 落在 `mcModePresets` 里，隔离就生效；缺失时插件会照官方 `copy()` 建一个「MC模式」并写好 persona。
+> 只要 preset id 落在 `mcModePresets` 里，隔离就生效；缺失时插件会照官方 `copy()` 建一个「MC模式」并写好 persona，
+> 顺带补上 `present` 组（官方 `minimal` 没有它）。
 
 ---
 

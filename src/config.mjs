@@ -138,9 +138,10 @@ export function isCopiedPresetDescription (desc, shippedDescriptions) {
  * 历史：1 = 复制官方 minimal；**2 = 顺手把 persona 换成我们自己的 + 关掉那个 shell**
  *      （复制 minimal 会把"极简模式"的 persona（You are a helpful software engineer assistant.）
  *      和它的持久 shell 一起带过来，而 MC 模式的指导里明写"本模式没有 shell" —— 自相矛盾）；
- *      **3 = persona 换成用户定稿的那一句**（"你在一台真实的 Minecraft Java 版服务器里扮演一名玩家…"）。
+ *      **3 = persona 换成用户定稿的那一句**（"你在一台真实的 Minecraft Java 版服务器里扮演一名玩家…"）；
+ *      **4 = 补上 `present`（显式文件交付）组** —— 删掉 mc_kit_share 之后，"让用户看到文件"改走宿主自带机制。
  */
-export const MC_PRESET_SPEC = 3
+export const MC_PRESET_SPEC = 4
 
 /**
  * 把 composition 里的 **persona 行**换成我们自己的（纯函数，好测）。
@@ -194,6 +195,30 @@ export function disableShellInComposition (text) {
   for (let i = start; i < end; i++) if (/^\s+disabled:/.test(lines[i])) return lines.join('\n')   // 已经有了
   lines.splice(start + 1, 0, '  disabled: true')
   return lines.join('\n')
+}
+
+/**
+ * 给 MC 模式的 preset 补上 **`present` 交付工具**那一组（纯函数，好测）。
+ *
+ * 🔴 2026-09-16 用户定的：删掉 `mc_kit_share`（它其实在调宿主另装的 dsh-file-host，
+ *    插件本身没有文件服务器），改用 DSH 自带的交付机制 —— `present` 会写 `deliverables/presented`，
+ *    Web 端在该轮末尾渲染**产出文件卡片**（可预览、可打开）。
+ *    但它是**按 preset 挂载**的：随附 Web 的 `standard`/`ptc`/`cordis` 有，`minimal` 没有
+ *    （官方明说 minimal 保持固定的双工具配置），而我们自动建的那份就是复制 `minimal` 来的。
+ *
+ * 只做"没有才加"，不动别的行；已经在（不管是哪来的）就返回 null。
+ * @param {string} text composition 文本（`agent.cordis.yml`）
+ * @returns {string|null} 改好的文本；无需改动 → null
+ */
+export function patchPresentIntoComposition (text) {
+  const src = String(text ?? '')
+  if (/@deepseek-ai\/dsh-tool-present/.test(src)) return null
+  const body = src.endsWith('\n') ? src : src + '\n'
+  return body
+    + '\n# ── 显式文件交付（whale_craft 2026-09-16 加）：present 让 AI 把产出文件交给用户 ──\n'
+    + '# Web 端会把它渲染成该轮末尾的文件卡片（可预览、可打开）。\n'
+    + '\n- id: present\n'
+    + "  name: '@deepseek-ai/dsh-tool-present'\n"
 }
 
 /**

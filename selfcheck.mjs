@@ -212,6 +212,23 @@ for (const [n, d] of tools) {
   console.log(`  ${n}${params.length ? ' (' + params.join(', ') + ')' : ''} —— ${String(d.description ?? '').slice(0, 50)}`)
 }
 
+// ── 工具面：mc_kit_share 已移除 / present 已接上（用户 2026-09-16）──
+console.log('\n--- 工具面（share 移除 / present 接入）---')
+{
+  const { readFileSync } = await import('node:fs')
+  const idx = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+  console.log(`  ${!tools.has('mc_kit_share') ? '✅' : '❌'} 🔴 mc_kit_share 已移除（它只是在调宿主**另装**的 dsh-file-host，插件本身没有文件服务器）`)
+  console.log(`  ${tools.size === 27 ? '✅' : '❌'} 工具数 27（实际 ${tools.size}）：mc_* 24 + mc_kit_* 2 + mc_admin_* 1`)
+  // 只看**代码**，不看注释：注释里留着"为什么删"的说明（那是要留的）
+  const codeOnly = idx.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
+  console.log(`  ${!/uploadToFileHost|dsh-file-host|\/serve\/file-host|mc_kit_share/.test(codeOnly) ? '✅' : '❌'} 源码里没有上传/文件服务器残留（注释里保留"为什么删"的说明）`)
+  console.log(`  ${tools.has('mc_kit_image') && tools.has('mc_kit_memory') ? '✅' : '❌'} mc_kit_image / mc_kit_memory 仍在（一个渲染 PNG、一个记忆语义层）`)
+  console.log(`  ${/MC_PRESENT_TOOL = 'present'/.test(idx) && /^\s+MC_PRESENT_TOOL,$/m.test(idx) ? '✅' : '❌'} present 已进 MC 模式白名单`)
+  console.log(`  ${/patchPresentIntoComposition/.test(idx) && /if \(presentToolAvailable\(\)\) finalText = patchPresentIntoComposition/.test(idx) ? '✅' : '❌'} 新建/重建 preset 时会补 present 组`)
+  console.log(`  ${/const ensurePresentGroupInPreset/.test(idx) && /ensurePresentGroupInPreset\(svc, existingId\)/.test(idx) ? '✅' : '❌'} 🔴 **已存在的** preset（含本机手写那份）也会被补上 present 组`)
+  console.log(`  ${/没在随附 preset 里看到 @deepseek-ai\/dsh-tool-present/.test(idx) ? '✅' : '❌'} 加组之前先探"这个部署里有没有那个包"（免得把 preset 弄挂）`)
+}
+
 /** 造一个假的 exec（带会话身份），工具靠它路由到各自的实例 */
 const execAs = (id) => ({ agent: { id } })
 
@@ -896,6 +913,12 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     console.log(`  ${C.disableShellInComposition('# 没有 shell 组\n') === null ? '✅' : '❌'} 没有 shell 组 → 返回 null`)
     const twice = C.disableShellInComposition(C.disableShellInComposition('- id: persistent-shell\n  group: true\n', '') ?? '')
     console.log(`  ${(twice.match(/disabled: true/g) ?? []).length === 1 ? '✅' : '❌'} 关 shell 是幂等的（不会写两遍 disabled）`)
+    // present 组（2026-09-16：删掉 mc_kit_share 之后，"让用户看到文件"改走宿主自带交付）
+    const added = C.patchPresentIntoComposition('- id: tool-fs\n  name: x\n')
+    console.log(`  ${added && /- id: present\n  name: '@deepseek-ai\/dsh-tool-present'\n$/.test(added) ? '✅' : '❌'} 补 present 组：追加在 composition 末尾（组写法与随附 preset 一致）`)
+    console.log(`  ${added && C.patchPresentIntoComposition(added) === null ? '✅' : '❌'} 已经有 present 组 → 返回 null（幂等，不会加两遍）`)
+    console.log(`  ${C.patchPresentIntoComposition("- id: present\n  name: '@deepseek-ai/dsh-tool-present'\n") === null ? '✅' : '❌'} 随附 preset 那种写法也认得（不重复加）`)
+    console.log(`  ${C.MC_PRESET_SPEC === 4 ? '✅' : '❌'} MC_PRESET_SPEC=4（自建 preset 下次启动会重建 → 带上 present 组）`)
   }
   // 🔴 **已经建好的**那份也要能修（用户那台测试机上就是旧版建出来的）：
   //    只在"简介恰好等于某个官方 preset 的简介"（明显是复制残留）时才动，用户自己写的不碰。
@@ -1054,6 +1077,15 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   const plainExec3 = { name: 'pwsh', arguments: { command: 'whoami' }, agent: { id: 'sess-MC', ctx: mcCtxObj } }
   const plainRead = guards.every((g) => { try { return g(plainExec3) === undefined } catch { return true } })
   console.log(`  ${plainRead ? '✅' : '❌'} guard 不拦 pwsh（它靠白名单**看不见**，不是靠 guard）`)
+  // `present`（显式文件交付）：允许交付**工作区内**的文件（out/ 与 .whale-craft/ 都在里面），外面一律拒
+  const presentIn = callGuard({ name: 'present', arguments: { files: [{ path: 'out/map.png', description: '地图' }] }, agent: { id: 'sess-MC', ctx: mcCtxObj } })
+  console.log(`  ${presentIn === undefined ? '✅' : '❌'} present 交付工作区内的文件放行（out/x.png）`)
+  const presentInMem = callGuard({ name: 'present', arguments: { files: [{ path: '.whale-craft/README.md' }] }, agent: { id: 'sess-MC', ctx: mcCtxObj } })
+  console.log(`  ${presentInMem === undefined ? '✅' : '❌'} present 交付记忆夹里的文件也放行`)
+  const presentOut = callGuard({ name: 'present', arguments: { files: [{ path: 'E:\\<dsh-checkout>\\x.png' }] }, agent: { id: 'sess-MC', ctx: mcCtxObj } })
+  console.log(`  ${presentOut ? '✅' : '❌'} present 交付工作区外的文件被拒：${String(presentOut).slice(0, 34)}`)
+  const presentNorm = guards.every((g) => { try { return g({ name: 'present', arguments: { files: [{ path: 'E:\\x\\y.png' }] }, agent: { id: 'sess-P', ctx: plainCtxObj } }) === undefined } catch { return true } })
+  console.log(`  ${presentNorm ? '✅' : '❌'} 普通会话的 present 不受影响（隔离只管 MC 模式）`)
   const normRead = guards.every((g) => { try { return g({ name: 'read', arguments: { path: 'E:\\x\\README.md' }, agent: { id: 'sess-P', ctx: plainCtxObj } }) === undefined } catch { return true } })
   console.log(`  ${normRead ? '✅' : '❌'} 普通会话读工作区文件不受影响（隔离只管 MC 模式）`)
 
@@ -1068,6 +1100,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   const KNOWN_TOOLS = new Set([
     ...tools.keys(),
     'read', 'write', 'edit', 'read_image',
+    'present',
     'pwsh', 'subagent', 'workflow', 'web_search', 'todo_write', 'ask_user_question',
     'serve_deploy', 'serve_list', 'goal_write',
   ])
@@ -1129,6 +1162,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   console.log(`  ${allowList && allowList.includes('mc_status') && allowList.includes('mc_kit_memory') && allowList.includes('mc_build') ? '✅' : '❌'} 自己的工具还在（mc_status / mc_kit_memory / mc_build）`)
   console.log(`  ${allowList && allowList.every((n) => !n.startsWith('mc_admin_')) ? '✅' : '❌'} 管理工具不在白名单里（hideAdminTools 默认 true）`)
   console.log(`  ${allowList && ['read', 'write', 'edit', 'read_image'].every((n) => allowList.includes(n)) ? '✅' : '❌'} 在场的文件工具在白名单里（路径由 guard 限在 .whale-craft/）`)
+  console.log(`  ${allowList && allowList.includes('present') ? '✅' : '❌'} present 也在白名单里（显式文件交付：卡片 + 可预览/打开）`)
   // 🔴 宿主对不认识的名字**抛错**；要是直接放弃，隔离就等于没做（pwsh 又回来了）
   console.log(`  ${allowList && !allowList.includes('glob') && !allowList.includes('grep') ? '✅' : '❌'} 🔴 不在场的工具（这台 preset 没挂 tool-fs-search ⇒ glob/grep）被过滤掉，**不是**整次白名单作废`)
   console.log(`  ${allowList && allowList.length > 5 ? '✅' : '❌'} 过滤后白名单仍然生效（${allowList?.length ?? 0} 个）`)
