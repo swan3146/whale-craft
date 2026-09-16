@@ -687,8 +687,16 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const [pendingDelete, setPendingDelete] = React.useState(false)
       const rowBusy = typeof busyKey === 'string' && busyKey.startsWith('row:' + acc.innerID + ':')
       const offline = acc.type === 'offline'
-      // 第三方：跟一行小灰字（服务器名；没有名字就显示 url）——不然多个皮肤站号不好分
-      const sub = offline ? '' : (acc.server?.name || acc.server?.url || '')
+      // 第三方的小灰字 = **「输入的账号（服务器名）」**。
+      // 🔴 用户 2026-09-16：主文本是**游戏 ID**（第三方登录成功后回写的档案名），
+      //    它跟你输入的账号通常不是一回事（输入的是邮箱，游戏里叫角色名）→ 两个都得看得见。
+      //    两者相同时（登录名本身就是角色名）不重复写，只留服务器名。
+      //    服务器名没了就退化成 url；都没有就只剩账号。
+      const srvLabel = acc.server?.name || acc.server?.url || ''
+      const login = String(acc.login ?? '').trim()
+      const sub = offline ? '' : (login && login !== acc.name
+        ? (srvLabel ? `${login}（${srvLabel}）` : login)
+        : srvLabel)
 
       return h('div', { 'data-wc-acct': '', 'data-wc-account': acc.innerID },
         h(TypeChip, { type: acc.type }),

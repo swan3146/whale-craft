@@ -884,6 +884,8 @@ console.log('\n--- MC账户：账户库 / 凭据隔离 / 工具 ---')
   const viewJson = JSON.stringify(store.list())
   const view2 = store.list().find((a) => a.innerID === acc2.innerID)
   console.log(`  ${view2?.server?.url === 'https://auth.example.com/yggdrasil' && view2?.hasCredential ? '✅' : '❌'} 皮肤站账户带服务器信息 + hasCredential 标记`)
+  // 🔴 列表小灰字要显示"输入的账号"→ 视图必须把它带给 UI（离线/正版没有 login，为 null）
+  console.log(`  ${view2?.login === 'owner@example.com' && store.list().find((a) => a.type === 'offline')?.login === null ? '✅' : '❌'} 视图带 login（皮肤站=输入的账号，离线=None）`)
   const delUsed = await Promise.resolve().then(() => store.removeAuthServer(srv.id)).catch((e) => e.message)
   console.log(`  ${/还有账户在用/.test(String(delUsed)) ? '✅' : '❌'} 被账户占用的服务器不许删：${String(delUsed).slice(0, 34)}`)
   console.log(`  ${!/p@ssw0rd|tok-1|ct-1/.test(viewJson) ? '✅' : '❌'} 🔴 公开视图里逐字查过：**没有**密码/token`)
@@ -1460,6 +1462,9 @@ console.log('\n--- 客户端 bundle（client.js 静态检查）---')
     ['拖卡片后自动选中并填进输入框', /onAddCard\(card\)[\s\S]{0,160}setUrl\(srv\.url\)/.test(code)],
     ['已缓存服务器 = 可点填充 + × 删除的标签', /data-wc-tagpick/.test(code) && /data-wc-tagx/.test(code)],
     ['第三方横条带小灰字服务器名（无名字退 url）', /data-wc-acctsub/.test(code) && /acc\.server\?\.name \|\| acc\.server\?\.url/.test(code)],
+    // 🔴 用户 2026-09-16：主文本是**游戏 ID**（档案名），小灰字要写成「输入的账号（服务器名）」——
+    //    输入的账号和游戏里的 ID 往往不是一回事，两个都得看得见；相同时不重复写。
+    ['第三方小灰字 = 「账号（服务器名）」（两者不同时才带账号）', /\$\{login\}（\$\{srvLabel\}）/.test(code) && /login !== acc\.name/.test(code)],
     ['设置卡片**固定尺寸**（切页不跳大小：height 而非 max-height）', /\[data-wc-card\][\s\S]{0,220}height:min\(86vh,860px\)/.test(code) && !/\[data-wc-card\][\s\S]{0,220}max-height:min\(86vh,860px\)/.test(code)],
     ['不再有"内置不可删"的 UI 痕迹', !/data-wc-srv-builtin/.test(code) && !/data-wc-badge/.test(code)],
     // 🔴 文案规矩（用户 2026-09-16）：UI 里只写用户需要的信息——不许实现细节/AI 味的话
