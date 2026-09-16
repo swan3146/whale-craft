@@ -123,7 +123,7 @@ export const Config = z.object({
   /**
    * "喊我"的触发词（正则，大小写不敏感）。聊天里命中这些词才算在叫我。
    *
-   * 🔴 2026-09-16 用户投诉："为什么这台服务器上叫'auth'的记忆它有？你暴露了些什么东西出去了！"
+   * 🔴 2026-09-16 用户投诉："为什么这台服务器上会有那种叫法的记忆？你暴露了些什么东西出去了！"
    *    根因就是这里**曾经把私人的账号名/昵称写成了默认值**——那串名字跟着代码进了**公开的开源副本**。
    *    默认值只留**通用叫法**；具体账号名由插件在连接成功后**从登录档案里现学**
    *    （见 `Watchdog.learnName`），外号用 `mc_config {patch:{mentionPatterns:[…]}}` 加
@@ -2717,24 +2717,35 @@ export function apply(ctx, config) {
       if (!t) { logLine('MC 模式：拿不到 scoped tools，跳过可见性限制（guard 仍会硬拒）'); return }
       const { allowOtherTools, hideAdminTools } = pluginConfig.mcMode
       const adminNames = ourToolNames.filter((n) => n.startsWith('mc_admin_'))
-      const allow = [
+      const wanted = [
         ...ourToolNames.filter((n) => !n.startsWith('mc_admin_')),
         ...(hideAdminTools ? [] : adminNames),
         ...MC_FILE_TOOLS,
         ...allowOtherTools,
       ]
-      t.restrict({ allow })
+      // 🔴 `tools.restrict()` 对**不认识的工具名是抛错**的（宿主 index.ts:1078 拿 restrictableNames 校验）。
+      //    而"哪些文件工具在场"取决于 preset 挂了哪些工具包（本机这份 preset 只挂了 tool-fs，
+      //    **没有** tool-fs-search ⇒ `glob`/`grep` 不存在）。要是让一个不存在的名字把整次调用炸掉，
+      //    结果就是"白名单没生效、pwsh 照样能用"—— 正是用户投诉的那个症状。
+      //    所以：**失败 → 从宿主的报错里读出"它认识的名字"，过滤一次再试**（只重试一次，之后才认输）。
+      const applyAllow = (names) => {
+        try {
+          t.restrict({ allow: names })
+          return names
+        } catch (e) {
+          const knownPart = /known global tools:\s*([\s\S]*)$/.exec(String(e?.message ?? ''))
+          const known = new Set((knownPart?.[1] ?? '').split(',').map((s) => s.trim()).filter(Boolean))
+          const usable = names.filter((n) => known.has(n))
+          if (!known.size || !usable.length) throw e
+          t.restrict({ allow: usable })
+          logLine(`MC 模式：白名单里有宿主不认识的名字（${names.filter((n) => !known.has(n)).join(', ')}）→ 已按实际在场的工具过滤`)
+          return usable
+        }
+      }
+      const allow = applyAllow(wanted)
       logLine(`MC 模式：工具白名单已生效（${agent.id}）：${allow.join(', ')}`)
     } catch (e) {
-      // 配置里写了宿主不认识的工具名会让 restrict 抛错 —— 退化成"只给我们的工具 + 文件工具"
-      try {
-        const t = scopedTools(agent.ctx)
-        const safe = [...ourToolNames.filter((n) => !n.startsWith('mc_admin_')), ...MC_FILE_TOOLS]
-        if (t && safe.length) {
-          t.restrict({ allow: safe })
-          logLine(`MC 模式：配置里有 restrict 不认识的名字（${String(e.message).slice(0, 120)}）→ 退化为只给 mc_* / mc_kit_* / 文件工具`)
-        }
-      } catch (e2) { logLine(`MC 模式工具限制失败：${e2.message}`) }
+      logLine(`MC 模式工具白名单**没生效**（${String(e?.message).slice(0, 160)}）—— 管理工具与文件越界仍由 guard 兜底`)
     }
   }
 

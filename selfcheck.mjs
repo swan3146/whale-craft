@@ -1,4 +1,4 @@
-// -*- coding: utf-8 -*-
+﻿// -*- coding: utf-8 -*-
 /**
  * 插件自检：用假 ctx 加载 whale_craft 的 apply()，检查
  *   - Config schema 能否解析
@@ -517,7 +517,7 @@ console.log('\n--- 聊天识别（未签名 system_chat 也要算玩家说话）
 {
   const { McBot } = await import('./src/core.mjs')
   const { EventEmitter } = await import('node:events')
-  const mkChatBot = (username = 'bot_name') => {
+  const mkChatBot = (username = 'Test_Bot') => {
     const bot = new EventEmitter()
     bot.username = username
     bot._client = new EventEmitter()
@@ -560,7 +560,7 @@ console.log('\n--- 聊天识别（未签名 system_chat 也要算玩家说话）
   console.log(`  ${chats.length === 1 ? '✅' : '❌'} 同一句短时间内重复只算一次（1.5s 去重）`)
 
   chats.length = 0
-  fake.emit('message', ...sysChat('bot_name', '我自己说的话'))
+  fake.emit('message', ...sysChat('Test_Bot', '我自己说的话'))
   console.log(`  ${chats.length === 0 ? '✅' : '❌'} 自己说的话不触发 chat（不当成别人喊我）`)
 
   chats.length = 0
@@ -585,9 +585,9 @@ console.log('\n--- 聊天识别（未签名 system_chat 也要算玩家说话）
   const genericMentions = ['deepseek', 'deep\\s*seek', '\\bds\\b', '\\bdsh\\b', '\\bai\\b', 'agent', '机器人', '麦块']
   const dflt = JSON.stringify(wd.config.mentionPatterns)
   console.log(`  ${dflt === JSON.stringify(genericMentions) ? '✅' : '❌'} 🔴 默认叫法就是这 ${genericMentions.length} 条通用词（没有任何私人名字）：${dflt}`)
-  wd.learnName('bot_name')
-  console.log(`  ${wd.calledBy('bot_name 你在吗').length > 0 ? '✅' : '❌'} 连接后现学自己的游戏名 → 别人喊名字能叫醒`)
-  console.log(`  ${wd.learnName('bot_name') === false ? '✅' : '❌'} 同一个名字不会重复加（幂等）`)
+  wd.learnName('Test_Bot')
+  console.log(`  ${wd.calledBy('Test_Bot 你在吗').length > 0 ? '✅' : '❌'} 连接后现学自己的游戏名 → 别人喊名字能叫醒`)
+  console.log(`  ${wd.learnName('Test_Bot') === false ? '✅' : '❌'} 同一个名字不会重复加（幂等）`)
   wd.learnName('a+b(c)')
   console.log(`  ${wd.calledBy('a+b(c) 来').length > 0 ? '✅' : '❌'} 名字里的正则特殊字符被转义（不会把正则写坏）`)
 }
@@ -1043,14 +1043,36 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   const normRead = guards.every((g) => { try { return g({ name: 'read', arguments: { path: 'E:\\x\\README.md' }, agent: { id: 'sess-P', ctx: plainCtxObj } }) === undefined } catch { return true } })
   console.log(`  ${normRead ? '✅' : '❌'} 普通会话读工作区文件不受影响（隔离只管 MC 模式）`)
 
-  // ⑤ 会话建立时应用策略：MC 模式 → 隐藏管理工具 + 投提示行；普通模式 → 什么都不做
+  // ⑤ 会话建立时应用策略：MC 模式 → 工具白名单 + 投提示行；普通模式 → 什么都不做
   const restrictCalls = []
   const guidanceCtxs = []
+  /**
+   * 照抄宿主的 `tools.restrict()` 契约：**名字不认识就抛错**（错误里带 known global tools 清单）。
+   * 🔴 这台 preset 只挂了 tool-fs（有 read/write/edit/read_image），**没有** tool-fs-search
+   *    ⇒ `glob` / `grep` 不在场 —— 正是这个"在场名单"逼出了 index.js 里那次过滤重试。
+   */
+  const KNOWN_TOOLS = new Set([
+    ...tools.keys(),
+    'read', 'write', 'edit', 'read_image',
+    'pwsh', 'subagent', 'workflow', 'web_search', 'todo_write', 'ask_user_question',
+    'serve_deploy', 'serve_list', 'goal_write',
+  ])
   const makeAgentCtx = (preset) => {
     const base = {}
     presetByCtx.set(base, preset)
     base.get = (k) => (k === 'tools'
-      ? { restrict: (f) => { restrictCalls.push({ preset, f }); return () => {} } }
+      ? {
+          restrict: (f) => {
+            const names = [...(f.allow ?? []), ...(f.deny ?? [])]
+            const unknown = names.filter((n) => !KNOWN_TOOLS.has(n))
+            if (unknown.length) {
+              throw new Error(`tools.restrict() names unknown global tool${unknown.length > 1 ? 's' : ''} `
+                + `${unknown.map((n) => `"${n}"`).join(', ')}; known global tools: ${[...KNOWN_TOOLS].sort().join(', ')}`)
+            }
+            restrictCalls.push({ preset, f })
+            return () => {}
+          },
+        }
       : k === 'systemPrompt'
         ? { context: (c) => { guidanceCtxs.push({ preset, c }); return () => {} } }
         : undefined)
@@ -1092,7 +1114,10 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   console.log(`  ${allowList && !allowList.includes('pwsh') && !allowList.includes('subagent') && !allowList.includes('workflow') ? '✅' : '❌'} 🔴 白名单里**没有** pwsh / subagent / workflow：${JSON.stringify((allowList ?? []).slice(0, 6))}…`)
   console.log(`  ${allowList && allowList.includes('mc_status') && allowList.includes('mc_kit_memory') && allowList.includes('mc_build') ? '✅' : '❌'} 自己的工具还在（mc_status / mc_kit_memory / mc_build）`)
   console.log(`  ${allowList && allowList.every((n) => !n.startsWith('mc_admin_')) ? '✅' : '❌'} 管理工具不在白名单里（hideAdminTools 默认 true）`)
-  console.log(`  ${allowList && ['read', 'write', 'edit', 'glob', 'grep', 'read_image'].every((n) => allowList.includes(n)) ? '✅' : '❌'} 文件工具在白名单里（路径由 guard 限在 .whale-craft/）`)
+  console.log(`  ${allowList && ['read', 'write', 'edit', 'read_image'].every((n) => allowList.includes(n)) ? '✅' : '❌'} 在场的文件工具在白名单里（路径由 guard 限在 .whale-craft/）`)
+  // 🔴 宿主对不认识的名字**抛错**；要是直接放弃，隔离就等于没做（pwsh 又回来了）
+  console.log(`  ${allowList && !allowList.includes('glob') && !allowList.includes('grep') ? '✅' : '❌'} 🔴 不在场的工具（这台 preset 没挂 tool-fs-search ⇒ glob/grep）被过滤掉，**不是**整次白名单作废`)
+  console.log(`  ${allowList && allowList.length > 5 ? '✅' : '❌'} 过滤后白名单仍然生效（${allowList?.length ?? 0} 个）`)
   console.log(`  ${denyList.length === 0 ? '✅' : '❌'} 不再用黑名单模式（deny=[]）`)
   // 🔴 2026-09-16：**一个 systemPrompt 段都不注册**了（用户："系统提示词不用显式注入"）。
   //    这条断言就是防回归：以后谁再往 systemPrompt 里塞东西，这里会红。
@@ -1685,7 +1710,7 @@ console.log('\n--- 无 OP 建造（创造模式自动取物）---')
     const world = new Map()
     const key = (p) => `${p.x},${p.y},${p.z}`
     const fake = {
-      username: 'bot_name',
+      username: 'Test_Bot',
       game: { gameMode },
       entity: { position: new Vec3(0, 64, 0), yaw: 0, pitch: 0 },
       players: {},
