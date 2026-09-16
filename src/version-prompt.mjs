@@ -23,40 +23,42 @@
 import { createHash } from 'node:crypto'
 
 /**
- * 生成本版本的硬提示词正文。
- * @param {string} version 插件版本（`package.json` 的 version，例如 `0.1.0`）
+ * 生成本版本的硬提示词**正文**。
+ *
+ * 🔴 用户 2026-09-16 定：**正文里不写版本号**（选项 A）。版本由两条自动生成的行携带 ——
+ *    · 模型看得见的来源行：`Instructions from: whale_craft@<版本>（内置版本提示，随插件版本更新）`；
+ *    · 用户看得见的折叠标题：`提示词注入：whale_craft v<版本> 版本提示（<正文短哈希>）`。
+ *    正文写死版本号会变成第三遍，还会让人误以为"改版本就得改正文"。
+ *    所以：**正文跨版本保持不变，哈希只标记这段文字本身**。
  * @returns {string}
  */
-export function versionPromptText (version) {
-  const v = String(version ?? '').trim() || 'unknown'
+export function versionPromptText () {
   return [
-    `本版本（whale_craft v${v}）的工具成熟度与取舍：`,
+    '1. 在本版本中，`mc_move`（walk/fly）、`mc_act`、`mc_build` 这些"自己动手"的工具还不成熟，'
+      + '容易操作失败、耗费太多时间。需要移动、建造等时，可以先试一次：用 `mc_command` 发 `/tp`、'
+      + '`/setblock`、`/fill`、`/clone` 这类指令；被白名单或权限拒绝时，再改用 `mc_move` / `mc_act` / '
+      + '`mc_build`，或者向用户申请。如果你不确定有没有权限、或不知道用户允不允许使用，无须犹豫，先询问；'
+      + '如果已有相关记忆，优先按记忆行事。',
     '',
-    '1. `mc_move`（walk/fly）、`mc_act`、`mc_build` 这些"自己动手"的工具在本版本里**还不成熟**：',
-    '   放置/移动容易失败、超时或失步。需要移动、建造、批量改方块时：',
-    '   · **若用户没有明确禁止使用服务器指令**，优先用 `mc_command` 发 `/tp`、`/setblock`、`/fill`、`/clone`',
-    '     （这些默认就在白名单里）；被白名单或权限拒绝时，再改用 `mc_move` / `mc_act` / `mc_build`，',
-    '     或者向用户申请 OP 权限。',
-    '   · 按 `.whale-craft/AGENTS.md` 的规矩：**用指令之前先跟用户确认**。',
-    '2. **要让用户看到图/文件，走发布区**：出图时把 `out` 写成',
-    `   \`.whale-craft/${'.express'}/<子目录>/x.png\`，工具返回值里会带现成的 \`express.markdown\`（\`![](url)\`）——`,
-    '   把那一串**原样粘进你的回复**，用户就能在会话里看到图。',
-    '   · 只在磁盘上、没放进发布区的文件（默认输出目录 `.whale-craft/.out/`）**用户看不到**；',
-    '     工具返回里的 `attachment` 字段只给**模型**看，不会变成用户界面里的图。',
-    '   · 游戏公屏/私聊里看不到图，只能说"图发到会话窗口了"。',
-    '3. 用户明确说过"不要用指令"之类的偏好时（他可能写在 AGENTS.md 或记忆里），**以他为先**。',
-    '4. 优先级从高到低：**用户当前明确的要求 > `.whale-craft/AGENTS.md` > 本条版本提示**。',
+    '2. 要给用户发送图片等文件，你需要先把要分享的文件放在 `.whale-craft/.express/` 或其子目录下'
+      + '（出图时把工具的 `out` 写成 `.whale-craft/.express/<子目录>/x.png`，'
+      + '或用 `mc_kit_memory {action:"put"}` 复制过去），然后调用 `mc_kit_express` 工具传入这个文件的路径'
+      + '（工作区相对或绝对都行），它会返回网络可达的 url（形如 `/api/mc/whale-craft/<工作区名>/...`，'
+      + '**原样使用，不要补 `http://…` 或域名**）。然后把它嵌进回复里回答用户：图片（内联显示）'
+      + '`![图片名](url)`，任意文件（可点开／下载）`[文件名](url)`。没有放在 `.whale-craft/.express/` 下的'
+      + '文件无法访问；也不要把裸路径直接发给用户（要点成链接或内联图片）；游戏公屏/私聊里看不到图，'
+      + '只能说"图发到会话窗口了"。',
   ].join('\n')
 }
 
-/** 正文的短哈希（写进折叠标题，便于在日志/界面上分辨"这条提示是哪一版"）。 */
-export function versionPromptHash (version) {
-  return createHash('sha256').update(versionPromptText(version)).digest('hex').slice(0, 8)
+/** 正文的短哈希（写进折叠标题；**只标记正文本身**，与版本号无关）。 */
+export function versionPromptHash () {
+  return createHash('sha256').update(versionPromptText()).digest('hex').slice(0, 8)
 }
 
 /** 折叠标题：`提示词注入：whale_craft v0.1.0 版本提示（a1b2c3d4）` */
 export function versionPromptTitle (version) {
-  return `提示词注入：whale_craft v${String(version ?? '').trim() || 'unknown'} 版本提示（${versionPromptHash(version)}）`
+  return `提示词注入：whale_craft v${String(version ?? '').trim() || 'unknown'} 版本提示（${versionPromptHash()}）`
 }
 
 /** 正文首行那行"来源"（照 DSH 原生 `Instructions from: …` 的形状） */

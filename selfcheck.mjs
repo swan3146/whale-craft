@@ -218,7 +218,7 @@ console.log('\n--- 工具面（share 移除 / present 接入）---')
   const { readFileSync } = await import('node:fs')
   const idx = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
   console.log(`  ${!tools.has('mc_kit_share') ? '✅' : '❌'} 🔴 mc_kit_share 已移除（它只是在调宿主**另装**的 dsh-file-host，插件本身没有文件服务器）`)
-  console.log(`  ${tools.size === 27 ? '✅' : '❌'} 工具数 27（实际 ${tools.size}）：mc_* 24 + mc_kit_* 2 + mc_admin_* 1`)
+  console.log(`  ${tools.size === 28 ? '✅' : '❌'} 工具数 28（实际 ${tools.size}）：mc_* 24 + mc_kit_* 3 + mc_admin_* 1`)
   // 只看**代码**，不看注释：注释里留着"为什么删"的说明（那是要留的）
   const codeOnly = idx.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
   console.log(`  ${!/uploadToFileHost|dsh-file-host|\/serve\/file-host|mc_kit_share/.test(codeOnly) ? '✅' : '❌'} 源码里没有上传/文件服务器残留（注释里保留"为什么删"的说明）`)
@@ -234,7 +234,7 @@ console.log('\n--- 工具面（share 移除 / present 接入）---')
   console.log(`  ${/realpathSync\(target\)/.test(idx) && /拒绝越界（符号链接）/.test(idx) ? '✅' : '❌'} 🔴 防穿透：段级校验 + realpath 复查（符号链接也跳不出去）`)
   console.log(`  ${!/read_image \{file_path/.test(codeOnly) && !/present \{files/.test(codeOnly) ? '✅' : '❌'} 🔴 旧的"用 read_image / present 发图"提示已清干净（注释里的历史说明不算）`)
   const vp = readFileSync(new URL('./src/version-prompt.mjs', import.meta.url), 'utf8')
-  console.log(`  ${/\.express/.test(vp) && /express\.markdown/.test(vp) && /attachment.*只给\*\*模型\*\*看|只给\*\*模型\*\*看/.test(vp) ? '✅' : '❌'} 版本提示里写清交付流程（先放发布区 → 粘 markdown；attachment 只给模型看）`)
+  console.log(`  ${/\.whale-craft\/\.express\//.test(vp) && /mc_kit_express/.test(vp) && /!\[图片名\]\(url\)/.test(vp) && /\[文件名\]\(url\)/.test(vp) ? '✅' : '❌'} 版本提示里写清交付流程（先放发布区 → mc_kit_express 拿路径 → 自己拼 ![]/[]）`)
   const cli = readFileSync(new URL('./client.js', import.meta.url), 'utf8')
   console.log(`  ${/data-wc-verprompt/.test(cli) && /本版本内置提示/.test(cli) ? '✅' : '❌'} 「提示词」页只读展示版本内置提示（用户有权知道它说了什么）`)
 }
@@ -634,6 +634,44 @@ console.log('\n--- 发布区：目录即白名单 / 不用 token / 必须防穿�
   console.log(`  ${dirReq.status !== 200 ? '✅' : '❌'} 目录请求不是 200（不列目录）：${dirReq.status}`)
   const dirReq2 = await callRaw('GET', '/api/mc/whale-craft/myproj/world1')
   console.log(`  ${dirReq2.status !== 200 ? '✅' : '❌'} 子目录请求也不是 200：${dirReq2.status}`)
+
+  // ④ 专用工具 `mc_kit_express`：入参一个路径，**只回一行纯路径**
+  {
+    const tool = tools.get('mc_kit_express')
+    console.log(`  ${tool ? '✅' : '❌'} 工具已注册：mc_kit_express（参数 ${JSON.stringify(Object.keys(tool?.parameters ?? {}))}）`)
+    // 真机上记忆根就是 <工作区>/.whale-craft → 这里临时去掉自检的 WHALE_CRAFT_MEMORY_DIR，按真机形态测
+    const savedMem = process.env.WHALE_CRAFT_MEMORY_DIR
+    delete process.env.WHALE_CRAFT_MEMORY_DIR
+    try {
+      const wsEx = join(cwd, '.whale-craft', E.EXPRESS_DIR, 'world1')
+      mkdirSync(wsEx, { recursive: true })
+      writeFileSync(join(wsEx, 'example.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]))
+      const ex = { agent: { id: 'sess-EX', session: { header: { cwd } } } }
+      const want = `/api/mc/whale-craft/myproj/world1/example.png`
+
+      const got = await tool.execute({ path: `.whale-craft/${E.EXPRESS_DIR}/world1/example.png` }, ex)
+      const rendered = tool.output?.render?.({}, got)?.map((b) => b.text).join('') ?? ''
+      console.log(`  ${got.url === want ? '✅' : '❌'} 🔴 工作区相对路径（真机最常用写法）→ 返回纯路径：${got.url}`)
+      console.log(`  ${rendered === got.url ? '✅' : '❌'} 渲染给模型的**只有那一行路径**（不含 JSON 壳）：${JSON.stringify(rendered)}`)
+      const memRel = await tool.execute({ path: join(E.EXPRESS_DIR, 'world1', 'example.png') }, ex)
+      console.log(`  ${memRel.url === want ? '✅' : '❌'} 记忆根相对写法（.express/...）也认`)
+      const absGot = await tool.execute({ path: join(wsEx, 'example.png') }, ex)
+      console.log(`  ${absGot.url === want ? '✅' : '❌'} 绝对路径也认（三种写法给同一条路径）`)
+
+      const missing = await tool.execute({ path: '.express/nope.png' }, ex).then(() => null).catch((e) => e.message)
+      console.log(`  ${/找不到这个文件/.test(String(missing)) ? '✅' : '❌'} 文件不存在 → 报错清楚：${String(missing).slice(0, 40)}…`)
+      const outDir2 = join(cwd, '.whale-craft', E.OUT_DIR)
+      mkdirSync(outDir2, { recursive: true })
+      writeFileSync(join(outDir2, 'draft.png'), Buffer.from([0x89]))
+      const notInExpress = await tool.execute({ path: `.whale-craft/${E.OUT_DIR}/draft.png` }, ex).then(() => null).catch((e) => e.message)
+      console.log(`  ${/不在发布区里/.test(String(notInExpress)) ? '✅' : '❌'} 🔴 .out/ 里的文件 → 拒绝并提示先放进发布区：${String(notInExpress).slice(0, 30)}…`)
+      const escape = await tool.execute({ path: '../../../etc/passwd' }, ex).then(() => null).catch((e) => e.message)
+      console.log(`  ${escape ? '✅' : '❌'} 穿透路径也拿不到东西（报错）：${String(escape).slice(0, 30)}…`)
+    } finally {
+      if (savedMem === undefined) delete process.env.WHALE_CRAFT_MEMORY_DIR
+      else process.env.WHALE_CRAFT_MEMORY_DIR = savedMem
+    }
+  }
 }
 
 // ── 玩家说话要能被认出来（2026-09-16 真机事故：LAN/离线服上"喊我不应，只能 tp 我"）──
@@ -1268,7 +1306,14 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     const bodyV = (second?.content ?? []).map((c) => c.text ?? '').join('')
     console.log(`  ${second?.source?.form === 'notice' && /^Instructions from: whale_craft@/.test(bodyV.split('\n')[0] ?? '') ? '✅' : '❌'} 第 2 条 = 版本提示（来源行 ${JSON.stringify((bodyV.split('\n')[0] ?? '').slice(0, 46))}…）`)
     console.log(`  ${/mc_move/.test(bodyV) && /mc_command/.test(bodyV) && /\/setblock/.test(bodyV) ? '✅' : '❌'} 版本提示正文点了工具名与指令名（mc_move / mc_command / /setblock）`)
-    console.log(`  ${/用户当前明确的要求 > .*AGENTS\.md`?\s*> 本条版本提示/.test(bodyV) ? '✅' : '❌'} 🔴 正文写清优先级：用户要求 > AGENTS.md > 版本提示（免得和用户偏好打架）`)
+    console.log(`  ${/可以先试一次/.test(bodyV) && /被白名单或权限拒绝/.test(bodyV) ? '✅' : '❌'} 第 1 条保留"先试一次、被拒再退"（不然模型有权限也不敢用指令）`)
+    console.log(`  ${/mc_kit_express/.test(bodyV) && /\.whale-craft\/\.express\//.test(bodyV) ? '✅' : '❌'} 第 2 条写明发布区路径与 mc_kit_express`)
+    console.log(`  ${/\[文件名\]\(url\)/.test(bodyV) && !/\[文件名\]\(\)/.test(bodyV) ? '✅' : '❌'} 🔴 链接示例带 url（空括号那个笔误已修）`)
+    console.log(`  ${/原样使用/.test(bodyV) && /不要补/.test(bodyV) ? '✅' : '❌'} 提醒"原样使用、别补域名"（补了在 https 下会被混合内容挡掉）`)
+    console.log(`  ${/^1\./m.test(bodyV) && /^2\./m.test(bodyV) && !/^3\./m.test(bodyV) ? '✅' : '❌'} 正文就是两条（用户："别的属实多余了"）`)
+    // 选项 A（用户 2026-09-16 定）：**正文里不写版本号** —— 版本由来源行与折叠标题携带
+    console.log(`  ${!/v\d+\.\d+\.\d+/.test(bodyV.replace(/^Instructions from: [^\n]*\n+/, '')) ? '✅' : '❌'} 🔴 正文里没有版本号（版本只在来源行与折叠标题里；哈希只标记正文本身）`)
+    console.log(`  ${/^Instructions from: whale_craft@\d+\.\d+\.\d+/.test(bodyV) ? '✅' : '❌'} 版本由来源行携带：${JSON.stringify((bodyV.split('\n')[0] ?? '').slice(0, 44))}`)
     const vTitle = String(second?.source?.summary ?? '')
     console.log(`  ${/v\d+\.\d+\.\d+/.test(vTitle) && /（[0-9a-f]{8}）$/.test(vTitle) ? '✅' : '❌'} 折叠标题带版本号 + 短哈希：${vTitle}`)
     const body2 = (third?.content ?? []).map((c) => c.text ?? '').join('')

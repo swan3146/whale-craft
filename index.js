@@ -1710,14 +1710,8 @@ export function apply(ctx, config) {
           mkdirSync(dirname(file), { recursive: true })
           writeFileSync(file, png)
           out.image.file = rel
-          const ref = expressRefFor(wsRoot, file, memoryRootFor(wsRoot))
-          if (ref) {
-            out.image.express = ref
-            out.image.hint = '这张图已发布：把 express.markdown（`![](url)`）原样粘进你的回复，Master 就能在会话里看到它'
-          } else {
-            out.image.hint = `默认输出不对外。要让 Master 看到，就把图写到发布区（out:".whale-craft/${EXPRESS_DIR}/<子目录>/x.png"），`
-              + '返回值里会带现成的 markdown，粘进回复即可'
-          }
+          out.image.hint = `要让用户看到这张图：把它写到发布区（out:".whale-craft/${EXPRESS_DIR}/<子目录>/x.png"），`
+            + '再用 mc_kit_express 拿可访问路径。默认输出（.out/）不对外。'
         } catch (e) { out.image.fileError = e.message }
       }
       return out
@@ -1958,9 +1952,8 @@ export function apply(ctx, config) {
       + '· render  SVG → PNG（可给 width/height/scale；svg 文本或 svgPath 二选一）\n'
       + '· grid    把多张图按网格拼成**可继续编辑的 SVG 文本**（省掉重复写 N 个 <image> 和算坐标）\n'
       + '· save    把 SVG 文本或 PNG 字节落盘\n'
-      + `输出默认落在 \`.whale-craft/${OUT_DIR}/\`（**不对外**）。🔴 要让 **Master** 看到图：`
-      + `把 \`out\` 写成 \`.whale-craft/${EXPRESS_DIR}/<子目录>/x.png\`（**发布区**），`
-      + '返回值里会带现成的 `express.url` 与 `express.markdown`（`![](url)`）—— 把 markdown **原样粘进你的回复**即可。',
+      + `输出默认落在 \`.whale-craft/${OUT_DIR}/\`（**不对外**）。要给用户看，就把 \`out\` 写成`
+      + `\`.whale-craft/${EXPRESS_DIR}/<子目录>/x.png\`（**发布区**），再用 \`mc_kit_express\` 拿可访问的路径。`,
     parameters: {
       action: { type: 'string', description: 'info / embed / render / grid / save' },
       path: { type: 'string', description: '输入文件（info/embed 用）' },
@@ -1991,23 +1984,17 @@ export function apply(ctx, config) {
        * 🔴 用户 2026-09-16 定的**发布模型**：
        *    · `.out/` = 默认输出，**谁都访问不到**；
        *    · `.express/` = **发布区**，放进去的文件可通过
-       *      `GET /api/mc/whale-craft/<工作区目录名>/<剩余路径>` 访问 —— 要给 Master 看就显式写进这里，
-       *      下面的 `withExpress()` 会把现成的 `url` 与 `markdown`（`![](url)`）一起返回，原样粘进回复即可。
+       *      `GET /api/mc/whale-craft/<工作区目录名>/<剩余路径>` 访问 —— 要给用户看就显式写进这里，
+       *      再用专用工具 `mc_kit_express` 换回那行路径，自己拼 markdown。
        */
       const outDir = outRootOf(memoryRootFor(workspaceOf(exec?.agent)))
       const needOut = (name) => (args.out ? inWs(args.out) : join(outDir, name))
-      /** 结果里补上"可访问地址"（只在文件位于发布区时；否则原样返回） */
-      const withExpress = (value, absPath) => {
-        const ref = expressRefFor(workspaceOf(exec?.agent), absPath, memoryRootFor(workspaceOf(exec?.agent)))
-        return ref ? { ...value, express: ref } : value
-      }
+      /* 🔴 用户 2026-09-16：结果里**不再**塞任何 express 字段（'不要乱给已有工具加'）——取路径统一走 mc_kit_express。 */
 
       switch (action) {
         case 'info': {
           const p = inWs(args.path)
-          const info = await ImageEngine.info(p)
-          // 文件已经在发布区里 → 顺手把现成的 markdown 给出去
-          return withExpress(info, p)
+          return await ImageEngine.info(p)
         }
 
         case 'embed': {
@@ -2030,7 +2017,7 @@ export function apply(ctx, config) {
           })
           const out = needOut('mc-image.png')
           const saved = ImageEngine.save(out, r.png)
-          return withExpress({ rendered: `${r.width}x${r.height}`, ...saved }, out)
+          return { rendered: `${r.width}x${r.height}`, ...saved }
         }
 
         case 'grid': {
@@ -2041,26 +2028,73 @@ export function apply(ctx, config) {
           })
           const out = needOut('mc-grid.svg')
           ImageEngine.save(out, r.svg)
-          return withExpress({
+          return {
             svg: `${r.width}x${r.height}`, cells: r.cells, layout: `${r.cols}x${r.rows}`,
             file: out, bytes: Buffer.byteLength(r.svg),
             note: '这是**可继续编辑的 SVG 文本**：想加标注就改这个文件（画 <rect stroke>、加 <text>），'
               + '再 mc_kit_image{action:"render"} 光栅化成 PNG。',
-          }, out)
+          }
         }
 
         case 'save': {
           if (!args.svg && !args.path) throw new Error('save 需要 svg（文本）或 path（要复制的文件）')
           const out = needOut('mc-image.svg')
-          if (args.svg) return withExpress({ ...ImageEngine.save(out, String(args.svg)), kind: 'svg' }, out)
+          if (args.svg) return { ...ImageEngine.save(out, String(args.svg)), kind: 'svg' }
           const src = inWs(args.path)
           const { readFileSync } = await import('node:fs')
-          return withExpress({ ...ImageEngine.save(out, readFileSync(src)), kind: 'copy', from: src }, out)
+          return { ...ImageEngine.save(out, readFileSync(src)), kind: 'copy', from: src }
         }
 
         default:
           throw new Error(`未知 action："${action}"（可用 info/embed/render/grid/save）`)
       }
+    },
+  }))
+
+  /**
+   * 发布区取链接：**唯一**的"把文件端给用户"的入口（用户 2026-09-16 定）。
+   *
+   * 只做一件事：把 `.whale-craft/.express/` 下的文件换成一串**可访问的纯路径**，
+   * 剩下的 markdown 由 AI 自己拼（`![名](url)` / `[名](url)`）——不再往别的工具返回值里塞字段。
+   */
+  ctx.tools.register(asTool({
+    name: 'mc_kit_express',
+    description: '把**发布区**（`.whale-craft/.express/`）里的文件换成**可访问的子路径**。\n'
+      + '· 入参：`path` —— 发布区下的文件（工作区相对或绝对都行，**必须在 `.whale-craft/.express/` 下**）；\n'
+      + '· 返回：**一行纯路径**（形如 `/api/mc/whale-craft/<工作区目录名>/<剩余路径>`）；\n'
+      + '· 用法：把它放进 markdown —— 图片 `![图片名](返回的路径)`，其它文件 `[文件名](返回的路径)`；\n'
+      + '  **原样使用**，不要在前面补 `http://…` 或域名（相对路径在本地与受信域名下都能用）。\n'
+      + '⚠️ 只有 `.whale-craft/.express/` 下的文件可访问；默认输出目录 `.whale-craft/.out/` **不对外**。',
+    parameters: {
+      path: { type: 'string', required: true, description: '发布区下的文件路径（工作区相对或绝对；必须在 .whale-craft/.express/ 下）' },
+    },
+    output: {
+      schema: { type: 'object', properties: { url: { type: 'string' } }, additionalProperties: true },
+      // **只把那一行路径给模型**（用户："输出纯路径，让 AI 自己拼接 md"）
+      render: (_args, value) => [{ type: 'text', text: String(value?.url ?? '') }],
+    },
+    async execute(args, exec) {
+      const cwd = workspaceOf(exec?.agent)
+      const memRoot = memoryRootFor(cwd)
+      const raw = String(args.path ?? '').trim()
+      if (!raw) throw new Error('path 不能为空')
+      // 解析顺序：绝对路径照用；相对路径先按**记忆根**试（`.express/x.png` 这种写法最常见），
+      // 再按**工作区**试（`.whale-craft/.express/x.png`）。都不存在才算文件不存在。
+      const candidates = isAbsolute(raw)
+        ? [resolve(raw)]
+        : [resolve(memRoot, raw), resolve(cwd ?? memRoot, raw)]
+      const abs = candidates.find((p) => { try { return statSync(p).isFile() } catch { return false } })
+      if (!abs) {
+        throw new Error(`找不到这个文件：${raw}（试过：${candidates.join(' / ')}）`)
+      }
+      const ref = expressRefFor(cwd, abs, memRoot)
+      if (!ref) {
+        throw new Error('这个文件不在发布区里，所以没有可访问的地址。'
+          + `请先把它放到 .whale-craft/${EXPRESS_DIR}/<子目录>/ 下（出图时把 out 写成那里，`
+          + '或用 mc_kit_memory {action:"put", path:".express/<子目录>/x.png"} 复制过去），再来换路径。')
+      }
+      rememberWorkspace(cwd)
+      return { url: ref.url, rel: ref.rel }
     },
   }))
 
@@ -2121,10 +2155,7 @@ export function apply(ctx, config) {
           const sess = getSession(exec)
           server = sess.bot.sub ?? null
         }
-        const put = mem.put({ source: src, name: args.name, path: args.path, server })
-        // 目标落在**发布区**（`.express/`）里 → 顺手给出现成的 markdown / url
-        const ref = expressRefFor(workspaceOf(exec?.agent), join(memoryRootFor(workspaceOf(exec?.agent)), String(put?.path ?? args.path ?? '')), memoryRootFor(workspaceOf(exec?.agent)))
-        return ref ? { ...put, express: ref } : put
+        return mem.put({ source: src, name: args.name, path: args.path, server })
       }
 
       // 只在"没显式给 server 且没给 path"时，才用当前所在服兜底
@@ -2283,7 +2314,7 @@ export function apply(ctx, config) {
     items.push({
       rel: versionPromptSource(PLUGIN_VERSION),
       title: versionPromptTitle(PLUGIN_VERSION),
-      text: versionPromptText(PLUGIN_VERSION),
+      text: versionPromptText(),
     })
     // ④ 记忆总索引（`.whale-craft/README.md`）：**每个 MC 会话都给一次**——这正是"长期记忆"的入口。
     //    内容空（还没记过东西）也照样给：里面写着"怎么记"，第一轮就知道该往哪写。
@@ -2385,8 +2416,8 @@ export function apply(ctx, config) {
       versionPrompt: {
         version: PLUGIN_VERSION,
         title: versionPromptTitle(PLUGIN_VERSION),
-        text: versionPromptText(PLUGIN_VERSION),
-        bytes: Buffer.byteLength(versionPromptText(PLUGIN_VERSION)),
+        text: versionPromptText(),
+        bytes: Buffer.byteLength(versionPromptText()),
       },
       // 保留 registered/segments 两个键名（前端与 mc_diag 在用）：现在两者同源 —— 都是"真的投了"
       registered: {

@@ -1,4 +1,4 @@
-# Whale Craft
+﻿# Whale Craft
 
 **[English ↓](#english)** · 中文 · [![CI](https://github.com/yzi1b/whale-craft/actions/workflows/ci.yml/badge.svg)](https://github.com/yzi1b/whale-craft/actions/workflows/ci.yml)
 
@@ -135,12 +135,12 @@ dsh plugin --profile web add whale_craft
 
 ---
 
-## 工具（27 个，三层命名空间）
+## 工具（28 个，三层命名空间）
 
 | 层 | 数量 | 工具 |
 | --- | --- | --- |
 | **游戏内** `mc_*` | 24 | `mc_status` `mc_connect` `mc_lan` `mc_accounts` `mc_capabilities` `mc_disconnect` `mc_stop` `mc_config` `mc_sessions` `mc_diag` `mc_say` `mc_events` `mc_watch` `mc_map` `mc_scan` `mc_entities` `mc_inventory` `mc_move` `mc_act` `mc_dig` `mc_build` `mc_give` `mc_sequence` `mc_command` |
-| **游戏外辅助** `mc_kit_*` | 2 | `mc_kit_memory`（记忆树：按服/主题定位、`key` 覆盖、搜索、删除、把文件与图片**存进记忆**）· `mc_kit_image`（SVG→PNG / 引图 / 拼网格） |
+| **游戏外辅助** `mc_kit_*` | 3 | `mc_kit_memory`（记忆树：按服/主题定位、`key` 覆盖、搜索、删除、把文件与图片**存进记忆**）· `mc_kit_image`（SVG→PNG / 引图 / 拼网格）· `mc_kit_express`（把发布区里的文件换成可访问路径） |
 | **管理** `mc_admin_*` | 1 | `mc_admin_config`（读写全局配置；**MC 模式看不见、也调不动**） |
 
 几个设计点：
@@ -171,7 +171,7 @@ dsh plugin --profile web add whale_craft
    硬限在 `<工作区>/.whale-craft/` 内（不给路径 = 扫整个工作区 = 拒绝）。
 3. **把文件给用户看，走插件自带的「发布区」**（不依赖任何外部服务，见下一节）。
    出图工具默认写 `<工作区>/.whale-craft/.out/`（**谁都访问不到**）；写进
-   `<工作区>/.whale-craft/.express/` 才可访问，工具会顺手返回现成的 `markdown`。
+   `<工作区>/.whale-craft/.express/` 才可访问，再用 `mc_kit_express` 换回可访问路径、自己拼 markdown。
    宿主若挂了 `read_image` / `present`（随附 `standard`/`ptc`/`cordis` 有，`minimal` 没有），它们也仍然可用 ——
    但**不是**主要交付路：`read_image` 只在工具行里渲染图（要展开），`present` 要等轮末。
 4. **`mc_admin_*` 看不见也调不动**（白名单 + `guard` 硬拒）。
@@ -203,10 +203,14 @@ dsh plugin --profile web add whale_craft
 
 - 地址：`GET /api/mc/whale-craft/<工作区目录名>/<剩余路径>`
   例：`.whale-craft/.express/world1/map.png` → `/api/mc/whale-craft/<工作区目录名>/world1/map.png`
-- 出图工具（`mc_map` / `mc_kit_image`）写进发布区时，返回值里**直接带** `express = { rel, url, markdown }`，
-  其中 `markdown` 就是 `![](url)`（**相对 URL**：本地 `127.0.0.1` 与受信域名两种访问方式都同源可用）——
-  AI 把它**原样粘进回复**，图就内联显示在对话里。已有文件想发布：
-  `mc_kit_memory {action:"put", source:".whale-craft/.out/x.png", path:".express/x.png"}`。
+- **怎么把文件给用户**（三步，AI 侧）：
+  ① 把文件写进发布区：出图工具（`mc_map` / `mc_kit_image`）把 `out` 写成
+  `.whale-craft/.express/<子目录>/x.png`；已有文件用
+  `mc_kit_memory {action:"put", source:".whale-craft/.out/x.png", path:".express/x.png"}` 复制过去；
+  ② 用 **`mc_kit_express {path:"…"}`** 换回那行可访问路径（**只回一行纯路径**，如
+  `/api/mc/whale-craft/…/world1/map.png`）；
+  ③ AI 自己拼 markdown：图片 `![名字](那行路径)`、任意文件 `[名字](那行路径)`，把路径**原样用**
+  （**不要补 `http://…` 或域名** —— 相对路径在本地与受信域名下都同源可用，补了反而会被混合内容策略挡）。
 - 为什么不用 `read_image` / `present`：它们是**宿主**的工具，preset 没挂就没有（官方 `minimal` 里就没有），
   而且 `read_image` 的图只在折叠的工具行里、`present` 要等该轮结束；插件自己这条通道**不挑宿主、当场可见**。
 - 安全（按"用户自己把握"的定位，只做必要加固）：
