@@ -1,4 +1,4 @@
-/**
+﻿/**
  * whale_craft —— DSH 原生 Minecraft Agent 插件（host 半端）
  * ============================================================================
  * 目标：把"我"接进 MC 做成**一等公民**，而不是外挂一个 MCP 子进程。
@@ -20,7 +20,7 @@
  */
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, unlinkSync, statSync, renameSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, unlinkSync, statSync, renameSync, realpathSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
@@ -28,6 +28,7 @@ import { resolve, sep, join, isAbsolute, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { McBot, lossless, logLine, libraryInfo } from './src/core.mjs'
 import { versionPromptText, versionPromptTitle, versionPromptSource } from './src/version-prompt.mjs'
+import { EXPRESS_DIR, OUT_DIR, expressRootOf, outRootOf, wsIdOf, parseExpressPath, safeExpressTarget, mimeOf, SANDBOX_TYPES, expressRefFor } from './src/express.mjs'
 import { Watchdog, WATCH_DEFAULTS } from './src/watchdog.mjs'
 import { MemoryStore } from './src/memory.mjs'
 import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction, patchPersonaInComposition, disableShellInComposition, patchToolGroupsIntoComposition, MC_PRESET_TOOL_GROUPS } from './src/config.mjs'
@@ -423,6 +424,20 @@ export function apply(ctx, config) {
   }
   logLine(`whale_craft：配置 ${pluginConfig.file}｜记忆 <会话工作区>/.whale-craft（兜底 ${memory.root}）`)
 
+  /* ─────────── 发布区（`.whale-craft/.express/`）：谁的工作区、单文件上限 ───────────
+   * 用户 2026-09-16：地址是 `/api/mc/whale-craft/<工作区指代>/<剩余路径>`，**不用 token**。
+   * "工作区指代"取工作区目录名 —— 所以服务端得知道"这台实例见过哪些工作区"。
+   * 见过就往这个 Set 里记（MC 模式生效时、点开 MC设置时、出图给 URL 时）。
+   * ------------------------------------------------------------------------ */
+  const knownWorkspaces = new Set()
+  const EXPRESS_MAX_BYTES = 32 * 1024 * 1024
+  const rememberWorkspace = (cwd) => {
+    const s = typeof cwd === 'string' ? cwd.trim() : ''
+    if (!s || !isAbsolute(s)) return null
+    knownWorkspaces.add(s)
+    return s
+  }
+
   /* ─────────── MC账户库：元数据在 $DSH_HOME/whale_craft/accounts.json，凭据只进宿主凭据服务 ───────────
    * 🔴 LLM 永远拿不到密码/token：工具只回基本信息；凭据只在这两个 helper 里出现，且不外传。
    * ------------------------------------------------------------------------ */
@@ -741,6 +756,7 @@ export function apply(ctx, config) {
         }
       }
       ensureMemoryRootForCwd(cwd)
+      rememberWorkspace(cwd)
       return { ok: true, cwd, from }
     }
     const gateOf = (b) => settingsGate(
@@ -870,9 +886,82 @@ export function apply(ctx, config) {
     throw new Error(`未知的设置接口：${req.method} ${path}`)
   }
 
+  /**
+   * 发布区服务：`GET/HEAD /api/mc/whale-craft/<工作区指代>/<剩余路径>`
+   *   → `<工作区>/.whale-craft/.express/<剩余路径>`（**子目录可以有**）。
+   *
+   * 用户 2026-09-16 定的规矩（照做）：
+   *   · **不用 token**（DSH 本身禁止公网访问；真要架公网，架的人自己加代理与鉴权）；
+   *   · **目录即白名单**：只有 `.express/` 下的文件可访问，`.out/`（默认输出）不对外；
+   *   · **所有扩展名都放行**（用户自己把握）；
+   *   · 🔴 **必须防穿透**：段级校验（`.whale-craft` 那边已做）之后，这里再用
+   *     `realpath` 复查一次"真实路径仍在发布区里" —— 这样**符号链接也跳不出去**。
+   *   · 信任栅栏在上面 `apiRoute` 里已经过（非回环且不在 trustedHosts → 403）。
+   */
+  const serveExpressFile = (req, res, hit) => {
+    const notFound = (why) => {
+      // 统一 404（不区分"没有这个工作区/没有这个文件/段不合法"）：不给人做探测的依据
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })
+      res.end(`not found${why ? ` (${why})` : ''}`)
+      return true
+    }
+    try {
+      const ws = String(hit.ws ?? '')
+      const candidates = [...knownWorkspaces].filter((p) => wsIdOf(p) === ws)
+      if (!candidates.length) { logLine(`发布区：没有工作区叫「${ws}」（现有：${[...knownWorkspaces].map(wsIdOf).join(', ') || '无'}）`); return notFound() }
+
+      for (const cwd of candidates) {
+        const root = expressRootOf(memoryRootFor(cwd))
+        const target = safeExpressTarget(root, hit.segments)
+        if (!target) continue
+        let real = null
+        try { real = realpathSync(target) } catch { continue }         // 不存在 → 试下一个候选
+        const rootReal = (() => { try { return realpathSync(root) } catch { return root } })()
+        const prefix = rootReal.endsWith(sep) ? rootReal : rootReal + sep
+        if (real !== rootReal && !real.startsWith(prefix)) {            // 符号链接跳出去了
+          logLine(`发布区：拒绝越界（符号链接）${real}`)
+          return notFound()
+        }
+        let st = null
+        try { st = statSync(real) } catch { continue }
+        if (!st.isFile()) continue                                       // 目录不列目录
+        if (st.size > EXPRESS_MAX_BYTES) {
+          res.writeHead(413, { 'content-type': 'text/plain; charset=utf-8' })
+          res.end(`too large (${st.size} > ${EXPRESS_MAX_BYTES})`)
+          return true
+        }
+        const type = mimeOf(real)
+        const head = {
+          'content-type': type,
+          'content-length': st.size,
+          'cache-control': 'private, max-age=300',
+          'x-content-type-options': 'nosniff',
+          // 会被当文档执行脚本的类型（svg/html/xml/js）→ 加 sandbox：内联 <img> 照常显示，导航过去跑不了脚本
+          ...(SANDBOX_TYPES.test(type) ? { 'content-security-policy': "sandbox; default-src 'none'; style-src 'unsafe-inline'" } : {}),
+        }
+        res.writeHead(200, head)
+        if (req.method === 'HEAD') { res.end(); return true }
+        res.end(readFileSync(real))
+        return true
+      }
+      return notFound()
+    } catch (e) {
+      logLine(`发布区服务失败：${e?.message ?? e}`)
+      res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' })
+      res.end('internal error')
+      return true
+    }
+  }
+
   const handleMcApi = async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost')
     const path = url.pathname
+
+    // 发布区（静态文件）走最前面：它不是 JSON 接口，别掉进下面的分支
+    {
+      const hit = parseExpressPath(path)
+      if (hit && (req.method === 'GET' || req.method === 'HEAD')) return serveExpressFile(req, res, hit)
+    }
 
     if (req.method === 'GET' && path === '/api/mc/status') {
       const sessionId = url.searchParams.get('sessionId') ?? ''
@@ -1551,7 +1640,9 @@ export function apply(ctx, config) {
     name: 'mc_map',
     description: '看周围地形。format="chars"（默认）返回**字符地形图**（无视觉也能读：'
       + '@ 是我 · ~ 水 · . 沙 · " 草木 · T 木构 · : 石/建筑 · _ 土/农田 · # 白 · ? 未加载）；'
-      + 'format="image" 额外生成**俯视图像**（**模型有视觉时直接能看**，也会落盘到工作区，可再用 present 交付）；'
+      + 'format="image" 额外生成**俯视图像**（模型有视觉时直接能看，并落盘到工作区）。'
+      + `🔴 要让 **Master** 看到图：给 \`out:"\\.whale-craft/${EXPRESS_DIR}/<子目录>/map.png"\` 写进发布区，`
+      + '然后把返回值里的 `express.markdown`（`![](url)`）原样粘进你的回复。'
       + 'format="both" 两者都给。字符图省 token 且坐标精确；形状/外观问题用图像。',
     parameters: {
       radius: { type: 'number', description: '半径（默认 32，上限 96）' },
@@ -1560,6 +1651,8 @@ export function apply(ctx, config) {
       yBottom: { type: 'number', description: '向下搜索深度（默认 -24）' },
       format: { type: 'string', description: 'chars（默认）/ image / both' },
       scale: { type: 'number', description: '图像每格放大倍数（默认 4，1–16）' },
+      out: { type: 'string', description: `落盘路径（工作区相对；默认 .whale-craft/${OUT_DIR}/mc-map-<时间>.png 不对外）。`
+        + `想让 Master 看到就写到 .whale-craft/${EXPRESS_DIR}/<子目录>/x.png（发布区），返回值会带现成的 markdown` },
     },
     output: {
       schema: { type: 'object', properties: {}, additionalProperties: true },
@@ -1604,17 +1697,27 @@ export function apply(ctx, config) {
         } else {
           out.image.attachmentError = '宿主没有 attachments 服务'
         }
-        // ② 顺手落盘：**落到记忆文件夹的 out/**（`.whale-craft/out/`）—— 那是文件工具够得着的地方，
-        //    用户有两种看到它的方式：当场的 `read_image`（图片卡片）或轮末的 `present`（文件卡片）。
+        // ② 顺手落盘：默认 **`.whale-craft/.out/`**（不对外）。给了 `out`（例如
+        //    `.whale-craft/.express/world1/map.png`）就写那儿 —— 落在发布区时结果里会带上
+        //    现成的 `express.url` 与 `express.markdown`（`![](url)`），原样粘进回复 Master 就能看到。
         try {
           const { writeFileSync, mkdirSync } = await import('node:fs')
-          const rel = `.whale-craft/out/mc-map-${Date.now()}.png`
-          const file = join(workspaceRootFor(exec?.agent), rel)
+          const wsRoot = workspaceRootFor(exec?.agent)
+          const rel = args.out
+            ? String(args.out)
+            : `.whale-craft/${OUT_DIR}/mc-map-${Date.now()}.png`
+          const file = resolve(wsRoot, rel)
           mkdirSync(dirname(file), { recursive: true })
           writeFileSync(file, png)
           out.image.file = rel
-          out.image.hint = `想让用户**当场**看到：read_image {file_path:"${rel}"}（会话里会出现图片卡片）；`
-            + `想当"产出文件"交付：present {files:[{path:"${rel}"}]}（本轮末尾出现文件卡片，可打开源文件）`
+          const ref = expressRefFor(wsRoot, file, memoryRootFor(wsRoot))
+          if (ref) {
+            out.image.express = ref
+            out.image.hint = '这张图已发布：把 express.markdown（`![](url)`）原样粘进你的回复，Master 就能在会话里看到它'
+          } else {
+            out.image.hint = `默认输出不对外。要让 Master 看到，就把图写到发布区（out:".whale-craft/${EXPRESS_DIR}/<子目录>/x.png"），`
+              + '返回值里会带现成的 markdown，粘进回复即可'
+          }
         } catch (e) { out.image.fileError = e.message }
       }
       return out
@@ -1855,9 +1958,9 @@ export function apply(ctx, config) {
       + '· render  SVG → PNG（可给 width/height/scale；svg 文本或 svgPath 二选一）\n'
       + '· grid    把多张图按网格拼成**可继续编辑的 SVG 文本**（省掉重复写 N 个 <image> 和算坐标）\n'
       + '· save    把 SVG 文本或 PNG 字节落盘\n'
-      + '输出**默认落在记忆文件夹**（`.whale-craft/out/`）—— 那里才是文件工具够得着的地方。'
-      + '要让用户看到图，两条路都在：`read_image {file_path:".whale-craft/out/x.png"}` → **当场**出现图片卡片；'
-      + '`present {files:[{path:".whale-craft/out/x.png"}]}` → 本轮末尾出现文件卡片（可预览/可打开源文件）。',
+      + `输出默认落在 \`.whale-craft/${OUT_DIR}/\`（**不对外**）。🔴 要让 **Master** 看到图：`
+      + `把 \`out\` 写成 \`.whale-craft/${EXPRESS_DIR}/<子目录>/x.png\`（**发布区**），`
+      + '返回值里会带现成的 `express.url` 与 `express.markdown`（`![](url)`）—— 把 markdown **原样粘进你的回复**即可。',
     parameters: {
       action: { type: 'string', description: 'info / embed / render / grid / save' },
       path: { type: 'string', description: '输入文件（info/embed 用）' },
@@ -1883,18 +1986,29 @@ export function apply(ctx, config) {
       }
       const action = String(args.action ?? '').toLowerCase()
       /**
-       * 输出路径。**默认落在记忆文件夹里**（`<工作区>/.whale-craft/out/`）——
-       * 🔴 用户 2026-09-16 定的：AI 要**显式写进 `.whale-craft/`**，因为那才是文件工具够得着的地方：
-       *    · `read_image .whale-craft/out/x.png` → **当场**在会话里渲染成图片卡片（用户点开那一行就能看）；
-       *    · `present {files:[".whale-craft/out/x.png"]}` → 该轮末尾的文件卡片（可预览/可打开）。
-       *    写到工作区 `out/` 的话，jail 不让 `read_image` 读，用户就只剩"自己开文件"这一条路了。
+       * 输出路径。默认落在**记忆夹的 `.out/`**（`.whale-craft/.out/`，**不对外**）。
+       *
+       * 🔴 用户 2026-09-16 定的**发布模型**：
+       *    · `.out/` = 默认输出，**谁都访问不到**；
+       *    · `.express/` = **发布区**，放进去的文件可通过
+       *      `GET /api/mc/whale-craft/<工作区目录名>/<剩余路径>` 访问 —— 要给 Master 看就显式写进这里，
+       *      下面的 `withExpress()` 会把现成的 `url` 与 `markdown`（`![](url)`）一起返回，原样粘进回复即可。
        */
-      const outDir = join(memoryRootFor(workspaceOf(exec?.agent)), 'out')
+      const outDir = outRootOf(memoryRootFor(workspaceOf(exec?.agent)))
       const needOut = (name) => (args.out ? inWs(args.out) : join(outDir, name))
+      /** 结果里补上"可访问地址"（只在文件位于发布区时；否则原样返回） */
+      const withExpress = (value, absPath) => {
+        const ref = expressRefFor(workspaceOf(exec?.agent), absPath, memoryRootFor(workspaceOf(exec?.agent)))
+        return ref ? { ...value, express: ref } : value
+      }
 
       switch (action) {
-        case 'info':
-          return await ImageEngine.info(inWs(args.path))
+        case 'info': {
+          const p = inWs(args.path)
+          const info = await ImageEngine.info(p)
+          // 文件已经在发布区里 → 顺手把现成的 markdown 给出去
+          return withExpress(info, p)
+        }
 
         case 'embed': {
           const r = await ImageEngine.embed(inWs(args.path), {
@@ -1916,7 +2030,7 @@ export function apply(ctx, config) {
           })
           const out = needOut('mc-image.png')
           const saved = ImageEngine.save(out, r.png)
-          return { rendered: `${r.width}x${r.height}`, ...saved, hint: '想让用户看到就用 present 交付这个文件' }
+          return withExpress({ rendered: `${r.width}x${r.height}`, ...saved }, out)
         }
 
         case 'grid': {
@@ -1927,22 +2041,21 @@ export function apply(ctx, config) {
           })
           const out = needOut('mc-grid.svg')
           ImageEngine.save(out, r.svg)
-          return {
+          return withExpress({
             svg: `${r.width}x${r.height}`, cells: r.cells, layout: `${r.cols}x${r.rows}`,
             file: out, bytes: Buffer.byteLength(r.svg),
             note: '这是**可继续编辑的 SVG 文本**：想加标注就改这个文件（画 <rect stroke>、加 <text>），'
               + '再 mc_kit_image{action:"render"} 光栅化成 PNG。',
-          }
+          }, out)
         }
 
         case 'save': {
           if (!args.svg && !args.path) throw new Error('save 需要 svg（文本）或 path（要复制的文件）')
           const out = needOut('mc-image.svg')
-          if (args.svg) { const s = ImageEngine.save(out, String(args.svg)); return { ...s, kind: 'svg' } }
+          if (args.svg) return withExpress({ ...ImageEngine.save(out, String(args.svg)), kind: 'svg' }, out)
           const src = inWs(args.path)
           const { readFileSync } = await import('node:fs')
-          const s = ImageEngine.save(out, readFileSync(src))
-          return { ...s, kind: 'copy', from: src }
+          return withExpress({ ...ImageEngine.save(out, readFileSync(src)), kind: 'copy', from: src }, out)
         }
 
         default:
@@ -2008,7 +2121,10 @@ export function apply(ctx, config) {
           const sess = getSession(exec)
           server = sess.bot.sub ?? null
         }
-        return mem.put({ source: src, name: args.name, path: args.path, server })
+        const put = mem.put({ source: src, name: args.name, path: args.path, server })
+        // 目标落在**发布区**（`.express/`）里 → 顺手给出现成的 markdown / url
+        const ref = expressRefFor(workspaceOf(exec?.agent), join(memoryRootFor(workspaceOf(exec?.agent)), String(put?.path ?? args.path ?? '')), memoryRootFor(workspaceOf(exec?.agent)))
+        return ref ? { ...put, express: ref } : put
       }
 
       // 只在"没显式给 server 且没给 path"时，才用当前所在服兜底
@@ -2698,6 +2814,7 @@ export function apply(ctx, config) {
       logLine(`拒绝启用 MC 模式：这个会话没有选中工作区（.whale-craft 与提示词要建在工作区里）`)
       return
     }
+    rememberWorkspace(workspaceOf(agent))     // 发布区按"工作区目录名"寻址 → 得先记住它
     mcPolicyApplied.add(agent)
     if (agent.id) mcModeAgentIds.add(String(agent.id))
     ensureMemoryRoot(agent)        // ← 首次发起 MC 模式会话 = 建 `.whale-craft/`（README / AGENTS.md）的时机

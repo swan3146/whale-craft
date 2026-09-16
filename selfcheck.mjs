@@ -227,11 +227,14 @@ console.log('\n--- 工具面（share 移除 / present 接入）---')
   console.log(`  ${/MC_PRESET_TOOL_GROUPS/.test(idx) && /availableToolGroups\(\)/.test(idx) ? '✅' : '❌'} 复制/重建 preset 时会补齐 MC 模式需要的工具组（tool-fs / tool-jobs / present）`)
   console.log(`  ${/const ensureToolGroupsInPreset/.test(idx) && /ensureToolGroupsInPreset\(svc, existingId\)/.test(idx) ? '✅' : '❌'} 🔴 **已存在的** preset（含本机手写那份）也会被补齐那几组（不动别的行）`)
   console.log(`  ${/这些工具包在本部署的 preset 里没人引用/.test(idx) ? '✅' : '❌'} 加组之前先探"这个部署里有没有那个包"（免得把 preset 弄挂）`)
-  // 两种"让用户看到图"的方式（用户 2026-09-16 定：AI 显式写进 .whale-craft/，两条路都要有）
-  console.log(`  ${/const outDir = join\(memoryRootFor\(workspaceOf\(exec\?\.agent\)\), 'out'\)/.test(idx) ? '✅' : '❌'} mc_kit_image 默认输出落在**记忆夹**（.whale-craft/out/）`)
-  console.log(`  ${/\.whale-craft\/out\/mc-map-/.test(idx) ? '✅' : '❌'} mc_map 的图也落记忆夹（jail 里 read_image 够得着）`)
-  console.log(`  ${/read_image \{file_path:"\$\{rel\}"\}/.test(idx) && /present \{files:\[\{path:"\$\{rel\}"\}\]\}/.test(idx) ? '✅' : '❌'} 🔴 出图后同时给出两条交付路：read_image（当场图片卡片）+ present（轮末文件卡片）`)
-  console.log(`  ${/versionPromptText/.test(idx) && /versionPromptTitle/.test(idx) ? '✅' : '❌'} 版本硬提示词已接进投递（正文 + 带版本与短哈希的折叠标题）`)
+  // 发布区（用户 2026-09-16 的形态：目录即白名单、不用 token、可子目录、所有扩展名放行、必须防穿透）
+  console.log(`  ${/const outDir = outRootOf\(memoryRootFor/.test(idx) ? '✅' : '❌'} mc_kit_image 默认输出 .whale-craft/.out/（**不对外**）`)
+  console.log(`  ${/\.whale-craft\/\$\{OUT_DIR\}\/mc-map-/.test(idx) ? '✅' : '❌'} mc_map 默认也落 .out/，并支持 out: 写进发布区`)
+  console.log(`  ${/const serveExpressFile = \(req, res, hit\)/.test(idx) && /parseExpressPath\(path\)/.test(idx) ? '✅' : '❌'} 发布区路由挂在/ api/mc 里（复用信任栅栏）`)
+  console.log(`  ${/realpathSync\(target\)/.test(idx) && /拒绝越界（符号链接）/.test(idx) ? '✅' : '❌'} 🔴 防穿透：段级校验 + realpath 复查（符号链接也跳不出去）`)
+  console.log(`  ${!/read_image \{file_path/.test(codeOnly) && !/present \{files/.test(codeOnly) ? '✅' : '❌'} 🔴 旧的"用 read_image / present 发图"提示已清干净（注释里的历史说明不算）`)
+  const vp = readFileSync(new URL('./src/version-prompt.mjs', import.meta.url), 'utf8')
+  console.log(`  ${/\.express/.test(vp) && /express\.markdown/.test(vp) && /attachment.*只给\*\*模型\*\*看|只给\*\*模型\*\*看/.test(vp) ? '✅' : '❌'} 版本提示里写清交付流程（先放发布区 → 粘 markdown；attachment 只给模型看）`)
   const cli = readFileSync(new URL('./client.js', import.meta.url), 'utf8')
   console.log(`  ${/data-wc-verprompt/.test(cli) && /本版本内置提示/.test(cli) ? '✅' : '❌'} 「提示词」页只读展示版本内置提示（用户有权知道它说了什么）`)
 }
@@ -546,6 +549,91 @@ console.log('\n--- 会话锁文件落点 ---')
   console.log(`  ${noDir.lockFile.includes('.instance.sess-A.json') ? '✅' : '❌'} 没给 lockDir 时仍能算出路径（退回包目录保底，不崩）`)
   const src = (await import('node:fs')).readFileSync(new URL('./index.js', import.meta.url), 'utf8')
   console.log(`  ${/new McSession\(agentId, this\.config, this\.lockDir\)/.test(src) && /registry\.lockDir = stateDir/.test(src) ? '✅' : '❌'} index.js 把状态目录传下去了（不写插件包目录）`)
+}
+
+// ── 发布区（`.whale-craft/.express/`）：纯函数 + 真路由（用户 2026-09-16 的形态）──
+console.log('\n--- 发布区：目录即白名单 / 不用 token / 必须防穿透 ---')
+{
+  const E = await import('./src/express.mjs')
+  const { mkdtempSync, mkdirSync, writeFileSync, existsSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join, sep } = await import('node:path')
+  const { EventEmitter } = await import('node:events')
+
+  console.log(`  ${E.EXPRESS_DIR === '.express' && E.OUT_DIR === '.out' ? '✅' : '❌'} 目录名：发布区 .express / 默认输出 .out（都以点开头）`)
+  const cwd = join(mkdtempSync(join(tmpdir(), 'whale-express-')), 'myproj')
+  mkdirSync(cwd, { recursive: true })        // 工作区目录本身得存在（闸门会 statSync 它）
+  // 自检里记忆根被 WHALE_CRAFT_MEMORY_DIR 指到临时目录 → 发布区跟着它（这是**正确**行为，测试照它建）
+  const memRoot = String(process.env.WHALE_CRAFT_MEMORY_DIR ?? '') || join(cwd, '.whale-craft')
+  const exRoot = E.expressRootOf(memRoot)
+  mkdirSync(join(exRoot, 'world1'), { recursive: true })
+  writeFileSync(join(exRoot, 'world1', 'example.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]))
+  writeFileSync(join(exRoot, 'note.svg'), '<svg/>')
+
+  // ① URL 形态（用户给的例子：/whale-craft/<工作区指代>/<剩余路径>）
+  const ref = E.expressRefFor(cwd, join(exRoot, 'world1', 'example.png'), memRoot)
+  console.log(`  ${ref?.url === `/api/mc/whale-craft/myproj/world1/example.png` ? '✅' : '❌'} URL 形态 = /api/mc/whale-craft/<工作区目录名>/<剩余路径>：${ref?.url}`)
+  console.log(`  ${ref?.markdown === `![](${ref?.url})` ? '✅' : '❌'} 直接给现成 markdown：${ref?.markdown}`)
+  console.log(`  ${E.expressRefFor(cwd, join(memRoot, '.out', 'x.png'), memRoot) === null ? '✅' : '❌'} .out/ 里的文件**不给 URL**（不对外）`)
+
+  // ② 解析 + 段级防穿透
+  const parse = E.parseExpressPath('/api/mc/whale-craft/myproj/world1/example.png')
+  console.log(`  ${parse?.ws === 'myproj' && parse.segments.join('/') === 'world1/example.png' ? '✅' : '❌'} 解析出工作区与剩余路径（**子目录可以有**）`)
+  const root = join(cwd, '.whale-craft', '.express')
+  const bad = [
+    ['..', ['..', 'secret.txt']],
+    ['编码过的 ..', ['%2e%2e', 'secret.txt'].map(decodeURIComponent)],
+    ['绝对路径味道', ['C:', 'windows', 'system32']],
+    ['段里带分隔符', ['a/b.png']],
+    ['反斜杠', ['a\\b.png']],
+    ['空段', ['world1', '', 'x.png']],
+    ['点段', ['.']],
+    ['~ 开头', ['~/.ssh/id_rsa']],
+  ]
+  const leaked = bad.filter(([, segs]) => E.safeExpressTarget(root, segs) !== null)
+  console.log(`  ${leaked.length === 0 ? '✅' : '❌'} 🔴 段级防穿透（${bad.length} 种）全拒：${leaked.map(([n]) => n).join(', ') || '无漏网'}`)
+  console.log(`  ${E.safeExpressTarget(root, ['world1', 'example.png']) === join(root, 'world1', 'example.png') ? '✅' : '❌'} 正常路径（含子目录）放行`)
+
+  // ③ 真路由：走注册好的 /api/mc handler（含信任栅栏与 realpath 复查）
+  const route = registeredRoutes.find((r) => r.path === '/api/mc')
+  const callRaw = async (method, url, headers = {}) => {
+    const rq = new EventEmitter()
+    rq.method = method
+    rq.url = url
+    rq.headers = { host: '127.0.0.1:39999', ...headers }
+    const rs = {
+      status: null, headers: null, body: null,
+      writeHead: (code, h) => { rs.status = code; rs.headers = h ?? {} },
+      end: (b) => { rs.body = b ?? null },
+    }
+    const p = route.handler(rq, rs)
+    rq.emit('end')
+    await p
+    return rs
+  }
+  // 让服务端认得这个工作区（走真实路径：点开 MC设置 → settingsGate → rememberWorkspace）
+  await callRaw('GET', '/api/mc/accounts?cwd=' + encodeURIComponent(cwd))
+  const ok = await callRaw('GET', '/api/mc/whale-craft/myproj/world1/example.png')
+  console.log(`  ${ok.status === 200 && ok.headers?.['content-type'] === 'image/png' && ok.headers?.['x-content-type-options'] === 'nosniff' ? '✅' : '❌'} GET 正常出图：${ok.status} ${ok.headers?.['content-type']}（len=${ok.headers?.['content-length']}）`)
+  console.log(`  ${ok.headers?.['cache-control'] === 'private, max-age=300' ? '✅' : '❌'} 缓存头 private（不给共享缓存）`)
+  const svg = await callRaw('GET', '/api/mc/whale-craft/myproj/note.svg')
+  console.log(`  ${svg.status === 200 && /sandbox/.test(String(svg.headers?.['content-security-policy'] ?? '')) ? '✅' : '❌'} 所有扩展名都放行；svg 只加一个 CSP sandbox 头（内联显示照旧、脚本跑不了）`)
+  const trav = await callRaw('GET', '/api/mc/whale-craft/myproj/..%2F..%2FAGENTS.md')
+  console.log(`  ${trav.status === 404 ? '✅' : '❌'} 🔴 穿透请求 404（实测）`)
+  const trav2 = await callRaw('GET', '/api/mc/whale-craft/myproj/world1/..%2F..%2F..%2FREADME.md')
+  console.log(`  ${trav2.status === 404 ? '✅' : '❌'} 🔴 子目录里的穿透也 404`)
+  const missing = await callRaw('GET', '/api/mc/whale-craft/myproj/nope.png')
+  console.log(`  ${missing.status === 404 ? '✅' : '❌'} 不存在的文件 404`)
+  const otherWs = await callRaw('GET', '/api/mc/whale-craft/other-proj/world1/example.png')
+  console.log(`  ${otherWs.status === 404 ? '✅' : '❌'} 不认得的工作区 404（不是 500）`)
+  const foreign = await callRaw('GET', '/api/mc/whale-craft/myproj/note.svg', { host: 'evil.example.com' })
+  console.log(`  ${foreign.status === 403 ? '✅' : '❌'} 外来 Host 仍被信任栅栏挡在门外（403）`)
+  const head = await callRaw('HEAD', '/api/mc/whale-craft/myproj/world1/example.png')
+  console.log(`  ${head.status === 200 && head.body === null ? '✅' : '❌'} HEAD 只有头没有体`)
+  const dirReq = await callRaw('GET', '/api/mc/whale-craft/myproj')
+  console.log(`  ${dirReq.status !== 200 ? '✅' : '❌'} 目录请求不是 200（不列目录）：${dirReq.status}`)
+  const dirReq2 = await callRaw('GET', '/api/mc/whale-craft/myproj/world1')
+  console.log(`  ${dirReq2.status !== 200 ? '✅' : '❌'} 子目录请求也不是 200：${dirReq2.status}`)
 }
 
 // ── 玩家说话要能被认出来（2026-09-16 真机事故：LAN/离线服上"喊我不应，只能 tp 我"）──

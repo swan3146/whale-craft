@@ -148,8 +148,8 @@ dsh plugin --profile web add whale_craft
 - `mc_give` 走**协议级** `set_creative_slot`（创造模式即可，**不需要 OP**）；
 - `mc_sequence` 给"连串动作"（最多 64 步），比让模型写脚本稳；
 - `mc_command` 是**最后手段**（要 OP，且受白名单限制）；
-- `mc_map` 的 `format:"image"` 会渲染一张真地形图并作为**图片附件**回给模型（同时落盘到**记忆文件夹** `.whale-craft/out/`）；
-  想让**用户**看到它，两条路都在：`read_image`（当场出图片卡片）或 `present`（轮末文件卡片）——本插件不提供任何上传/图床工具。
+- `mc_map` 的 `format:"image"` 会渲染一张真地形图并作为**图片附件**回给模型，同时落盘（默认 `.whale-craft/.out/`）。
+  要让**用户**看到它，就写进**发布区**（见「把产出文件给用户看」一节）——插件自带这条通道，不依赖任何外部服务。
 - `mc_lan` 找**局域网房间**：听 `224.0.2.60:4445` 的"对局域网开放"广播，再扫本机所在网段
   （自己手写的 STATUS ping，拿版本 / MOTD / 人数）。🔴 **只允许内网网段**，公网直接拒；
   主机数 / 端口数 / 并发 / 超时全有上限——它是"看看谁开了房间"，不是扫描器。
@@ -164,24 +164,23 @@ dsh plugin --profile web add whale_craft
 
 1. **工具白名单**（`tools.restrict({allow})`，无条件生效）：只看得见
    `mc_*` / `mc_kit_*` 自己的工具 + **文件工具**（`read` / `write` / `edit` / `glob` / `grep` / `read_image`）
-   + **`present`**（显式文件交付，见下条）+ 配置里额外允许的其它工具。
+   + **`present`**（宿主有就放行，见下条）+ 配置里额外允许的其它工具。
    宿主的 `pwsh` / `subagent` / `workflow` / `serve_*` 之类**一个都看不见**
    （早期版本用的是"只 deny 自家管理工具"的黑名单，等于没隔离——已修）。
 2. **文件工具被关进记忆文件夹**：`read`/`write`/`edit`/`glob`/`grep`/`read_image` 的路径由全局 `guard`
    硬限在 `<工作区>/.whale-craft/` 内（不给路径 = 扫整个工作区 = 拒绝）。
-3. **交付产出文件走 DSH 自带的机制**（插件不提供上传/图床工具，也不依赖任何外部文件服务）：
-   · **`read_image`** → 宿主当场渲染**图片卡片**（点在工具那一行里；🔴 宿主只对工具名 `read_image` 渲染图片）；
-   · **`present`** → 该轮末尾的**文件卡片**（可预览、可「打开」源文件），正文里写成行内代码的文件名也会变成可点链接。
-   两条路都要求文件在**本会话工作区**内；出图工具（`mc_map` / `mc_kit_image`）默认就写到 `<工作区>/.whale-craft/out/`
-   —— 那里的文件既够得着 `read_image`（guard 的 jail 允许 `.whale-craft/`），也够得着 `present`。
-   如果这份 DSH 里没有 `@deepseek-ai/dsh-tool-present`（随附 preset 里没人引用它），插件**不会**往 preset 里加它。
+3. **把文件给用户看，走插件自带的「发布区」**（不依赖任何外部服务，见下一节）。
+   出图工具默认写 `<工作区>/.whale-craft/.out/`（**谁都访问不到**）；写进
+   `<工作区>/.whale-craft/.express/` 才可访问，工具会顺手返回现成的 `markdown`。
+   宿主若挂了 `read_image` / `present`（随附 `standard`/`ptc`/`cordis` 有，`minimal` 没有），它们也仍然可用 ——
+   但**不是**主要交付路：`read_image` 只在工具行里渲染图（要展开），`present` 要等轮末。
 4. **`mc_admin_*` 看不见也调不动**（白名单 + `guard` 硬拒）。
 5. 收到 2–3 条**插件提示行**（在对话里看得见、可折叠，**不是**用户发言）：
-   `.whale-craft/AGENTS.md`（行事准则，可在「MC设置 → 提示词」里改）、`.whale-craft/README.md`（记忆总索引）、
+   `.whale-craft/AGENTS.md`（行事准则，可在「MC设置 → 提示词」里改）、**版本硬提示词**、`.whale-craft/README.md`（记忆总索引），
    以及可选的（默认关）工作区 `AGENTS.md`。
 6. 系统提示词 = preset 自己的 persona（宿主按 preset 自动注入，**插件不插手**）。
-7. 另外固定投一条**版本硬提示词**（硬编码、随插件版本发布、不可编辑、无开关）：说明"本版本哪些工具还不成熟、
-   优先用什么"，并写明优先级 **用户明确的要求 > `.whale-craft/AGENTS.md` > 本条版本提示**。
+7. 版本硬提示词是**硬编码、随插件版本发布、不可编辑、无开关**的：说明"本版本哪些工具还不成熟、优先用什么、
+   怎么把图给用户看"，并写明优先级 **用户明确的要求 > `.whale-craft/AGENTS.md` > 本条版本提示**。
    「MC设置 → 提示词」页里可以展开看它的原文。
 
 > 插件本身**不带 preset 目录**（`~/.dsh/.agent-presets/<名字>/` 需要你自己放一份 persona）。
@@ -193,9 +192,39 @@ dsh plugin --profile web add whale_craft
 
 ---
 
+## 把产出文件给用户看：发布区（`.whale-craft/.express/`）
+
+> 让 AI「画了图给你看」这件事，插件**自带**一条最小通道：**目录即白名单**。不依赖任何外部图床/文件服务。
+
+| 目录 | 谁能访问 | 用途 |
+| --- | --- | --- |
+| `<工作区>/.whale-craft/.out/` | **谁都访问不到** | 默认输出（草稿、中间产物） |
+| `<工作区>/.whale-craft/.express/` | 可以被访问（**支持子目录**） | 发布区：要让用户看到的图/文件 |
+
+- 地址：`GET /api/mc/whale-craft/<工作区目录名>/<剩余路径>`
+  例：`.whale-craft/.express/world1/map.png` → `/api/mc/whale-craft/<工作区目录名>/world1/map.png`
+- 出图工具（`mc_map` / `mc_kit_image`）写进发布区时，返回值里**直接带** `express = { rel, url, markdown }`，
+  其中 `markdown` 就是 `![](url)`（**相对 URL**：本地 `127.0.0.1` 与受信域名两种访问方式都同源可用）——
+  AI 把它**原样粘进回复**，图就内联显示在对话里。已有文件想发布：
+  `mc_kit_memory {action:"put", source:".whale-craft/.out/x.png", path:".express/x.png"}`。
+- 为什么不用 `read_image` / `present`：它们是**宿主**的工具，preset 没挂就没有（官方 `minimal` 里就没有），
+  而且 `read_image` 的图只在折叠的工具行里、`present` 要等该轮结束；插件自己这条通道**不挑宿主、当场可见**。
+- 安全（按"用户自己把握"的定位，只做必要加固）：
+  · 复用 `/api/mc` 的**信任栅栏**（非回环且不在 `trustedHosts` 的 Host 403、跨站 403）；
+  · **只用纯文件名逐段拼接**：`..`、`.`、空段、段内 `/` `\`、盘符、`~` 一律拒；拼完还要 `realpath` 复查
+    "真实路径仍在发布区里" ⇒ **路径穿越与符号链接都出不去**；
+  · 目录**不列目录**（404）；单个文件上限 32 MB；
+  · **所有扩展名都放行**（含 svg/html）：只给这些"被当文档打开会执行脚本"的类型加一个
+    `Content-Security-Policy: sandbox` 头 —— 内联 `<img>` 照常显示，直接导航过去跑不了脚本；
+    其余一律 `X-Content-Type-Options: nosniff` + `Cache-Control: private`。
+- ⚠️ 发布区**不自动清理**（你可能想留图），文件会堆积，旧图让 AI 自己删
+  （`mc_kit_memory {action:"delete", path:".express/x.png"}`）。
+
+---
+
 ## 安全边界
 
-- **HTTP 接口**（`/api/mc/*`：状态、强制停止、账户、配置、提示词）有**信任栅栏**：非回环且不在
+- **HTTP 接口**（`/api/mc/*`：状态、强制停止、账户、配置、提示词、**发布区静态文件**）有**信任栅栏**：非回环且不在
   `webRuntime.trustedHosts` 的 Host 一律 403；`Sec-Fetch-Site: cross-site` 403；外来 Origin 403。
 - **AI 拿不到密码**（见上）。
 - **`mc_command`** 默认只放行一份白名单，且需要 OP；`allowAllCommands` 才全放开（自己负责）。
