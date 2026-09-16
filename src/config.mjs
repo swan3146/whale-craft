@@ -126,6 +126,60 @@ export function isCopiedPresetDescription (desc, shippedDescriptions) {
   return (shippedDescriptions ?? []).some((x) => String(x ?? '').trim() === d)
 }
 
+/**
+ * 自动建 preset 的"规格版本"。**改这个数字 = 下次启动会把我们自己建的那份刷新一遍。**
+ * （用来解决用户问的："初始化时能不能检查是不是对的，不对也重新建吗？万一用户更新插件了呢。"）
+ */
+export const MC_PRESET_SPEC = 1
+
+/**
+ * 初始化时该对 MC 模式 preset 做什么 —— **纯函数**，好测。
+ *
+ * 判定顺序（每一条都有理由，乱动别人的 preset 比不修更糟）：
+ *   ① 不存在 → 建
+ *   ② 有我们写的**标记**（marker）说明这份是我们自建的：
+ *        · 规格版本变了（插件更新了）→ **重建**（重新从官方源复制一遍）
+ *        · 组成被改过（hash 对不上标记）→ **不动**（用户改过的东西不许碰）
+ *        · 官方源变了（源组成 hash ≠ 我们当初记的）→ **重建**（把新版工具面带过来）
+ *        · 只是显示名/简介/排序不对 → 修**元数据**（composition 不动）
+ *        · 都对 → 什么都不做
+ *   ③ 没有标记（不是我们建的）：只有"简介明显是复制残留"才修元数据，其余一律不动。
+ *
+ * @param {{exists:boolean, marker:object|null, compositionHash:string|null,
+ *          sourceHash:string|null, metaOk:boolean, shippedDescriptionMatch:boolean,
+ *          spec?:number}} input
+ * @returns {{action:'create'|'rebuild'|'meta'|'leave', reason:string}}
+ */
+export function planPresetAction ({
+  exists, marker = null, compositionHash = null, sourceHash = null,
+  metaOk = true, shippedDescriptionMatch = false, spec = MC_PRESET_SPEC,
+} = {}) {
+  if (!exists) return { action: 'create', reason: '还没有 MC 模式的 preset' }
+  const ours = marker?.createdBy === 'whale_craft'
+  if (!ours) {
+    return shippedDescriptionMatch
+      ? { action: 'meta', reason: '不是我们建的，但简介明显是复制残留（旧版建出来的）→ 只修显示文本' }
+      : { action: 'leave', reason: '不是我们建的（或用户自己维护的）→ 一律不动' }
+  }
+  // 🔴 没记下组成 hash（当初读不到组成）：**没有依据判断用户改没改** → 只敢修显示文本，永不重建。
+  if (!marker.compositionHash) {
+    return metaOk
+      ? { action: 'leave', reason: '自建的，但没记下组成 hash（无法确认有没有被改过）→ 不动' }
+      : { action: 'meta', reason: '自建的，但没记下组成 hash → 只修显示文本，不敢重建' }
+  }
+  if (Number(marker.spec) !== Number(spec)) {
+    return { action: 'rebuild', reason: `自建规格从 ${marker.spec} 变成 ${spec}（插件更新了）→ 重新复制一遍` }
+  }
+  if (compositionHash && marker.compositionHash && compositionHash !== marker.compositionHash) {
+    return { action: 'leave', reason: '组成被改过（不是我们当初复制的那份）→ 不动它' }
+  }
+  if (sourceHash && marker.compositionHash && sourceHash !== marker.compositionHash) {
+    return { action: 'rebuild', reason: '官方源 preset 变了（DSH 更新了）→ 把新版工具面复制过来' }
+  }
+  if (!metaOk) return { action: 'meta', reason: '显示名/简介/排序不对 → 只修元数据' }
+  return { action: 'leave', reason: '自建的，且组成与元数据都对' }
+}
+
 /** 从现有 preset 里挑复制源：先按优先级，再退到宿主的默认 preset；都没有就 null */
 export function pickPresetSource (ids, defaultId = null) {
   const set = new Set((ids ?? []).map((x) => String(x ?? '')))

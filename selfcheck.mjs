@@ -37,6 +37,34 @@ const { tmpdir: tdTop } = await import('node:os')
 const { join: jnTop } = await import('node:path')
 /** 假"用户可写 preset 根"：自动建 preset 时把目录 / preset.yml 真写在这里，好断言内容 */
 const presetUserRoot = mkTop(jnTop(tdTop(), 'whale-presets-'))
+/** 假"官方随包 preset 根"：`list()` 要给出**真实存在**的组成文件路径（否则读不到组成、hash 只能是 null） */
+const shippedRoot = mkTop(jnTop(tdTop(), 'whale-shipped-'))
+const SHIPPED_DESC = {
+  minimal: '仅提供持久 shell 的单工具编码 Agent。',
+  standard: '功能完整的编码 Agent，支持文件编辑、Shell、文件与网页检索、Skills、计划、目标、子代理和工作流。',
+  ptc: '功能完整的编码 Agent，但默认不提供 workflow 工具。',
+}
+/** id → 组成文件真实路径（copy 之后指到用户根那份） */
+const presetPaths = new Map()
+{
+  const { mkdirSync, writeFileSync } = await import('node:fs')
+  for (const [id, d] of Object.entries(SHIPPED_DESC)) {
+    const dir = jnTop(shippedRoot, id)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(jnTop(dir, 'agent.cordis.yml'), `# ${id} composition\n`, 'utf8')
+    writeFileSync(jnTop(dir, 'preset.yml'), `name: ${id}\ndescription: ${JSON.stringify(d)}\n`, 'utf8')
+    presetPaths.set(id, jnTop(dir, 'agent.cordis.yml'))
+  }
+}
+/** 假宿主的"读元数据"：user 根里那份读 preset.yml，官方的读 SHIPPED_DESC */
+const fakeDescriptionOf = (id) => {
+  const p = jnTop(presetUserRoot, id, 'preset.yml')
+  if (exTop(p)) {
+    const m = /^description:\s*"?(.*?)"?\s*$/m.exec(rfTop(p, 'utf8'))
+    if (m) return m[1]
+  }
+  return SHIPPED_DESC[id]
+}
 
 // ── 超时保护单元验证（"停不下来"根因修复的核心机制）──
 console.log('--- withTimeout / raceAbort 单元验证 ---')
@@ -100,13 +128,25 @@ const fakeCtx = {
     authorable: true,
     defaultId: 'standard',
     roots: [{ path: presetUserRoot, trust: 'user' }],
-    list: async () => presetRows.map((id) => ({ id, trust: 'shipped', path: `/presets/${id}/agent.cordis.yml` })),
+    list: async () => [...presetPaths.keys()].map((id) => ({
+      id,
+      trust: presetPaths.get(id).startsWith(presetUserRoot) ? 'user' : 'shipped',
+      path: presetPaths.get(id),
+      description: fakeDescriptionOf(id),
+    })),
     copy: async (from, id, name) => {
       presetCopyCalls.push([from, id, name])
-      presetRows.push(id)
-      // 假宿主也真的把目录复制出来，这样插件随后写 preset.yml（简介）才有地方落
-      const { mkdirSync } = await import('node:fs')
-      mkdirSync(jnTop(presetUserRoot, id), { recursive: true })
+      // 假宿主真的把目录复制出来（组成也从源拷一份），这样插件随后写 preset.yml/标记 才有地方落
+      const { mkdirSync, writeFileSync, readFileSync } = await import('node:fs')
+      const dir = jnTop(presetUserRoot, id)
+      mkdirSync(dir, { recursive: true })
+      const srcComp = presetPaths.get(from)
+      const body = srcComp && exTop(srcComp) ? readFileSync(srcComp, 'utf8') : `# ${id} composition\n`
+      const comp = jnTop(dir, 'agent.cordis.yml')
+      writeFileSync(comp, body, 'utf8')
+      presetPaths.set(id, comp)
+      // 官方 copy() 的行为：只改 name、**保留源简介**（这正是那个 bug 的来源）
+      writeFileSync(jnTop(dir, 'preset.yml'), `name: ${name ?? id}\ndescription: ${JSON.stringify(SHIPPED_DESC[from] ?? '')}\n`, 'utf8')
     },
   },
   webServer: { register: (route) => { registeredRoutes.push(route); return () => {} } },
@@ -721,7 +761,34 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   {
     const { readFileSync } = await import('node:fs')
     const src = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
-    console.log(`  ${/isCopiedPresetDescription\(cur\?\.description, shippedDescs\)/.test(src) ? '✅' : '❌'} 已有的 MC 模式 preset 也会走一次这个判断（旧版建出来的能被修好）`)
+    console.log(`  ${/planPresetAction\(\{/.test(src) && /shippedDescriptionMatch: isCopiedPresetDescription\(row\?\.description, shippedDescs\)/.test(src) ? '✅' : '❌'} 已有的 MC 模式 preset 也会走一次判定（旧版建出来的能被修好）`)
+    console.log(`  ${/writeMcPresetMarker\(svc, target, \{/.test(src) && /MC_PRESET_MARKER = '\.whale-craft\.json'/.test(src) ? '✅' : '❌'} 建完留下"自建标记"（下次启动才知道这份是我们建的）`)
+  }
+
+  // 🔴 用户问的："初始化时能不能检查是不是对的，不对也重新建吗？万一用户更新插件了呢。"
+  //    → `planPresetAction()` 是那套判定的**纯函数**，每条分支都钉一遍。
+  {
+    const C = await import('./src/config.mjs')
+    const plan = C.planPresetAction
+    const ours = { createdBy: 'whale_craft', spec: C.MC_PRESET_SPEC, compositionHash: 'aaa' }
+    const t = (label, got, want) => console.log(`  ${got === want ? '✅' : '❌'} ${label}（→ ${got}）`)
+    t('没有 preset → 建', plan({ exists: false }).action, 'create')
+    t('自建的 + 规格变了（插件更新）→ 重建', plan({ exists: true, marker: { ...ours, spec: 0 }, compositionHash: 'aaa', sourceHash: 'aaa' }).action, 'rebuild')
+    t('🔴 自建的但**组成被用户改过** → 绝不动', plan({ exists: true, marker: ours, compositionHash: 'bbb', sourceHash: 'aaa' }).action, 'leave')
+    t('自建的 + 官方源变了（DSH 更新）→ 重建', plan({ exists: true, marker: ours, compositionHash: 'aaa', sourceHash: 'ccc' }).action, 'rebuild')
+    t('自建的 + 只是显示文本不对 → 只修元数据', plan({ exists: true, marker: ours, compositionHash: 'aaa', sourceHash: 'aaa', metaOk: false }).action, 'meta')
+    t('自建的 + 都对 → 什么都不做', plan({ exists: true, marker: ours, compositionHash: 'aaa', sourceHash: 'aaa', metaOk: true }).action, 'leave')
+    t('不是我们建的 + 简介是复制残留 → 只修元数据', plan({ exists: true, marker: null, shippedDescriptionMatch: true }).action, 'meta')
+    t('不是我们建的 + 别的 → 一律不动（用户自己维护的）', plan({ exists: true, marker: null, shippedDescriptionMatch: false }).action, 'leave')
+    // 🔴 读不到组成（没记下 hash）→ **没有依据判断用户改没改** → 只敢修显示文本，永不重建
+    t('自建的但没记下组成 hash + 文本对 → 不动', plan({ exists: true, marker: { ...ours, compositionHash: null }, metaOk: true }).action, 'leave')
+    t('自建的但没记下组成 hash + 文本不对 → 只修文本（不重建）', plan({ exists: true, marker: { ...ours, compositionHash: null }, metaOk: false }).action, 'meta')
+  }
+  // 自建标记真的落盘了吗（含规格与组成 hash）
+  {
+    const markerFile = jnTop(presetUserRoot, 'minecraft', '.whale-craft.json')
+    const mk = exTop(markerFile) ? JSON.parse(rfTop(markerFile, 'utf8')) : null
+    console.log(`  ${mk?.createdBy === 'whale_craft' && typeof mk?.compositionHash === 'string' && typeof mk?.spec === 'number' ? '✅' : '❌'} 自建标记落盘（createdBy/spec/compositionHash：${JSON.stringify(mk && { by: mk.createdBy, spec: mk.spec, hash: mk.compositionHash })})`)
   }
   console.log(`  ${pickPresetTarget(['minecraft', 'whale_craft']) === 'minecraft' ? '✅' : '❌'} 目标 id 取的是**合法目录名**（minecraft）`)
   console.log(`  ${pickPresetTarget(['whale_craft']) === null ? '✅' : '❌'} 🔴 \`whale_craft\` 带下划线、**不可能是 preset id** → 宁可不建也不硬来（null）`)

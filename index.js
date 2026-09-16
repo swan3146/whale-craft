@@ -20,14 +20,15 @@
  */
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, unlinkSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, unlinkSync, statSync, renameSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { resolve, sep, join, isAbsolute } from 'node:path'
 import { homedir } from 'node:os'
 import { McBot, lossless, logLine, libraryInfo } from './src/core.mjs'
 import { Watchdog, WATCH_DEFAULTS } from './src/watchdog.mjs'
 import { MemoryStore } from './src/memory.mjs'
-import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES } from './src/config.mjs'
+import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction } from './src/config.mjs'
 import { AccountStore, parseAuthlibCard, normalizeServerUrl, dashUuid } from './src/accounts.mjs'
 import { DEFAULT_AGENTS_MD, agentsMdPath, readAgentsMd, writeAgentsMd, resetAgentsMd, isAgentsMdPath } from './src/agentsmd.mjs'
 import { encodePng } from './src/png.mjs'
@@ -2252,6 +2253,24 @@ export function apply(ctx, config) {
     return s.startsWith('~') ? join(homedir(), s.slice(1).replace(/^[/\\]+/, '')) : s
   }
 
+  /** preset 目录（用户可写根下那个），拿不到就 null */
+  const mcPresetDir = (svc, id) => {
+    try {
+      const roots = Array.isArray(svc?.roots) ? svc.roots : []
+      const userRoot = roots.find((r) => r?.trust === 'user')?.path
+      return userRoot ? join(expandHome(userRoot), id) : null
+    } catch { return null }
+  }
+
+  /** 读组成文本（`list()` 给的行里有 path = composition 文件） */
+  const compositionOf = (row) => {
+    try {
+      const p = row?.path
+      return p && existsSync(p) ? readFileSync(p, 'utf8') : null
+    } catch { return null }
+  }
+  const hash16 = (s) => (s == null ? null : createHash('sha256').update(String(s)).digest('hex').slice(0, 16))
+
   /**
    * 把 `preset.yml`（显示名 / 简介 / 排序）写回去。
    * ⚠️ 只写**元数据**：composition（`agent.cordis.yml`）一根手指都不碰 ——
@@ -2259,11 +2278,8 @@ export function apply(ctx, config) {
    */
   const writeMcPresetMetadata = (svc, id) => {
     try {
-      const roots = Array.isArray(svc?.roots) ? svc.roots : []
-      const userRoot = roots.find((r) => r?.trust === 'user')?.path
-      if (!userRoot) return false
-      const dir = join(expandHome(userRoot), id)
-      if (!existsSync(dir)) return false
+      const dir = mcPresetDir(svc, id)
+      if (!dir || !existsSync(dir)) return false
       const body = [
         `name: ${JSON.stringify(MC_PRESET_NAME)}`,
         `description: ${JSON.stringify(MC_PRESET_DESCRIPTION)}`,
@@ -2275,26 +2291,60 @@ export function apply(ctx, config) {
     } catch (e) { logLine(`写 preset 简介失败（不影响使用）：${e.message}`); return false }
   }
 
+  /**
+   * 我们的"自建标记"：写在 preset 目录里（dot 文件，宿主不认它是 preset 内容）。
+   * 作用：**下次启动能认出自建的那份**，从而"检查不对就重建"；用户改过的一律不碰。
+   * 文件名故意带 `.json` 与点前缀 —— preset id 规则 `/^[a-z0-9][a-z0-9-]*$/` 不含点，
+   * 所以它在 discovery 眼里根本不是 preset 槽位。
+   */
+  const MC_PRESET_MARKER = '.whale-craft.json'
+  const writeMcPresetMarker = (svc, id, { source, composition }) => {
+    try {
+      const dir = mcPresetDir(svc, id)
+      if (!dir || !existsSync(dir)) return false
+      writeFileSync(join(dir, MC_PRESET_MARKER), JSON.stringify({
+        createdBy: 'whale_craft',
+        spec: MC_PRESET_SPEC,
+        at: new Date().toISOString(),
+        source: source ?? null,
+        compositionHash: hash16(composition),
+        name: MC_PRESET_NAME,
+        description: MC_PRESET_DESCRIPTION,
+      }, null, 2) + '\n', 'utf8')
+      return true
+    } catch { return false }
+  }
+  const readMcPresetMarker = (svc, id) => {
+    try {
+      const dir = mcPresetDir(svc, id)
+      if (!dir) return null
+      const p = join(dir, MC_PRESET_MARKER)
+      return existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : null
+    } catch { return null }
+  }
+
   /** 宿主 agentPresets 服务（可能晚就绪 → 必须走 inject 等，别用 apply 时的 ctx.get） */
   let agentPresetsSvc = null
   ctx.inject(['agentPresets'], (scope) => {
     agentPresetsSvc = scope.get('agentPresets') ?? null
-    void ensureMcPresetIfMissing()
+    void ensureMcPreset()
   })
 
   /**
-   * **没有 MC 模式 preset 就自动建一个**（用户 2026-09-16 定）。
+   * **MC 模式 preset 的初始化自检**（用户 2026-09-16 定，两次追加要求）：
+   *   ① 没有 → 自动建一个（复制官方 preset）
+   *   ② 有 → **检查对不对**：显示名/简介/排序、以及"组成是否还等于我们当初复制的那份"
+   *      · 我们自己建的 + 用户没改过 + 规格/官方源变了 → **重建**（先备份成 `<id>.bak-<时间>`）
+   *      · 我们自己建的但**组成被改过** → **绝不动**（用户改的就是用户的）
+   *      · 不是我们建的，只有"简介明显是复制残留"才修显示文本
    *
-   * 起因：preset 属于用户的 `$DSH_HOME/.agent-presets/`，插件不塞目录 → 新机器上没人建过 →
-   * `mcModePresets` 一个都匹配不上 → "装了插件也没有 MC模式"（没有按钮、没有隔离、没有专属提示词）。
-   *
-   * 🔴 **只能用宿主官方接口 `agentPresets.copy(源, 新id, 显示名)`**：
-   *    官方 authoring 明令"只允许整目录复制一个已有 preset，调用方不得提供 composition 文本"
-   *    （`agent-presets/src/authoring.ts` 头注释）。所以我们是**复制**官方 `minimal`，不是手搓 YAML。
-   * 🔴 **已存在就绝不动**；`ensureMcPreset:false` 可关；没有可写根（`authorable:false`）就跳过并说明。
+   * 🔴 **只能用宿主官方接口 `agentPresets.copy/remove`**：官方 authoring 明令
+   *    "只允许整目录复制已有 preset，调用方不得提供 composition 文本"
+   *    （`agent-presets/src/authoring.ts` 头注释）。
+   * 🔴 `ensureMcPreset:false` 可关；没有可写根（`authorable:false`）就跳过并说明。
    */
   let presetEnsureTried = false
-  const ensureMcPresetIfMissing = async () => {
+  const ensureMcPreset = async () => {
     if (presetEnsureTried) return
     if (pluginConfig.get('ensureMcPreset') !== true) return
     const svc = agentPresetsSvc
@@ -2302,26 +2352,59 @@ export function apply(ctx, config) {
     presetEnsureTried = true
     try {
       if (svc.authorable === false) {
-        logLine('没找到 MC 模式 preset，但这份部署没有"用户可写的 preset 根"→ 跳过自动创建（请手动建一个）')
+        logLine('MC 模式 preset 需要"用户可写的 preset 根"，但这份部署没有 → 跳过自动创建（请手动建一个）')
         return
       }
       const list = await svc.list()
-      const ids = new Set((list ?? []).map((p) => String(p?.id ?? '')).filter(Boolean))
+      const rows = new Map((list ?? []).map((p) => [String(p?.id ?? ''), p]))
+      const ids = [...rows.keys()].filter(Boolean)
       const wanted = pluginConfig.mcModePresets
-      const existingId = wanted.find((id) => ids.has(id))
+      const existingId = wanted.find((id) => rows.has(id))
+      const source = pickPresetSource(ids, svc.defaultId)
+
       if (existingId) {
-        // 已经有 MC 模式 preset → **绝不覆盖 composition**。
-        // 但**我们自己复制出来的**那份可能带着源 preset 的简介（官方 copy() 只改 name）——
-        // 只在"简介恰好等于某个官方 preset 的简介"（明显是复制残留）时修一次显示文本。
-        const cur = (list ?? []).find((p) => String(p?.id ?? '') === existingId)
-        const shippedDescs = (list ?? [])
-          .filter((p) => PREFERRED_PRESET_SOURCES.includes(String(p?.id ?? '')))
-          .map((p) => p?.description)
-        if (isCopiedPresetDescription(cur?.description, shippedDescs)) {
+        const row = rows.get(existingId)
+        const dir = mcPresetDir(svc, existingId)
+        const marker = readMcPresetMarker(svc, existingId)
+        const composition = compositionOf(row)
+        const shippedDescs = PREFERRED_PRESET_SOURCES.map((sid) => rows.get(sid)?.description)
+        const plan = planPresetAction({
+          exists: true,
+          marker,
+          compositionHash: hash16(composition),
+          // 源变了才重建：拿**我们当初记的源**（marker.source）当前的组成来比
+          sourceHash: hash16(compositionOf(rows.get(String(marker?.source ?? source ?? '')))),
+          metaOk: String(row?.name ?? '') === MC_PRESET_NAME && String(row?.description ?? '') === MC_PRESET_DESCRIPTION,
+          shippedDescriptionMatch: isCopiedPresetDescription(row?.description, shippedDescs),
+        })
+        if (plan.action === 'leave') {
+          logLine(`MC 模式 preset「${existingId}」检查通过，不动它（${plan.reason}）`)
+          return
+        }
+        if (plan.action === 'meta') {
           const fixed = writeMcPresetMetadata(svc, existingId)
           logLine(fixed
-            ? `MC 模式 preset「${existingId}」的简介还是复制来的（"${String(cur.description).slice(0, 18)}…"）→ 已改成"${MC_PRESET_DESCRIPTION}"`
-            : `MC 模式 preset「${existingId}」的简介是复制来的，但自动修改失败（请手动编辑 preset.yml）`)
+            ? `MC 模式 preset「${existingId}」${plan.reason} → 已修好显示名/简介`
+            : `MC 模式 preset「${existingId}」${plan.reason}，但自动修改失败（请手动编辑 preset.yml）`)
+          // 旧版建的那份没有标记 → 修完补一个，下次才算"我们的"
+          if (marker === null) writeMcPresetMarker(svc, existingId, { source: marker?.source ?? source, composition })
+          return
+        }
+        // plan.action === 'rebuild'：先备份整个目录，再用官方接口重新复制一遍
+        let backup = null
+        try {
+          if (dir && existsSync(dir)) {
+            backup = `${dir}.bak-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}`
+            renameSync(dir, backup)
+          }
+          await svc.copy(String(marker?.source ?? source), existingId, MC_PRESET_NAME)
+          writeMcPresetMetadata(svc, existingId)
+          writeMcPresetMarker(svc, existingId, { source: marker?.source ?? source, composition: compositionOf(rows.get(String(marker?.source ?? source ?? ''))) })
+          logLine(`MC 模式 preset「${existingId}」${plan.reason} → 已重建${backup ? `（旧的备份在 ${backup}）` : ''}`)
+        } catch (e) {
+          // 重建失败：把备份放回去，别把用户坑在"什么都没有"的状态
+          try { if (backup && !existsSync(dir)) renameSync(backup, dir) } catch { /* 尽力而为 */ }
+          logLine(`MC 模式 preset 重建失败（已回滚）：${e?.message ?? e}`)
         }
         return
       }
@@ -2333,16 +2416,21 @@ export function apply(ctx, config) {
         logLine(`没找到 MC 模式 preset，而 mcModePresets 里没有**合法**的 preset id（${wanted.join(' / ')}）→ 跳过`)
         return
       }
-      const source = pickPresetSource([...ids], svc.defaultId)
       if (!source) {
-        logLine(`没找到 MC 模式 preset，且找不到可复制的官方 preset 源（现有：${[...ids].join(' / ') || '（空）'}）→ 跳过`)
+        logLine(`没找到 MC 模式 preset，且找不到可复制的官方 preset 源（现有：${ids.join(' / ') || '（空）'}）→ 跳过`)
         return
       }
       await svc.copy(source, target, MC_PRESET_NAME)
       // copy() 会**保留源 preset 的简介**（官方只改 name）→ 必须把元数据改回来，否则简介跟极简模式一样
       const meta = writeMcPresetMetadata(svc, target)
+      // 留个"这是我们建的"标记（含规格版本 + 组成 hash）→ 下次启动才能"检查不对就重建"
+      const marked = writeMcPresetMarker(svc, target, {
+        source,
+        composition: compositionOf((await svc.list())?.find?.((p) => String(p?.id ?? '') === target)),
+      })
       logLine(`已自动创建「${MC_PRESET_NAME}」preset：复制官方 ${source} → ${target}`
         + `${meta ? '（并把简介改成"可以加入Minecraft Java版服务器…"）' : '（⚠️ 简介没改成，请手动编辑 preset.yml）'}`
+        + `${marked ? '' : '（⚠️ 没留下自建标记，下次不会自动维护它）'}`
         + `；想改就编辑 ${expandHome(String(svc.roots?.find?.((r) => r?.trust === 'user')?.path ?? '$DSH_HOME/.agent-presets'))}/${target}/`
         + `，想关掉自动创建设 ensureMcPreset=false`)
     } catch (e) {
