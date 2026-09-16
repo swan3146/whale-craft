@@ -22,6 +22,9 @@
 3. 对你的 AI 说「进 xx 服务器」。
 4. 在对话窗口下命令，或直接在游戏里聊天。
 
+> 想让 AI 进**局域网房间**？直接说"找个局域网服务器"——它用 `mc_lan` 听广播 + 扫本机网段，
+> 拿到地址后用 `mc_connect` 进去（对方要先在游戏里「对局域网开放」）。
+
 ---
 
 ## 要求
@@ -114,11 +117,11 @@ dsh plugin --profile web add whale_craft
 
 ---
 
-## 工具（27 个，三层命名空间）
+## 工具（28 个，三层命名空间）
 
 | 层 | 数量 | 工具 |
 | --- | --- | --- |
-| **游戏内** `mc_*` | 23 | `mc_status` `mc_connect` `mc_accounts` `mc_capabilities` `mc_disconnect` `mc_stop` `mc_config` `mc_sessions` `mc_diag` `mc_say` `mc_events` `mc_watch` `mc_map` `mc_scan` `mc_entities` `mc_inventory` `mc_move` `mc_act` `mc_dig` `mc_build` `mc_give` `mc_sequence` `mc_command` |
+| **游戏内** `mc_*` | 24 | `mc_status` `mc_connect` `mc_lan` `mc_accounts` `mc_capabilities` `mc_disconnect` `mc_stop` `mc_config` `mc_sessions` `mc_diag` `mc_say` `mc_events` `mc_watch` `mc_map` `mc_scan` `mc_entities` `mc_inventory` `mc_move` `mc_act` `mc_dig` `mc_build` `mc_give` `mc_sequence` `mc_command` |
 | **游戏外辅助** `mc_kit_*` | 3 | `mc_kit_memory`（记忆树）· `mc_kit_share`（传文件拿链接）· `mc_kit_image`（SVG→PNG / 引图 / 拼网格） |
 | **管理** `mc_admin_*` | 1 | `mc_admin_config`（读写全局配置；**MC 模式看不见、也调不动**） |
 
@@ -127,7 +130,10 @@ dsh plugin --profile web add whale_craft
 - `mc_give` 走**协议级** `set_creative_slot`（创造模式即可，**不需要 OP**）；
 - `mc_sequence` 给"连串动作"（最多 64 步），比让模型写脚本稳；
 - `mc_command` 是**最后手段**（要 OP，且受白名单限制）；
-- `mc_map` 的 `format:"image"` 会渲染一张真地形图并作为**图片附件**回给模型。
+- `mc_map` 的 `format:"image"` 会渲染一张真地形图并作为**图片附件**回给模型；
+- `mc_lan` 找**局域网房间**：听 `224.0.2.60:4445` 的"对局域网开放"广播，再扫本机所在网段
+  （自己手写的 STATUS ping，拿版本 / MOTD / 人数）。🔴 **只允许内网网段**，公网直接拒；
+  主机数 / 端口数 / 并发 / 超时全有上限——它是"看看谁开了房间"，不是扫描器。
 
 ---
 

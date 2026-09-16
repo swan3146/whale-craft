@@ -1462,6 +1462,79 @@ console.log(missing.length ? `  ❌ 缺少参数：${missing.join(', ')}` : `  �
 console.log(leaked.length ? `  ❌ 凭据参数又回来了：${leaked.join(', ')}` : '  ✅ mc_connect 上没有 authUrl/authUser/authPass（凭据只在服务端）')
 
 // ── 客户端 bundle 静态断言（防误删/防回退；真机渲染仍要浏览器里看）──
+// ── 局域网探测（mc_lan）：纯函数 + **真在回环上跑一遍协议** ──
+console.log('\n--- 局域网探测（mc_lan）---')
+{
+  const L = await import('./src/lan.mjs')
+  const { createServer } = await import('node:net')
+
+  // ① 广播文本解析（Minecraft "对局域网开放" 的格式）
+  const b1 = L.parseLanBroadcast('[MOTD]A Minecraft Server[/MOTD][AD]25565[/AD]')
+  console.log(`  ${b1?.port === 25565 && b1?.motd === 'A Minecraft Server' ? '✅' : '❌'} 解析局域网广播（MOTD + 端口）`)
+  console.log(`  ${L.parseLanBroadcast('乱七八糟') === null && L.parseLanBroadcast('[AD]0[/AD]') === null ? '✅' : '❌'} 垃圾文本/非法端口 → null`)
+
+  // ② 内网判定：只许打自己家网络
+  const priv = ['10.0.0.5', '172.16.0.1', '172.31.255.254', '192.168.1.9', '169.254.1.1', '127.0.0.1']
+  const pub = ['8.8.8.8', '172.15.0.1', '172.32.0.1', '11.0.0.1', '1.1.1.1']
+  console.log(`  ${priv.every(L.isPrivateIPv4) && !pub.some(L.isPrivateIPv4) ? '✅' : '❌'} 内网判定（10/8 · 172.16-31 · 192.168 · 169.254 · 127）`)
+
+  // ③ 网段展开 + 🔴 公网必须被拒
+  const hosts = L.hostsOf('192.168.1')
+  console.log(`  ${hosts.length === 254 && hosts[0] === '192.168.1.1' && hosts.at(-1) === '192.168.1.254' ? '✅' : '❌'} /24 展开成 .1~.254（跳过网络号/广播号）`)
+  console.log(`  ${L.hostsOf('192.168.1.7').length === 1 && L.hostsOf('192.168.1.7')[0] === '192.168.1.7' ? '✅' : '❌'} 单个地址（/32）就只扫一个`)
+  const refused = await Promise.resolve().then(() => L.hostsOf('8.8.8')).catch((e) => e.message)
+  console.log(`  ${/只允许扫描内网网段/.test(String(refused)) ? '✅' : '❌'} 🔴 公网网段被拒：${String(refused).slice(0, 34)}`)
+  const badSpec = await Promise.resolve().then(() => L.hostsOf('not-a-subnet')).catch((e) => e.message)
+  console.log(`  ${/网段写法不认/.test(String(badSpec)) ? '✅' : '❌'} 写法不对也报清楚`)
+
+  // ④ MOTD 组件拍平（含 § 颜色码）
+  console.log(`  ${L.flattenMotd({ text: 'A ', extra: [{ text: '§aFake' }, { text: ' §rServer' }] }) === 'A Fake Server' ? '✅' : '❌'} MOTD 组件拍平 + 去掉 § 颜色码`)
+
+  // ⑤ VARINT 往返（300 要两个字节才装得下）
+  const v = L.writeVarInt(300)
+  const back = L.readVarInt(v, 0)
+  console.log(`  ${v.length === 2 && back?.value === 300 && back?.size === 2 ? '✅' : '❌'} VARINT 编解码往返（300 → ${v.length} 字节）`)
+
+  // ⑥ 🔴 真在回环上起一个"假 MC 服务器"，把 STATUS ping 整条路跑通
+  const fake = createServer((sock) => {
+    sock.once('data', () => {
+      const json = JSON.stringify({
+        version: { name: '1.21.4', protocol: 769 },
+        players: { online: 2, max: 20, sample: [{ name: 'Alice' }, { name: 'Bob' }] },
+        description: { text: 'A §aFake §rServer' },
+      })
+      const payload = Buffer.concat([L.writeVarInt(0x00), L.writeVarInt(Buffer.byteLength(json)), Buffer.from(json, 'utf8')])
+      sock.write(Buffer.concat([L.writeVarInt(payload.length), payload]))
+    })
+  })
+  await new Promise((r) => fake.listen(0, '127.0.0.1', r))
+  const port = fake.address().port
+  const st = await L.statusPing({ host: '127.0.0.1', port, timeoutMs: 2000 })
+  console.log(`  ${st.ok === true ? '✅' : '❌'} STATUS ping 手写协议跑通（${st.ok ? st.latencyMs + 'ms' : st.error}）`)
+  console.log(`  ${st.version === '1.21.4' && st.protocol === 769 ? '✅' : '❌'} 读到版本 ${st.version}（协议 ${st.protocol}）`)
+  console.log(`  ${st.players?.online === 2 && st.players?.max === 20 && st.players?.sample?.[0] === 'Alice' ? '✅' : '❌'} 读到人数 2/20 + 玩家名`)
+  console.log(`  ${st.motd === 'A Fake Server' ? '✅' : '❌'} 读到 MOTD（颜色码已去）：${JSON.stringify(st.motd)}`)
+
+  // ⑦ 端口探测：开着的 true、没人听的 false（都走回环）
+  const openOk = await L.probePort({ host: '127.0.0.1', port, timeoutMs: 800 })
+  const closedOk = await L.probePort({ host: '127.0.0.1', port: 1, timeoutMs: 300 })
+  console.log(`  ${openOk === true && closedOk === false ? '✅' : '❌'} TCP 端口探测（开着=true / 关着=false）`)
+
+  // ⑧ 扫段整条路：只扫 127.0.0.1 这一个地址、只扫那一个端口 → 必须找到这台假服务器
+  const scan = await L.scanSubnet({ subnet: '127.0.0.1', ports: [port], timeoutMs: 800, pingTimeoutMs: 2000 })
+  const hit = scan.servers?.[0]
+  console.log(`  ${scan.hosts === 1 && scan.openPorts === 1 && hit?.version === '1.21.4' ? '✅' : '❌'} 扫段 → 摸端口 → STATUS ping 一条龙（找到 ${scan.servers?.length ?? 0} 台）`)
+  await new Promise((r) => fake.close(r))
+
+  // ⑨ 工具面：注册了、参数齐、公网网段在工具层也被拒（且不傻等广播）
+  const lanDef = tools.get('mc_lan')
+  console.log(`  ${lanDef ? '✅' : '❌'} 注册了 mc_lan 工具`)
+  const lanParams = Object.keys(lanDef?.parameters?.properties ?? lanDef?.parameters ?? {})   // defineTool 归一成 JSON Schema，真参数在 .properties
+  console.log(`  ${['mode', 'subnet', 'ports', 'seconds'].every((k) => lanParams.includes(k)) ? '✅' : '❌'} 参数齐（${lanParams.join(', ')}）`)
+  const lanRefuse = await tools.get('mc_lan').execute({ mode: 'scan', subnet: '8.8.8' }, A)
+  console.log(`  ${lanRefuse?.error && /网段被拒/.test(String(lanRefuse.error)) ? '✅' : '❌'} 工具层同样拒绝公网：${String(lanRefuse?.error).slice(0, 30)}`)
+}
+
 console.log('\n--- 客户端 bundle（client.js 静态检查）---')
 {
   const { readFileSync } = await import('node:fs')

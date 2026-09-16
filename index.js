@@ -31,6 +31,10 @@ import { AccountStore, parseAuthlibCard, normalizeServerUrl, dashUuid } from './
 import { DEFAULT_AGENTS_MD, agentsMdPath, readAgentsMd, writeAgentsMd, resetAgentsMd, isAgentsMdPath } from './src/agentsmd.mjs'
 import { encodePng } from './src/png.mjs'
 import { ImageEngine, imageEngineAvailable, imageEngineError } from './src/image.mjs'
+import {
+  DEFAULT_PORTS as DEFAULT_LAN_PORTS, hostsOf, localAddresses, localSubnets,
+  listenLanBroadcast, scanSubnet,
+} from './src/lan.mjs'
 
 export const name = 'whale_craft'
 export const inject = ['webServer', 'tools']
@@ -982,6 +986,105 @@ export function apply(ctx, config) {
       const sess = getSession(exec)
       const s = sess.bot.status()
       return { ...s, ...sess.modeView(), recentChat: sess.bot.recentChat(5) }
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_lan',
+    description: '探测**局域网里的 Minecraft 服务器**（只读：不连接、不进服）。两种手段：\n'
+      + '① **广播**：Minecraft"对局域网开放"会在多播 `224.0.2.60:4445` 上发 `[MOTD]…[/MOTD][AD]端口[/AD]`，'
+      + '听到就是"谁开了房间"，连端口都直接拿到；\n'
+      + '② **扫段**：扫本机所在网段（默认各网卡 /24）的候选端口，开着的发 **STATUS ping** 拿版本 / MOTD / 人数。\n'
+      + '`mode` 默认 `both`。🔴 **只允许内网网段**（私有 / 回环 / 链路本地），公网直接拒；'
+      + '主机数 / 端口数 / 并发 / 超时都有上限。拿到 host/port 后用 `mc_connect` 进服。',
+    parameters: {
+      mode:        { type: 'string', description: 'broadcast（只听广播）/ scan（只扫网段）/ both（默认）' },
+      subnet:      { type: 'string', description: '要扫的网段，如 `192.168.1` 或 `192.168.1.0/24`；不传就用本机各私有网卡的 /24' },
+      ports:       { type: 'string', description: '端口，逗号分隔（默认 25565 及邻近的 25566-25569）' },
+      seconds:     { type: 'number', description: '听广播多久（默认 3 秒，上限 15）' },
+      timeoutMs:   { type: 'number', description: '每个端口 TCP 探测超时（默认 400ms）' },
+      pingTimeoutMs: { type: 'number', description: 'STATUS ping 超时（默认 1200ms）' },
+      includeSelf: { type: 'boolean', description: '是否包含本机地址（默认 true）' },
+    },
+    output: text(),
+    async execute(args, exec) {
+      const mode = String(args.mode ?? 'both').toLowerCase()
+      const wantBroadcast = mode !== 'scan'
+      const wantScan = mode !== 'broadcast'
+      const ports = (() => {
+        const raw = String(args.ports ?? '').trim()
+        if (!raw) return DEFAULT_LAN_PORTS
+        const list = raw.split(/[,\s]+/).map((x) => Number(x)).filter((n) => Number.isInteger(n) && n > 0 && n <= 65535)
+        if (!list.length) throw new Error(`ports 写法不认：${raw}（用 25565,25566 这样）`)
+        return [...new Set(list)].slice(0, 8)          // 上限 8 个，别把扫段变成扫描器
+      })()
+
+      const broadcast = []
+      if (wantBroadcast) {
+        const seconds = Math.max(1, Math.min(Number(args.seconds) || 3, 15))
+        broadcast.push(...await listenLanBroadcast({ seconds }))
+      }
+
+      let scanned = null
+      const servers = broadcast.map((b) => ({ ...b }))
+      if (wantScan) {
+        let subnets = []
+        try {
+          if (args.subnet) {
+            hostsOf(String(args.subnet), { max: 1 })      // 先校验：写法不对 / 是公网 → 抛错
+            subnets = [String(args.subnet)]
+          } else {
+            subnets = localSubnets()
+          }
+        } catch (e) {
+          // 非法网段（例如公网）→ 说清楚，但不打断广播那部分的结果
+          return {
+            ok: true, mode, broadcast,
+            error: `网段被拒：${e.message}`,
+            hint: '只扫内网（10./172.16-31./192.168./169.254./127.）；要看公网服务器请直接用 mc_connect。',
+          }
+        }
+        if (!subnets.length) {
+          return {
+            ok: true, mode, broadcast,
+            error: '没有可扫的内网网段（本机所有网卡都不是私有地址）',
+            hint: '可以显式给 subnet，如 192.168.1。',
+          }
+        }
+        const selfIps = new Set(localAddresses())
+        for (const sn of subnets.slice(0, 4)) {
+          const r = await scanSubnet({
+            subnet: sn, ports,
+            timeoutMs: Number(args.timeoutMs) || 400,
+            pingTimeoutMs: Number(args.pingTimeoutMs) || 1200,
+            signal: exec?.signal ?? null,
+          })
+          for (const s of r.servers) {
+            if (args.includeSelf === false && selfIps.has(s.host)) continue
+            if (servers.some((x) => x.host === s.host && x.port === s.port)) continue
+            servers.push(s)
+          }
+          scanned = scanned ?? { subnets: [], hosts: 0, ports: ports.length, openPorts: 0 }
+          scanned.subnets.push(sn)
+          scanned.hosts += r.hosts
+          scanned.openPorts += r.openPorts
+        }
+      }
+
+      // 排个序：广播来的最可信（有人开房），其次是有版本的，再按延迟
+      servers.sort((a, b) => (b.source === 'broadcast' ? 1 : 0) - (a.source === 'broadcast' ? 1 : 0)
+        || (b.version ? 1 : 0) - (a.version ? 1 : 0)
+        || (a.latencyMs ?? 9e9) - (b.latencyMs ?? 9e9))
+      const found = servers.slice(0, 20)
+      return {
+        ok: true,
+        mode,
+        broadcast,
+        scanned,
+        count: servers.length,
+        found,
+        ...(servers.length ? {} : { hint: '没找到。确认对方已经"对局域网开放"（或把端口告诉我），必要时用 subnet 指定网段。' }),
+      }
     },
   }))
 
