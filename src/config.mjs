@@ -62,14 +62,18 @@ export const DEFAULT_CONFIG = {
   mcModePresets: ['minecraft', 'whale_craft'],
   mcMode: {
     /**
-     * 允许 MC 模式会话使用的**其它工具**（whale_craft 自己的工具永远放行）。
-     * 非空 = 白名单模式：除列出者之外，其它工具对 MC 模式会话隐藏。
+     * **额外**允许 MC 模式会话使用的其它工具（whale_craft 自己的工具与文件工具永远在白名单里）。
+     *
+     * MC 模式是**无条件白名单**：默认只给 `mc_*` / `mc_kit_*` + 文件工具（`read/write/edit/glob/grep/read_image`），
+     * 宿主的 `pwsh` / `subagent` / `workflow` / `serve_*` 之类一律看不见。想额外开哪个就写在这里。
      * ⚠️ 只能"收窄"，不能凭空添加 preset 没挂的工具。
+     *
+     * （2026-09-16 修：以前 `allowOtherTools` 为空就退化成"只 deny 自家管理工具"的黑名单，
+     *   结果 MC 模式里 pwsh 照样能用 —— 用户真机投诉"不是只暴露我们指定的工具吗！"。
+     *   同时删掉了 `denyOtherTools`：白名单之外本来就看不见，那个开关没有意义了。）
      */
     allowOtherTools: [],
-    /** 禁止 MC 模式会话使用的其它工具（黑名单，精确名）。 */
-    denyOtherTools: [],
-    /** 是否对 MC 模式会话隐藏 mc_admin_* （隐藏之外，guard 仍会硬拒） */
+    /** 是否把 mc_admin_* 也放进白名单（默认 false = 隐藏；隐藏之外 guard 仍会硬拒） */
     hideAdminTools: true,
   },
   /** 记忆根目录；null = `<工作区>/.whale-craft` */
@@ -337,7 +341,6 @@ export class PluginConfig {
     const v = this.get('mcMode')
     return {
       allowOtherTools: Array.isArray(v?.allowOtherTools) ? v.allowOtherTools.map(String) : [],
-      denyOtherTools: Array.isArray(v?.denyOtherTools) ? v.denyOtherTools.map(String) : [],
       hideAdminTools: v?.hideAdminTools !== false,
     }
   }
@@ -403,7 +406,7 @@ function validate (top, rest, value) {
     return
   }
   if (top === 'mcMode') {
-    if (key === 'mcMode.allowOtherTools' || key === 'mcMode.denyOtherTools') {
+    if (key === 'mcMode.allowOtherTools') {
       if (!isStrArray) throw new Error(`${key} 必须是字符串数组（工具名，精确匹配）`)
       return
     }
@@ -411,9 +414,9 @@ function validate (top, rest, value) {
       if (typeof value !== 'boolean') throw new Error('mcMode.hideAdminTools 必须是 true/false')
       return
     }
-    if (key !== 'mcMode') throw new Error(`未知配置项 "${key}"；mcMode 下可用：allowOtherTools / denyOtherTools / hideAdminTools`)
+    if (key !== 'mcMode') throw new Error(`未知配置项 "${key}"；mcMode 下可用：allowOtherTools / hideAdminTools`)
     if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-      throw new Error('mcMode 必须是对象，如 {"allowOtherTools":[],"denyOtherTools":[],"hideAdminTools":true}')
+      throw new Error('mcMode 必须是对象，如 {"allowOtherTools":[],"hideAdminTools":true}')
     }
   }
 }

@@ -582,19 +582,7 @@ export class McBot extends EventEmitter {
       b.on('health', () => {
         if (b.health !== undefined && b.health <= 6) this.emit('damage', { health: b.health, position: this.position })
       })
-      b.on('message', (msg) => {
-        const text = this.#plain(msg)
-        this.#pushChat('system', null, text)
-        this.emit('system', { text })
-      })
-      b._client.on('player_chat', (p) => {
-        const who = String(p?.networkName?.value ?? p?.networkName ?? '?')
-        const text = p?.plainMessage ?? ''
-        this.#pushChat('player', who, text)
-        this.stats.chats++
-        this.stats.lastEventAt = Date.now()
-        if (who !== b.username) this.emit('chat', { who, text })
-      })
+      this.wireChatEvents(b)
 
       try {
         await new Promise((resolve, reject) => {
@@ -863,8 +851,113 @@ export class McBot extends EventEmitter {
 
   /* ───────────── 聊天记录 ───────────── */
 
+  /**
+   * 把 mineflayer 的聊天/系统消息接到本实例的 `chat` / `system` 事件上。
+   *
+   * 🔴🔴 2026-09-16 真机事故（用户："喊我不应，只能 tp 我"）：
+   *    以前只有 `_client.on('player_chat')`（**签名**聊天包）才 `emit('chat')`，
+   *    而 `bot.on('message')`（`system_chat`，**未签名**聊天）被一律当成 system 丢掉。
+   *    对**局域网开放的世界 / 离线服 / 1.19+ 关掉签名聊天**的服务器，玩家说话走的正是
+   *    `system_chat` → `player_chat` 永不触发 → 看门狗的 mention / nearbySpeech **全哑**，
+   *    只剩 damage / death / teleport 能用（`stats.chats === 0`、看门狗日志里一条 chat 都没有）。
+   *
+   * 现在按 mineflayer 的约定分流（`lib/plugins/chat.js` 里两种包的 emit 签名）：
+   *    · `position === 'chat'`  → 来自 playerChat（签名）→ 由下面的 `player_chat` handler 处理，
+   *      这里**直接跳过**（否则同一条进两遍）
+   *    · `position === undefined`→ 来自 systemChat 的 **positionId 0 = 聊天**（未签名）→ 当玩家说话
+   *    · 其余（'system' / 'game_info'）→ 仍然是系统消息
+   *
+   * ⚠️ 这是**公开方法**（不放在 connect 里内联）：自检要能用假 bot 走同一条代码路径 ——
+   *    "喊我能不能醒"这种链路，断言必须落在真实实现上，不能只 grep 源码。
+   * @param {object} b mineflayer bot（`on` + `_client`）
+   */
+  wireChatEvents (b) {
+    b.on('message', (msg, position) => {
+      const text = this.#plain(msg)
+      if (position === 'chat') return
+      if (position === undefined) {
+        const parsed = this.#playerChatFrom(msg, text)
+        if (parsed) {
+          this.#emitPlayerChat(parsed.who, parsed.text, b.username)
+          return
+        }
+      }
+      this.#pushChat('system', null, text)
+      this.emit('system', { text })
+    })
+    b._client?.on?.('player_chat', (p) => {
+      const who = String(p?.networkName?.value ?? p?.networkName ?? '?')
+      const text = p?.plainMessage ?? ''
+      this.#emitPlayerChat(who, text, b.username)
+    })
+    return b
+  }
+
   #plain (msg) {
     try { return msg.toString().replace(/§./g, '') } catch { return String(msg) }
+  }
+
+  /**
+   * 一条"玩家说话"进账（**唯一入口**：签名聊天与未签名聊天都走这里）。
+   * 自带 1.5 秒去重：同一句同一人在极短时间内从两条路各来一次（理论上不会）也只发一次。
+   */
+  #emitPlayerChat (who, text, selfName) {
+    const w = String(who ?? '?')
+    const t = String(text ?? '')
+    if (!t) return
+    const key = `${w}\u0000${t}`
+    const now = Date.now()
+    if (this._lastChatKey === key && now - (this._lastChatAt ?? 0) < 1500) return
+    this._lastChatKey = key
+    this._lastChatAt = now
+    this.#pushChat('player', w, t)
+    this.stats.chats++
+    this.stats.lastEventAt = now
+    if (w !== selfName) this.emit('chat', { who: w, text: t })
+  }
+
+  /**
+   * 从 `bot.on('message')` 收到的消息里**认出"玩家聊天"**（未签名聊天：LAN 开放世界 / 离线服 / 1.19+）。
+   *
+   * 判据按 translate 键（服务端给的聊天类型），只认这几种"有人在说话"的：
+   *    · `chat.type.text`                    —— 普通公屏（渲染成 `<名字> 正文`）
+   *    · `chat.type.team.text` / `.team.*`    —— 队伍聊天（with = [队伍, 发送者, 正文]）
+   *    · `commands.message.display.incoming` —— 别人私聊我（with = [发送者, 正文]）
+   * 其它一律返回 null（服务器公告、加入/离开、成就…都还是 system）。
+   * @returns {{who:string, text:string}|null}
+   */
+  #playerChatFrom (msg, plain) {
+    const t = String(msg?.translate ?? '')
+    const withParts = Array.isArray(msg?.with) ? msg.with : []
+    const partText = (p) => {
+      if (p === null || p === undefined) return ''
+      if (typeof p === 'string') return p
+      if (typeof p.text === 'string') return p.text
+      try { return String(p) } catch { return '' }
+    }
+
+    // ① 队伍聊天：who 取**发送者**（with[1]），不是队伍名
+    if (/^chat\.type\.team\./.test(t)) {
+      const who = partText(withParts[1] ?? withParts[0])
+      const body = partText(withParts[withParts.length - 1])
+      if (body) return { who: who || '?', text: body }
+    }
+    // ② 普通公屏
+    if (t === 'chat.type.text') {
+      const who = partText(withParts[0])
+      const body = partText(withParts[1] ?? withParts[withParts.length - 1])
+      if (body) return { who: who || '?', text: body }
+    }
+    // ③ 私聊（/tell、/msg）
+    if (t === 'commands.message.display.incoming') {
+      const who = partText(withParts[0])
+      const body = partText(withParts[1] ?? withParts[withParts.length - 1])
+      if (body) return { who: who || '?', text: body }
+    }
+    // ④ 兜底：渲染出来就是 `<名字> 正文` 的形状（有些服务端用自定义 chat type，translate 不认识）
+    const m = /^\s*<([^<>]{1,32})>\s*(.+)$/s.exec(String(plain ?? ''))
+    if (m) return { who: m[1].trim(), text: m[2] }
+    return null
   }
 
   #pushChat (kind, who, text) {

@@ -122,11 +122,16 @@ export const Config = z.object({
   // ── 行为配置（保留）──
   /**
    * "喊我"的触发词（正则，大小写不敏感）。聊天里命中这些词才算在叫我。
-   * 默认覆盖用户的各种叫法（deepseek / ds / dsh / ai / agent / 机器人 / 麦块 / bot_name）。
+   *
+   * 🔴 2026-09-16 用户投诉："为什么这台服务器上叫'auth'的记忆它有？你暴露了些什么东西出去了！"
+   *    根因就是这里**曾经把私人的账号名/昵称写成了默认值**——那串名字跟着代码进了**公开的开源副本**。
+   *    默认值只留**通用叫法**；具体账号名由插件在连接成功后**从登录档案里现学**
+   *    （见 `Watchdog.learnName`），外号用 `mc_config {patch:{mentionPatterns:[…]}}` 加
+   *    —— **代码里永不再出现私人名字**。
    */
   mentions: z.array(z.string()).default([
     'deepseek', 'deep\\s*seek', '\\bds\\b', '\\bdsh\\b', '\\bai\\b', 'agent',
-    '机器人', '麦块', 'bot_name', '昵称',
+    '机器人', '麦块',
   ]),
   /** 聊天是否必须命中触发词才算叫我（默认 true：避免公屏闲聊把我叫醒） */
   chatMentionOnly: z.boolean().default(true),
@@ -1059,6 +1064,27 @@ export function apply(ctx, config) {
    *      见 packages/core/tools/src/index.ts:219 "cannot hard-kill same-process code"），
    *      所以必须由我们在每个 mineflayer await 上监听它，否则按停止要等本地超时（最长 25s）。
    */
+  /**
+   * MC 模式白名单里的**文件工具**（宿主 tool-fs / tool-fs-search 注册的名字）。
+   *
+   * 🔴 用户 2026-09-16："读写文件都只能在记忆文件夹内！" —— 这几个工具留在可见面上
+   *    （看地图、写 SVG、读回自己存的图都要用），但路径由 guard 硬限在 `<工作区>/.whale-craft/`。
+   */
+  const MC_FILE_TOOLS = ['read', 'write', 'edit', 'glob', 'grep', 'read_image']
+
+  /**
+   * 从一次工具调用里取"要碰的路径"：是文件工具才返回（不是 → null；是但没给路径 → 空串）。
+   * 路径参数名按宿主用 `path`，也兼容 harness 的 `file_path`；glob/grep 的目录参数同样是 `path`。
+   */
+  const fileToolPath = (exec) => {
+    const name = String(exec?.name ?? '')
+    if (!/^(read|write|edit|glob|grep|read_image)$/i.test(name)) return null
+    const args = exec?.arguments ?? {}
+    const v = args.path ?? args.file_path ?? args.dir ?? args.directory
+    if (v === undefined || v === null) return ''
+    return String(v)
+  }
+
   /** 我们自己注册的工具名（MC 模式做工具白名单时要带上它们，否则会被 restrict 一并滤掉） */
   const ourToolNames = []
 
@@ -1231,6 +1257,8 @@ export function apply(ctx, config) {
       const ready = await sess.bot.waitForChunks()
       // 进服自动挂看门狗（用户要求：进游戏自动打开）
       const wd = ensureWatchdog(ctx, sess, exec?.agent, promptAbort.signal)
+      // 把自己的游戏名学进叫法（默认叫法里**没有**私人名字 —— 见 learnName 的注释）
+      try { wd.learnName(sess.bot?.bot?.username) } catch { /* 拿不到就算了 */ }
       if (wd.config.autoArm && !wd.armed) {
         try { wd.arm() } catch (e) { ctx.logger?.warn?.(`[whale_craft] 看门狗自动挂载失败：${e.message}`) }
       }
@@ -2677,37 +2705,40 @@ export function apply(ctx, config) {
     //    complete/includeRuntimeContext 压掉）。这里只做"命令式"的部分：工具可见性 + guard。
     logLine(`MC 模式生效（preset=${lastPresetSeen.get(agent) ?? '?'}，${agent.id}）`)
 
-    // ② 工具可见性：隐藏管理工具（以及配置里的白/黑名单）
+    // ② 工具可见性：**白名单**（用户 2026-09-16 真机投诉："这个 agent 怎么还能用 pwsh！不是只暴露我们指定的工具吗！"）
+    //
+    // 🔴 以前是"allowOtherTools 非空才走白名单"——默认为空 ⇒ 只 deny 了我们自己的管理工具，
+    //    宿主那一堆工具（pwsh / subagent / workflow / serve_* / web_* …）**全都还在**。
+    //    那不是"隔离"，只是"藏了自家两个工具"。现在**无条件白名单**：
+    //      我们自己的非管理工具（mc_* / mc_kit_*）+ **文件工具**（会被 guard 限在 .whale-craft/ 内）
+    //      + 配置里额外允许的其它工具。
     try {
       const t = scopedTools(agent.ctx)
       if (!t) { logLine('MC 模式：拿不到 scoped tools，跳过可见性限制（guard 仍会硬拒）'); return }
-      const { allowOtherTools, denyOtherTools, hideAdminTools } = pluginConfig.mcMode
+      const { allowOtherTools, hideAdminTools } = pluginConfig.mcMode
       const adminNames = ourToolNames.filter((n) => n.startsWith('mc_admin_'))
-      const deny = [...denyOtherTools, ...(hideAdminTools ? adminNames : [])]
-
-      if (allowOtherTools.length) {
-        // 白名单模式：我们自己的非管理工具 + 配置里允许的"其它工具"
-        const allow = [...ourToolNames.filter((n) => !n.startsWith('mc_admin_')), ...allowOtherTools]
-        t.restrict({ allow })
-        logLine(`MC 模式：已应用工具白名单（${agent.id}）：${allow.join(', ')}`)
-      } else if (deny.length) {
-        t.restrict({ deny })
-        logLine(`MC 模式：已隐藏工具（${agent.id}）：${deny.join(', ')}`)
-      }
+      const allow = [
+        ...ourToolNames.filter((n) => !n.startsWith('mc_admin_')),
+        ...(hideAdminTools ? [] : adminNames),
+        ...MC_FILE_TOOLS,
+        ...allowOtherTools,
+      ]
+      t.restrict({ allow })
+      logLine(`MC 模式：工具白名单已生效（${agent.id}）：${allow.join(', ')}`)
     } catch (e) {
-      // 配置里写了宿主不认识的工具名会让 restrict 抛错 —— 退化成"只限制本插件自己的工具"
+      // 配置里写了宿主不认识的工具名会让 restrict 抛错 —— 退化成"只给我们的工具 + 文件工具"
       try {
         const t = scopedTools(agent.ctx)
-        const safe = ourToolNames.filter((n) => n.startsWith('mc_admin_'))
+        const safe = [...ourToolNames.filter((n) => !n.startsWith('mc_admin_')), ...MC_FILE_TOOLS]
         if (t && safe.length) {
-          t.restrict({ deny: safe })
-          logLine(`MC 模式：配置里有 restrict 不认识的名字（${String(e.message).slice(0, 120)}）→ 退化为只隐藏管理工具`)
+          t.restrict({ allow: safe })
+          logLine(`MC 模式：配置里有 restrict 不认识的名字（${String(e.message).slice(0, 120)}）→ 退化为只给 mc_* / mc_kit_* / 文件工具`)
         }
       } catch (e2) { logLine(`MC 模式工具限制失败：${e2.message}`) }
     }
   }
 
-  // ③ 硬保证：MC 模式会话**调不动**管理工具（不管可见性怎样）
+  // ③ 硬保证（不管可见性怎样）：管理工具调不动 + **文件工具只能碰 `<工作区>/.whale-craft/`**
   try {
     ctx.tools.guard((exec) => {
       const name = String(exec?.name ?? '')
@@ -2718,19 +2749,36 @@ export function apply(ctx, config) {
         return 'MC 模式会话不能读取或修改 whale_craft 配置——请在普通会话里用 mc_admin_config 改。'
       }
 
-      // ② 凭据文件与行事准则：不许用文件工具绕过去读写
-      if (/^(read|edit|write|glob|grep|ls|cat|mc_kit_memory)$/i.test(name)) {
-        const text = JSON.stringify(exec?.arguments ?? {})
+      if (/^(read|edit|write|glob|grep|ls|cat|read_image|mc_kit_memory)$/i.test(name)) {
+        const args = exec?.arguments ?? {}
+        const text = JSON.stringify(args)
         if (/(\.credentials|credentials\.yaml|[/\\]\.dsh[/\\])/i.test(text)) {
           return 'MC 模式不允许触碰宿主凭据文件；账号密码在「MC设置」里维护，AI 不需要也不应该看到。'
         }
-        // ③ 明文凭据备忘（`secrets/` 下用户自己的私密档）：同样不许读
+        // ② 明文凭据备忘（`secrets/` 下用户自己的私密档）：同样不许读
         //    （2026-09-16：账户体系上线后，密码只该待在「MC设置 → 账户」里）
         if (/[/\\]secrets[/\\]/i.test(text)) {
           return 'MC 模式不允许读凭据备忘目录（secrets/）；账号密码在「MC设置 → 账户」里维护，AI 不需要也不应该看到。'
         }
         if (isAgentsMdPath(text)) {
           return 'AGENTS.md 是给 Master 编辑的行事准则，AI 不能读写它（要改请在「MC设置 → 提示词」里改）。'
+        }
+      }
+
+      // ③ 🔴 用户 2026-09-16："读写文件都只能在记忆文件夹内！"
+      //    文件工具（read/write/edit/read_image/glob/grep）的路径一律解析到
+      //    `<工作区>/.whale-craft/` 之内；**没给路径也算越界**（glob/grep 不给路径 = 扫整个工作区）。
+      const raw = fileToolPath(exec)
+      if (raw !== null) {
+        const root = memoryRootFor(workspaceOf(exec?.agent))
+        const rel = String(raw ?? '').trim()
+        if (!rel) {
+          return `MC 模式的文件工具只能在记忆文件夹（${root}）里用——请显式给 .whale-craft/ 内的路径。`
+        }
+        const abs = resolve(root, rel)
+        const prefix = root.endsWith(sep) ? root : root + sep
+        if (abs !== root && !abs.startsWith(prefix)) {
+          return `MC 模式只能在记忆文件夹（${root}）里读写文件；这个路径在外面：${rel}`
         }
       }
       return undefined
@@ -2775,8 +2823,8 @@ export function apply(ctx, config) {
       + '· set   改一项（path + value）\n'
       + '· unset 删掉一项（回到默认值）· reset 全部恢复默认 · list 看默认值 + 生效值\n'
       + '可用键：`commandWhitelist`（字符串数组；支持 "tp" 精确名、"/^gi.*/" 正则、"*" 全放行）· '
-      + '`mcModePresets`（哪些 preset 算 MC 模式）· `mcMode.allowOtherTools`（MC 模式工具白名单，非空即"只给这些"）· '
-      + '`mcMode.denyOtherTools`（黑名单）· `mcMode.hideAdminTools`（默认 true）· `memoryDir`。\n'
+      + '`mcModePresets`（哪些 preset 算 MC 模式）· `mcMode.allowOtherTools`（MC 模式白名单里**额外**放行的工具）· '
+      + '`mcMode.hideAdminTools`（默认 true）· `memoryDir`。\n'
       + '改完**立即生效**，落在 `<工作区>/.whale-craft/config.json`。（白名单只能"收窄"，不能凭空添加 preset 没挂的工具。）',
     parameters: {
       action: { type: 'string', description: 'get（默认）/ set / unset / reset / list' },

@@ -510,6 +510,88 @@ console.log('\n--- disconnect：优雅优先 / 强断兜底 ---')
   console.log(`  ${!r3.graceful && !r3.forced ? '✅' : '❌'} 没连接时立刻返回（不吊死，${r3.ms}ms）`)
 }
 
+// ── 玩家说话要能被认出来（2026-09-16 真机事故：LAN/离线服上"喊我不应，只能 tp 我"）──
+// 根因：只有 player_chat（签名聊天包）才 emit('chat')；system_chat（未签名）被当 system 丢掉。
+// 这条链路（说话 → chat 事件 → 看门狗 mention）必须断言在**真实实现**上，所以走公开的 wireChatEvents()。
+console.log('\n--- 聊天识别（未签名 system_chat 也要算玩家说话）---')
+{
+  const { McBot } = await import('./src/core.mjs')
+  const { EventEmitter } = await import('node:events')
+  const mkChatBot = (username = 'bot_name') => {
+    const bot = new EventEmitter()
+    bot.username = username
+    bot._client = new EventEmitter()
+    return bot
+  }
+  // 服务端发来的 **未签名** 聊天（LAN 开放世界 / 离线服 / 1.19+）：translate = chat.type.text
+  const sysChat = (who, body) => {
+    const msg = {
+      translate: 'chat.type.text',
+      with: [{ text: who }, { text: body }],
+      toString: () => `<${who}> ${body}`,
+    }
+    return [msg, undefined]        // position = undefined（mineflayer 对 positionId 0 就是这个）
+  }
+  const sysText = (text) => {
+    const msg = { translate: 'multiplayer.player.joined', with: [{ text: 'x' }], toString: () => text }
+    return [msg, 'system']
+  }
+  const whisper = (who, body) => {
+    const msg = {
+      translate: 'commands.message.display.incoming',
+      with: [{ text: who }, { text: body }],
+      toString: () => `${who} whispers to you: ${body}`,
+    }
+    return [msg, undefined]
+  }
+
+  const chats = []
+  const systems = []
+  const b1 = new McBot({ instanceId: 'sc-chat-' + Math.random().toString(36).slice(2, 7) })
+  const fake = mkChatBot()
+  b1.wireChatEvents(fake)
+  b1.on('chat', (c) => chats.push(c))
+  b1.on('system', (s) => systems.push(s))
+
+  fake.emit('message', ...sysChat('<user>', '来我这。'))
+  console.log(`  ${chats.length === 1 && chats[0].who === '<user>' && chats[0].text === '来我这。' ? '✅' : '❌'} 🔴 未签名聊天（system_chat）被认成玩家说话：${JSON.stringify(chats[0] ?? null)}`)
+  console.log(`  ${b1.stats.chats === 1 ? '✅' : '❌'} stats.chats 也涨了（以前这里是 0 —— 就是"喊我不应"的判据）`)
+  fake.emit('message', ...sysChat('<user>', '来我这。'))
+  console.log(`  ${chats.length === 1 ? '✅' : '❌'} 同一句短时间内重复只算一次（1.5s 去重）`)
+
+  chats.length = 0
+  fake.emit('message', ...sysChat('bot_name', '我自己说的话'))
+  console.log(`  ${chats.length === 0 ? '✅' : '❌'} 自己说的话不触发 chat（不当成别人喊我）`)
+
+  chats.length = 0
+  fake.emit('message', ...sysText('<user> joined the game'))
+  console.log(`  ${chats.length === 0 && systems.length === 1 ? '✅' : '❌'} 服务器系统消息仍然走 system（不会误当玩家说话）`)
+
+  chats.length = 0
+  fake.emit('message', ...whisper('<user>', '在吗'))
+  console.log(`  ${chats.length === 1 && chats[0].who === '<user>' && chats[0].text === '在吗' ? '✅' : '❌'} 私聊（/tell）也认（未签名时同样走这条路）`)
+
+  // 签名聊天（player_chat）：走另一条路，且**不会**被 message 再算一遍
+  chats.length = 0
+  fake._client.emit('player_chat', { networkName: { value: '<user>' }, plainMessage: '签名的这句' })
+  console.log(`  ${chats.length === 1 && chats[0].text === '签名的这句' ? '✅' : '❌'} 签名聊天（player_chat）照旧`)
+  fake.emit('message', { translate: 'chat.type.text', with: [{ text: '<user>' }, { text: '签名的这句' }], toString: () => '<<user>> 签名的这句' }, 'chat')
+  console.log(`  ${chats.length === 1 ? '✅' : '❌'} 签名聊天在 message 里的那条被跳过（不重复投递）`)
+
+  // 看门狗：叫法命中（含"现学自己的名字"）
+  const { Watchdog } = await import('./src/watchdog.mjs')
+  const wd = new Watchdog({ ctx: fakeCtx, sess: { bot: { on: () => {}, off: () => {} }, events: [], config: {} }, agent: A.agent })
+  // 🔴 默认叫法必须**逐字等于**这份通用清单：多一条都不行（曾经多过两条私人名字，跟着开源副本公开了）
+  const genericMentions = ['deepseek', 'deep\\s*seek', '\\bds\\b', '\\bdsh\\b', '\\bai\\b', 'agent', '机器人', '麦块']
+  const dflt = JSON.stringify(wd.config.mentionPatterns)
+  console.log(`  ${dflt === JSON.stringify(genericMentions) ? '✅' : '❌'} 🔴 默认叫法就是这 ${genericMentions.length} 条通用词（没有任何私人名字）：${dflt}`)
+  wd.learnName('bot_name')
+  console.log(`  ${wd.calledBy('bot_name 你在吗').length > 0 ? '✅' : '❌'} 连接后现学自己的游戏名 → 别人喊名字能叫醒`)
+  console.log(`  ${wd.learnName('bot_name') === false ? '✅' : '❌'} 同一个名字不会重复加（幂等）`)
+  wd.learnName('a+b(c)')
+  console.log(`  ${wd.calledBy('a+b(c) 来').length > 0 ? '✅' : '❌'} 名字里的正则特殊字符被转义（不会把正则写坏）`)
+}
+
 // McBot.status 要带上**连的哪个服**（用户 2026-09-16："状态条应该显示服务器地址，太长则截断"）
 console.log('\n--- status：服务器地址 ---')
 {
@@ -929,18 +1011,37 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   const otherTool = guards.map((g) => { try { return g({ name: 'mc_status', agent: { id: 'sess-MC', ctx: mcCtxObj } }) } catch { return undefined } }).find(Boolean)
   console.log(`  ${otherTool === undefined ? '✅' : '❌'} guard 只管管理工具，不影响 mc_status 等游戏工具`)
 
-  // guard 硬化：MC 模式不许用文件工具绕去读凭据
+  // guard 硬化：MC 模式不许用文件工具绕去读凭据 / 读 AGENTS.md / 碰记忆文件夹以外的任何文件
   const credRead = guards.map((g) => { try { return g({ name: 'read', arguments: { path: 'C:\\Users\\x\\.dsh\\.credentials.yaml' }, agent: { id: 'sess-MC', ctx: mcCtxObj } }) } catch { return undefined } }).find(Boolean)
   console.log(`  ${credRead ? '✅' : '❌'} MC 模式读 .credentials.yaml 被 guard 拒绝：${String(credRead).slice(0, 28)}`)
-  const secretsRead = guards.map((g) => { try { return g({ name: 'read', arguments: { path: 'E:\\x\\.agent-docs\\secrets\\auth-account.md' }, agent: { id: 'sess-MC', ctx: mcCtxObj } }) } catch { return undefined } }).find(Boolean)
+  const secretsRead = guards.map((g) => { try { return g({ name: 'read', arguments: { path: 'E:\\x\\.agent-docs\\secrets\\example.md' }, agent: { id: 'sess-MC', ctx: mcCtxObj } }) } catch { return undefined } }).find(Boolean)
   console.log(`  ${secretsRead ? '✅' : '❌'} MC 模式读 secrets/ 明文凭据备忘也被拒：${String(secretsRead).slice(0, 28)}`)
   const mdRead = guards.map((g) => { try { return g({ name: 'read', arguments: { path: 'E:\\x\\.whale-craft\\AGENTS.md' }, agent: { id: 'sess-MC', ctx: mcCtxObj } }) } catch { return undefined } }).find(Boolean)
   console.log(`  ${mdRead ? '✅' : '❌'} MC 模式读 AGENTS.md 被 guard 拒绝：${String(mdRead).slice(0, 28)}`)
   const mdViaMemory = guards.map((g) => { try { return g({ name: 'mc_kit_memory', arguments: { action: 'read', path: 'AGENTS.md' }, agent: { id: 'sess-MC', ctx: mcCtxObj } }) } catch { return undefined } }).find(Boolean)
   console.log(`  ${mdViaMemory ? '✅' : '❌'} 记忆工具绕路读 AGENTS.md 也被拒`)
-  const plainExec3 = { name: 'read', arguments: { path: 'E:\\x\\README.md' }, agent: { id: 'sess-MC', ctx: mcCtxObj } }
+  // 🔴 用户 2026-09-16："读写文件都只能在记忆文件夹内！"
+  const memRoot = String(process.env.WHALE_CRAFT_MEMORY_DIR)
+  const callGuard = (spec) => guards.map((g) => { try { return g(spec) } catch { return undefined } }).find(Boolean)
+  const jail = [
+    ['read', { path: 'E:\\x\\README.md' }],                                  // 工作区里、但不在记忆夹
+    ['write', { path: 'E:\\x\\notes.md', content: 'x' }],
+    ['edit', { path: '..\\..\\secret.txt' }],
+    ['read_image', { path: 'E:\\<dsh-checkout>\\x.png' }],
+    ['glob', { pattern: '**/*.mjs' }],                                       // 不给路径 = 扫整个工作区
+    ['grep', { pattern: 'password', path: 'E:\\x' }],
+    ['write', { file_path: 'E:\\x\\via-file_path.txt' }],                    // 兼容 file_path 参数名
+  ]
+  const escaped = jail.filter(([name, args]) => callGuard({ name, arguments: args, agent: { id: 'sess-MC', ctx: mcCtxObj } }) === undefined)
+  console.log(`  ${escaped.length === 0 ? '✅' : '❌'} 🔴 MC 模式的文件工具越界全被拒（${jail.length - escaped.length}/${jail.length}）：${escaped.map(([n]) => n).join(', ') || '无漏网'}`)
+  const insideOk = [['read', { path: join(memRoot, 'notes.md') }], ['glob', { pattern: '*.md', path: memRoot }], ['write', { path: 'notes.md' }]]
+    .every(([name, args]) => callGuard({ name, arguments: args, agent: { id: 'sess-MC', ctx: mcCtxObj } }) === undefined)
+  console.log(`  ${insideOk ? '✅' : '❌'} 记忆文件夹**内**的读写放行（绝对路径 + 相对路径都行）`)
+  const plainExec3 = { name: 'pwsh', arguments: { command: 'whoami' }, agent: { id: 'sess-MC', ctx: mcCtxObj } }
   const plainRead = guards.every((g) => { try { return g(plainExec3) === undefined } catch { return true } })
-  console.log(`  ${plainRead ? '✅' : '❌'} 读普通文件不受影响`)
+  console.log(`  ${plainRead ? '✅' : '❌'} guard 不拦 pwsh（它靠白名单**看不见**，不是靠 guard）`)
+  const normRead = guards.every((g) => { try { return g({ name: 'read', arguments: { path: 'E:\\x\\README.md' }, agent: { id: 'sess-P', ctx: plainCtxObj } }) === undefined } catch { return true } })
+  console.log(`  ${normRead ? '✅' : '❌'} 普通会话读工作区文件不受影响（隔离只管 MC 模式）`)
 
   // ⑤ 会话建立时应用策略：MC 模式 → 隐藏管理工具 + 投提示行；普通模式 → 什么都不做
   const restrictCalls = []
@@ -982,8 +1083,17 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     fire('agent/session-start', mcAgent)
     console.log(`  ${mcAgent.inbox.nextStep.length === inboxBefore ? '✅' : '❌'} 同一会话只投一次（不刷屏）`)
   }
+  // 🔴🔴 用户 2026-09-16 真机投诉："这个 agent 怎么还能用 pwsh！不是只暴露我们指定的工具吗！"
+  //    旧实现：allowOtherTools 默认为空 ⇒ 只 deny 了我们的管理工具，宿主那堆工具（pwsh/subagent/…）
+  //    **全都还在**。现在**无条件白名单** —— 这条断言就是防它退回去。
+  const allowList = mcRestrict?.f?.allow ?? null
   const denyList = mcRestrict?.f?.deny ?? []
-  console.log(`  ${denyList.includes('mc_admin_config') ? '✅' : '❌'} MC 模式会话被隐藏管理工具：${JSON.stringify(denyList)}`)
+  console.log(`  ${Array.isArray(allowList) ? '✅' : '❌'} MC 模式走的是**白名单**（restrict({allow})），不是"只藏自家工具"${allowList ? `（${allowList.length} 个）` : ''}`)
+  console.log(`  ${allowList && !allowList.includes('pwsh') && !allowList.includes('subagent') && !allowList.includes('workflow') ? '✅' : '❌'} 🔴 白名单里**没有** pwsh / subagent / workflow：${JSON.stringify((allowList ?? []).slice(0, 6))}…`)
+  console.log(`  ${allowList && allowList.includes('mc_status') && allowList.includes('mc_kit_memory') && allowList.includes('mc_build') ? '✅' : '❌'} 自己的工具还在（mc_status / mc_kit_memory / mc_build）`)
+  console.log(`  ${allowList && allowList.every((n) => !n.startsWith('mc_admin_')) ? '✅' : '❌'} 管理工具不在白名单里（hideAdminTools 默认 true）`)
+  console.log(`  ${allowList && ['read', 'write', 'edit', 'glob', 'grep', 'read_image'].every((n) => allowList.includes(n)) ? '✅' : '❌'} 文件工具在白名单里（路径由 guard 限在 .whale-craft/）`)
+  console.log(`  ${denyList.length === 0 ? '✅' : '❌'} 不再用黑名单模式（deny=[]）`)
   // 🔴 2026-09-16：**一个 systemPrompt 段都不注册**了（用户："系统提示词不用显式注入"）。
   //    这条断言就是防回归：以后谁再往 systemPrompt 里塞东西，这里会红。
   console.log(`  ${guidanceCtxs.length === 0 ? '✅' : '❌'} MC 模式也不注册 systemPrompt 段（实际 ${guidanceCtxs.length} 段）—— 提示词只走插件提示行`)
@@ -1013,7 +1123,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   console.log(`  ${/Whale Craft 行事准则/.test(lateBody) ? '✅' : '❌'} 🔴 模式晚选上后**立刻投递**（${lateAgent.inbox.nextStep.length} 条 / ${lateBody.length} 字）—— 就是那个 bug`)
   console.log(`  ${lateAgent.inbox.nextStep.length === 2 ? '✅' : '❌'} 补投递没有重复（行事准则 + 记忆索引，各一条）`)
   const lateRestrict = restrictCalls.find((c) => c.preset === undefined)
-  console.log(`  ${(lateRestrict?.f?.deny ?? []).includes('mc_admin_config') ? '✅' : '❌'} 模式晚选上时"命令式"的隔离也补上了（restrict 含 mc_admin_config）`)
+  console.log(`  ${Array.isArray(lateRestrict?.f?.allow) && !lateRestrict.f.allow.includes('pwsh') ? '✅' : '❌'} 模式晚选上时工具白名单也补上了（allow 有 ${lateRestrict?.f?.allow?.length ?? 0} 个、无 pwsh）`)
   console.log(`  ${eventHandlers.some((h) => h.ev === 'agent-preset/selected') ? '✅' : '❌'} 挂了宿主的 agent-preset/selected 事件（会话里切模式才生效）`)
 
   /* ⑦b 记忆索引**是活的**：写一条记忆 → 新会话的提示行里必须带上它；删掉就不再出现。

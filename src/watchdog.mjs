@@ -94,10 +94,14 @@ export const WATCH_DEFAULTS = {  /** 进服自动挂载（用户要求：进游�
   /**
    * 叫法（正则片段，大小写不敏感）。**这是配置不是代码**——AI 可以用 mc_config
    * 增删（例如玩家给它起了外号，它记下来）。
+   *
+   * 🔴 这里**只放通用叫法**。2026-09-16 用户投诉过："为什么这台服务器上叫'auth'的记忆它有？"
+   *    —— 之前默认值里写死了他私人的账号名/昵称，跟着开源副本一起公开了。
+   *    账号自己的名字由 `learnName()` 在连接/挂载时**从登录档案现学**（不进源码）。
    */
   mentionPatterns: [
     'deepseek', 'deep\\s*seek', '\\bds\\b', '\\bdsh\\b', '\\bai\\b', 'agent',
-    '机器人', '麦块', 'bot_name', '昵称',
+    '机器人', '麦块',
   ],
 }
 
@@ -223,6 +227,24 @@ export class Watchdog {
     })
   }
 
+  /**
+   * 把**自己的游戏名**学进叫法里（连接成功 / 挂载时调用）。
+   *
+   * 为什么要现学：默认叫法里**不许**再写私人名字（见 WATCH_DEFAULTS 的注释），
+   * 但"别人喊我的名字"必须能叫醒我 —— 而这个名字每台机器都不一样（账号档案里的名字），
+   * 所以从 `bot.username` 现拿：既通用又不泄露。
+   * @param {string} name 玩家名（正则特殊字符会被转义）
+   * @returns {boolean} 是否新增了一条
+   */
+  learnName (name) {
+    const n = String(name ?? '').trim()
+    if (!n || n.length > 32) return false
+    const esc = n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    if (this.config.mentionPatterns.some((p) => p === esc || p === n)) return false
+    this.config.mentionPatterns = [...this.config.mentionPatterns, esc]
+    return true
+  }
+
   /** 说话者是否在近距范围内（拿不到位置时保守返回 false） */
   #isNearby (who) {
     try {
@@ -240,6 +262,9 @@ export class Watchdog {
     if (this.armed) return this.status()
     this.armed = true
     this.startedAt = Date.now()
+
+    // 挂载时顺手把自己的游戏名学进叫法（源码里没有私人名字，见 learnName）
+    try { this.learnName(this.sess?.bot?.bot?.username ?? this.sess?.bot?.username) } catch { /* 没连上也正常 */ }
 
     this.#bind()
     this.#startJob()

@@ -107,9 +107,8 @@ dsh plugin --profile web add whale_craft
 | `commandWhitelist` | `mc_command` 放行的服务器指令。支持精确名 `"tp"`、正则 `"/^gi.+/"`、`"*"` 全放行 | tp/give/time/… |
 | `allowAllCommands` | 白名单页那个总开关 | `false` |
 | `mcModePresets` | 哪些 preset 算"MC 模式"（权限隔离的判据） | `["minecraft","whale_craft"]` |
-| `mcMode.allowOtherTools` | MC 模式**额外**允许的其它工具（非空 = 白名单） | `[]` |
-| `mcMode.denyOtherTools` | MC 模式禁止的其它工具 | `[]` |
-| `mcMode.hideAdminTools` | 是否对 MC 模式隐藏 `mc_admin_*`（隐藏之外还有 guard 硬拒） | `true` |
+| `mcMode.allowOtherTools` | MC 模式白名单里**额外**放行的其它工具（默认只给 `mc_*` / `mc_kit_*` / 文件工具） | `[]` |
+| `mcMode.hideAdminTools` | 是否把 `mc_admin_*` 也放进白名单（默认隐藏，另有 guard 硬拒） | `true` |
 | `injectWhaleCraftAgentsMd` | 是否把 `.whale-craft/AGENTS.md` 注入 MC 模式会话 | `true` |
 | `injectWorkspaceAgentsMd` | 是否**额外**注入工作区的 `AGENTS.md` | `false` |
 | `memoryDir` | 记忆根目录（`null` = 会话工作区的 `.whale-craft/`） | `null` |
@@ -161,12 +160,17 @@ dsh plugin --profile web add whale_craft
 
 把会话的 preset 设成 `mcModePresets` 里的一员（默认 `minecraft` / `whale_craft`），该会话就会：
 
-1. **看不见** `mc_admin_*`（`tools.restrict`）；
-2. **调不动** `mc_admin_*`（全局 `guard` 硬拒，即使隐藏失效）；
-3. 收到 2–3 条**插件提示行**（在对话里看得见、可折叠，**不是**用户发言）：
+1. **工具白名单**（`tools.restrict({allow})`，无条件生效）：只看得见
+   `mc_*` / `mc_kit_*` 自己的工具 + **文件工具**（`read` / `write` / `edit` / `glob` / `grep` / `read_image`）
+   + 配置里额外允许的其它工具。宿主的 `pwsh` / `subagent` / `workflow` / `serve_*` 之类**一个都看不见**
+   （早期版本用的是"只 deny 自家管理工具"的黑名单，等于没隔离——已修）。
+2. **文件工具被关进记忆文件夹**：`read`/`write`/`edit`/`glob`/`grep`/`read_image` 的路径由全局 `guard`
+   硬限在 `<工作区>/.whale-craft/` 内（不给路径 = 扫整个工作区 = 拒绝）。
+3. **`mc_admin_*` 看不见也调不动**（白名单 + `guard` 硬拒）。
+4. 收到 2–3 条**插件提示行**（在对话里看得见、可折叠，**不是**用户发言）：
    `.whale-craft/AGENTS.md`（行事准则，可在「MC设置 → 提示词」里改）、`.whale-craft/README.md`（记忆总索引）、
    以及可选的（默认关）工作区 `AGENTS.md`。
-4. 系统提示词 = preset 自己的 persona（宿主按 preset 自动注入，**插件不插手**）。
+5. 系统提示词 = preset 自己的 persona（宿主按 preset 自动注入，**插件不插手**）。
 
 > 插件本身**不带 preset 目录**（`~/.dsh/.agent-presets/<名字>/` 需要你自己放一份 persona）。
 > 只要 preset id 落在 `mcModePresets` 里，隔离就生效；缺失时插件会照官方 `copy()` 建一个「MC模式」并写好 persona。
