@@ -7,8 +7,13 @@ out/
 *.log
 isolate-*.json
 
-# 打包产物（npm pack 的 tarball 别提交）
+# 打包产物（npm pack 的 tarball / 发布用 zip 别提交）
 *.tgz
+*.zip
+dist/
+
+# npm 凭据（要放本仓库的话：在这里，别提交）
+.npmrc
 
 # 插件状态（正常在 $DSH_HOME/whale_craft/，别放仓库里）
 config.json

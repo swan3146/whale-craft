@@ -2656,6 +2656,37 @@ console.log('\n--- 依赖面 + 打包完整性（mineflayer 是**依赖**不是"
     ['files 里每个条目都真实存在', files.every((f) => existsSync(join(root, String(f))))],
   ]
   for (const [label, passed] of packChecks) console.log(`  ${passed ? '✅' : '❌'} ${label}`)
+
+  /* ── 开源副本专有的发版工具（线上插件里没有 scripts/，所以缺失时算"不适用"）─────────
+   * 用户 2026-09-17：CI 里那步 npm publish 删掉（红叉来源），npm 改成在本机手动发；
+   * 修复靠 scripts/release.workflow.yml 这个**普通文件**分发（推工作流文件需要 workflow scope）。 */
+  const scriptsDir = join(root, 'scripts')
+  if (!existsSync(scriptsDir)) {
+    console.log('  ✅ 发版工具（scripts/）：线上插件没有这层，跳过（开源副本专有）')
+  } else {
+    const rd = (p) => { try { return readFileSync(join(scriptsDir, p), 'utf8') } catch { return null } }
+    const pub = rd('publish-npm.mjs')
+    const land = rd('land-workflow-fix.mjs')
+    const tpl = rd('release.workflow.yml')
+    // ⚠️ 断言前先剥掉 YAML 注释：模板注释里**故意**写了 "npm publish" / "--generate-notes"
+    //    （说明为什么删掉它们），不剥就会被自己的注释骗到（2026-09-17 真踩：两条假红）。
+    const tplCode = (tpl ?? '').split('\n').filter((l) => !/^\s*#/.test(l)).join('\n')
+    const releasing = (() => { try { return readFileSync(join(root, 'RELEASING.md'), 'utf8') } catch { return null } })()
+    const toolChecks = [
+      ['本机发 npm 的脚本在（带前置校验/确认/dry-run）', !!pub && /--dry/.test(pub) && /whoami/.test(pub) && /CHANGELOG\.md/.test(pub) && /npm publish/.test(pub)],
+      ['脚本会在"版本已发过 / 树不干净 / token 不可用"时**停下**', /已经发布过了/.test(pub ?? '') && /工作树不干净/.test(pub ?? '') && /npm whoami 失败/.test(pub ?? '')],
+      ['工作流修复以**普通文件**分发（scripts/release.workflow.yml）', !!tpl && /gh release create/.test(tpl)],
+      ['🔴 模板工作流里**没有** npm 步骤（红叉来源）', /gh release create/.test(tplCode) && !/npm publish/.test(tplCode) && !/NPM_TOKEN/.test(tplCode) && /whale_craft-\*\.zip/.test(tplCode)],
+      ['模板工作流用 CHANGELOG 当正文（不 --generate-notes）', /notes-file notes\.md/.test(tplCode) && !/generate-notes/.test(tplCode)],
+      ['模板里取正文的脚本用 .cjs（"type": "module" 下 .js 会被当 ESM 而炸）', !!tpl && /\.notes\.cjs/.test(tpl)],
+      ['落地脚本会先校验 token 的 workflow scope、并回读确认', !!land && /x-oauth-scopes/.test(land) && /workflow/.test(land) && /npm publish/.test(land)],
+      ['publishConfig 钉死官方 registry（防止发到镜像）', pkg.publishConfig?.registry === 'https://registry.npmjs.org/' && pkg.publishConfig?.access === 'public'],
+      ['npm 脚本入口在（publish:npm / release:workflow-fix）', pkg.scripts?.['publish:npm'] === 'node scripts/publish-npm.mjs' && pkg.scripts?.['release:workflow-fix'] === 'node scripts/land-workflow-fix.mjs'],
+      ['RELEASING.md 写清两条渠道与红叉排障', !!releasing && /发 npm/.test(releasing) && /workflow.*scope/.test(releasing) && /Full Changelog/.test(releasing)],
+      ['.gitignore 挡住了 .npmrc 与 zip（token / 产物别提交）', (() => { try { const gi = readFileSync(join(root, '.gitignore'), 'utf8'); return /^\.npmrc$/m.test(gi) && /\*\.zip/.test(gi) } catch { return false } })()],
+    ]
+    for (const [label, passed] of toolChecks) console.log(`  ${passed ? '✅' : '❌'} ${label}`)
+  }
 }
 
 console.log('\n日志:', logs.slice(0, 6).join(' | ') || '(无)')

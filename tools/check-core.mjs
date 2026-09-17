@@ -21,11 +21,13 @@ const core = join(root, 'src', 'core.mjs')
 const listOf = (dir, ext = '.mjs') => {
   try { return readdirSync(join(root, dir)).filter((f) => f.endsWith(ext)).map((f) => `${dir}/${f}`) } catch { return [] }
 }
-/** 全部要语法检查的文件（相对包根） */
+/** 全部要语法检查的文件（相对包根）。
+ * ⚠️ `scripts/` 只在开源副本里有（发版工具：本机发 npm / 落地工作流修复），缺失不算错 */
 const TARGETS = [
   'index.js', 'client.js', 'selfcheck.mjs',
   ...listOf('src'),
   ...listOf('tools'),
+  ...listOf('scripts'),
 ]
 /** 真去 import 一遍的"纯模块"（不碰网络/文件系统副作用；core.mjs 单独处理） */
 const IMPORTABLE = listOf('src').filter((f) => !f.endsWith('/core.mjs'))

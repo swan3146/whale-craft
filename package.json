@@ -68,8 +68,14 @@
       "platform": "web"
     }
   },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
     "check": "node tools/check-core.mjs && node selfcheck.mjs",
-    "prepublishOnly": "npm run check"
+    "prepublishOnly": "npm run check",
+    "publish:npm": "node scripts/publish-npm.mjs",
+    "release:workflow-fix": "node scripts/land-workflow-fix.mjs"
   }
 }

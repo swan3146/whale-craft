@@ -1,0 +1,92 @@
+name: Release
+
+# 打一个 v* tag（例如 v0.1.2）就自动：跑检查 → 校验 tag 与 package.json 版本一致 →
+# 打 **zip** 产物 → 建 GitHub Release，把 zip 挂上去，正文用 CHANGELOG.md 里本版本那一节。
+#
+# 🔴 本工作流**不碰 npm**（老大 2026-09-17："不要再让它碰 npm 了！"）——
+#    以前最后一步会 `npm publish`，token 一失效就红叉，而发布其实早就成功了。整段已删除。
+#    想发 npm 就在本机跑 `npm run publish:npm`（见 RELEASING.md）。
+# 🔴 更新日志**不引用 diff/commit 列表**（老大要求）：正文只来自 CHANGELOG.md，
+#    不再用 `gh release create --generate-notes`（那会写出 "Full Changelog: …/compare/…"）。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 建 Release 要写权限
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+
+      - name: 发布前必须全绿
+        run: node tools/check-core.mjs && node selfcheck.mjs
+
+      - name: tag 必须和 package.json 版本一致
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          echo "tag=$TAG  package.json=$PKG"
+          [ "$TAG" = "$PKG" ] || { echo "::error::tag 与 package.json 版本不一致"; exit 1; }
+
+      - name: 打 zip 产物（解压就是一个可直接安装的插件目录）
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          npm pack
+          tar -xzf whale_craft-*.tgz
+          mv package "whale_craft-${VERSION}"
+          zip -qr "whale_craft-${VERSION}.zip" "whale_craft-${VERSION}"
+          unzip -l "whale_craft-${VERSION}.zip" | tail -3
+
+      - name: 拼更新日志（取 CHANGELOG.md 本版本那一节，不引用 diff）
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          # ⚠️ 用 .cjs：package.json 里有 "type": "module"，`.js` 会被当 ESM（require 不存在）
+          cat > .notes.cjs <<'JS'
+          const fs = require('node:fs')
+          const version = process.argv[2]
+          const lines = fs.readFileSync('CHANGELOG.md', 'utf8').split('\n')
+          const head = `## [${version}]`
+          const start = lines.findIndex((line) => line.startsWith(head))
+          if (start < 0) {
+            console.error(`CHANGELOG.md 里找不到 ${head} 这一节`)
+            process.exit(1)
+          }
+          let end = lines.findIndex((line, index) => index > start && line.startsWith('## ['))
+          if (end < 0) end = lines.length
+          const section = lines.slice(start, end).join('\n').trim()
+          const intro = [
+            `**whale_craft v${version}**`,
+            '',
+            '```bash',
+            'dsh plugin --profile web add github:yzi1b/whale-craft   # 或解压附件后：dsh plugin --profile web add link:<目录>',
+            '```',
+            '',
+            '装完**重启 DSH**（服务端插件不热重载）。',
+            '',
+          ].join('\n')
+          fs.writeFileSync('notes.md', `${intro}\n${section}\n`, 'utf8')
+          JS
+          node .notes.cjs "$VERSION"
+          head -20 notes.md
+
+      - name: 建 GitHub Release 并挂上 zip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            whale_craft-*.zip
