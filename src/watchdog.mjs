@@ -184,6 +184,18 @@ export class Watchdog {
 
     /** 绑定的监听器（disarm 时摘掉） */
     this._listeners = []
+
+    /**
+     * **模式闸门**：只有"仍然是 MC 模式"的会话才允许注入（2026-09-17 补）。
+     *
+     * 🔴 同类残留事故：看门狗的 `armed` 挂在**会话实例**上，切模式不会自动关它 ——
+     *    从「MC模式」切回普通模式后，它仍会把"游戏里有人叫你/你被打了一下"这类 MC 事件
+     *    注进一个**已经不在 MC 模式**的会话（用户："开到 mc 模式再开回去标准，
+     *    居然注入了 mc 模式提示词"）。插件在 `ensureWatchdog` 后挂上这个回调（现场判 preset），
+     *    闸门关着时**只记账不注入**；切回 MC 模式**自动恢复**（不必重新 arm）。
+     * @type {(() => boolean) | null}
+     */
+    this.gate = null
   }
 
   /* ─────────────── 配置 ─────────────── */
@@ -523,6 +535,17 @@ export class Watchdog {
    * 兜底才用 `sessionController.prompt`（那条必然是用户来源）。
    */
   #inject (text, kind) {
+    // 🔴 模式闸门：会话已经不是 MC 模式了 → **绝不注入**（见 constructor 里 gate 的说明）。
+    //    失败开放（gate 抛错时按"允许"处理）：宁可偶尔多注入一次，也别把真 MC 会话叫不醒。
+    if (typeof this.gate === 'function') {
+      let allowed = true
+      try { allowed = this.gate() !== false } catch { allowed = true }
+      if (!allowed) {
+        this.stats.dropped++
+        this.#record('lifecycle', `会话已不在 MC 模式 → 丢弃这次注入（${kind}）`)
+        return
+      }
+    }
     const running = this.agent?.status === 'running'
 
     // ────────────────────────────────────────────────────────────────────────

@@ -1330,7 +1330,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     // 🔴 2026-09-16 抽取成标准插件：记忆/提示词必须**按会话工作区**解析（插件装哪都行）
     console.log(`  ${/const workspaceOf = \(agent\) =>/.test(idx) && /agent\?\.session\?\.header\?\.cwd/.test(idx) ? '✅' : '❌'} 工作区取自 exec.agent.session.header.cwd（不再用"插件自己在哪"）`)
     console.log(`  ${/join\(cwd, '\.whale-craft'\)/.test(idx) ? '✅' : '❌'} 记忆根 = <会话工作区>/.whale-craft`)
-    console.log(`  ${/const noticesSent = new WeakMap\(\)/.test(idx) && /inbox\.nextStep\.push\(createUserMessage\(\{/.test(idx) ? '✅' : '❌'} 提示词按会话工作区投递到 agent.inbox.nextStep（每个会话一份，插件不再碰 systemPrompt）`)
+    console.log(`  ${/const noticesSent = new WeakMap\(\)/.test(idx) && /const pushNotice = \(inbox, message\)/.test(idx) ? '✅' : '❌'} 提示词按会话工作区投递到 agent.inbox（每个会话一份，插件不再碰 systemPrompt）`)
   }
 
   // ② 管理工具（走真实插件实例，落盘在自检临时目录）
@@ -1442,8 +1442,23 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   }
   const fire = (ev, agent) => eventHandlers.filter((h) => h.ev === ev).forEach((h) => h.fn({ agent }))
 
-  const mcAgent = { id: 'sess-MC2', session: { header: { cwd: mkdtempSync(join(tmpdir(), 'whale-mc-')) } }, ctx: makeAgentCtx('minecraft'), inbox: { nextStep: [] }, steer: () => { throw new Error('不该走 steer！') } }
-  const plainAgent = { id: 'sess-P2', session: { header: { cwd: mkdtempSync(join(tmpdir(), 'whale-pl-')) } }, ctx: makeAgentCtx('standard'), inbox: { nextStep: [] } }
+  /** 忠实的 inbox 替身：照抄宿主 `ReactLoopInbox` 的 append/remove 契约（消息自带 id） */
+  const mkInbox = () => {
+    const box = {
+      nextStep: [],
+      append: (target, message) => { if (target === 'next-step') box.nextStep.push(message) },
+      prepend: (target, message) => { if (target === 'next-step') box.nextStep.unshift(message) },
+      remove: (id) => {
+        const i = box.nextStep.findIndex((m) => m?.id === id)
+        if (i < 0) return false
+        box.nextStep.splice(i, 1)
+        return true
+      },
+    }
+    return box
+  }
+  const mcAgent = { id: 'sess-MC2', session: { header: { cwd: mkdtempSync(join(tmpdir(), 'whale-mc-')) } }, ctx: makeAgentCtx('minecraft'), inbox: mkInbox(), steer: () => { throw new Error('不该走 steer！') } }
+  const plainAgent = { id: 'sess-P2', session: { header: { cwd: mkdtempSync(join(tmpdir(), 'whale-pl-')) } }, ctx: makeAgentCtx('standard'), inbox: mkInbox() }
   fire('agent/created', mcAgent)
   fire('agent/created', plainAgent)
 
@@ -1516,7 +1531,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     id: 'sess-LATE',
     session: { header: { cwd: mkdtempSync(join(tmpdir(), 'whale-late-')) } },
     ctx: makeAgentCtx(undefined),
-    inbox: { nextStep: [] },
+    inbox: mkInbox(),
   }
   fire('agent/created', lateAgent)                                  // 建的时候还没选 mode
   console.log(`  ${lateAgent.inbox.nextStep.length === 0 ? '✅' : '❌'} preset 未知时不投递（不误注入）`)
@@ -1546,13 +1561,30 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     const releasedBefore = restrictReleased.length
     switchTo('standard')
     console.log(`  ${restrictReleased.length === releasedBefore + 1 && restrictReleased.at(-1) === applied ? '✅' : '❌'} 🔴 切回普通模式**撤销**了工具白名单（pwsh/命令工具回来了）`)
+    console.log(`  ${lateAgent.inbox.nextStep.length === 0 ? '✅' : '❌'} 🔴 切回普通模式**撤回了还没投递的提示词**（${lateAgent.inbox.nextStep.length} 条）—— 就是"标准模式里冒出 MC 提示词"那个 bug`)
     const callsBefore = restrictCalls.length
     switchTo('minecraft')
     const reapplied = restrictCalls.at(-1)
     console.log(`  ${restrictCalls.length === callsBefore + 1 ? '✅' : '❌'} 再切回 MC模式 重新套上白名单（撤销 ≠ 以后不再管）：allow ${reapplied?.f?.allow?.length ?? 0} 个`)
     console.log(`  ${Array.isArray(reapplied?.f?.allow) && !reapplied.f.allow.includes('pwsh') ? '✅' : '❌'} 重新套上的仍然是白名单（没有 pwsh）`)
+    console.log(`  ${lateAgent.inbox.nextStep.length === 3 ? '✅' : '❌'} 再切回 MC模式 也**重新投递**提示词（${lateAgent.inbox.nextStep.length} 条）`)
     switchTo('standard')                                 // 收尾：留成普通模式
     console.log(`  ${restrictReleased.at(-1) === reapplied ? '✅' : '❌'} 套用与撤销一一对应（每次套的都撤掉了）`)
+    console.log(`  ${lateAgent.inbox.nextStep.length === 0 ? '✅' : '❌'} 再切出也把待投递提示词清干净（${lateAgent.inbox.nextStep.length} 条）`)
+
+    /* 已经**投递过**的提示词（进了对话历史）摘不掉 → 必须补一条"作废"声明，否则模型会继续按 MC 准则办事 */
+    const deliverAgent = { id: 'sess-DELIVERED', session: { header: { cwd: mkdtempSync(join(tmpdir(), 'whale-dlv-')) } }, ctx: makeAgentCtx('minecraft'), inbox: mkInbox() }
+    fakeCtx.agents = { get: (id) => (id === 'sess-DELIVERED' ? deliverAgent : id === 'sess-LATE' ? lateAgent : undefined) }
+    fire('agent/created', deliverAgent)
+    const queued = deliverAgent.inbox.nextStep.length
+    deliverAgent.inbox.nextStep.length = 0                          // ← 模拟宿主 claim()：已投递进对话
+    switchTo('standard', deliverAgent)
+    const notice = deliverAgent.inbox.nextStep[0]
+    const noticeText = (notice?.content ?? []).map((c) => c.text ?? '').join('')
+    console.log(`  ${queued === 3 ? '✅' : '❌'} （前置）投递前队列里有 3 条（实际 ${queued}）`)
+    console.log(`  ${deliverAgent.inbox.nextStep.length === 1 ? '✅' : '❌'} 🔴 已经投过的那几条补发了 **1 条作废声明**（实际的 ${deliverAgent.inbox.nextStep.length} 条）`)
+    console.log(`  ${/退出 MC 模式/.test(noticeText) && /作废/.test(noticeText) ? '✅' : '❌'} 作废声明的正文写明"已退出 MC 模式 / 行事准则作废"`)
+    console.log(`  ${notice?.source?.kind === 'plugin' && notice?.source?.plugin === 'whale_craft' ? '✅' : '❌'} 作废声明同样是**插件提示行**（不是用户发言）：${JSON.stringify(notice?.source?.plugin ?? null)}`)
     // 静态防回归：撤销路径的三块拼图必须在源码里（谁删了这里就红）
     const srcIdx = (await import('node:fs')).readFileSync(new URL('./index.js', import.meta.url), 'utf8')
     console.log(`  ${/const mcRestrictRelease = new WeakMap\(\)/.test(srcIdx) && /const liftMcModePolicy = \(agent\)/.test(srcIdx) ? '✅' : '❌'} 源码里有撤销路径（mcRestrictRelease + liftMcModePolicy）`)
@@ -2177,6 +2209,19 @@ console.log('\n--- 看门狗唤醒投递（真机 bug 回归）---')
   await new Promise((r) => setTimeout(r, 1400))
   console.log(`  ${deliver[0]?.mode === 'steer' ? '✅' : '❌'} 运行中走 steer=插话不打断：mode=${deliver[0]?.mode}`)
   console.log(`  ${wd.stats.injected >= 1 ? '✅' : '❌'} 注入计数已累加（${wd.stats.injected}）`)
+
+  // 🔴 2026-09-17：**模式闸门** —— 会话切出 MC 模式后，看门狗不许再往会话里注入（同类残留）
+  deliver.length = 0
+  const droppedBefore = wd.stats.dropped
+  wd.gate = () => false
+  bot.emit('chat', { who: '<user>', text: 'deepseek 又在吗' })
+  await new Promise((r) => setTimeout(r, 1400))
+  console.log(`  ${deliver.length === 0 ? '✅' : '❌'} 🔴 闸门关着（已退出 MC 模式）→ **一次都不注入**（实际 ${deliver.length} 次）`)
+  console.log(`  ${wd.stats.dropped > droppedBefore ? '✅' : '❌'} 被丢弃的注入记进 stats.dropped（${wd.stats.dropped}）`)
+  wd.gate = () => true
+  bot.emit('chat', { who: '<user>', text: 'deepseek 回来了吗' })
+  await new Promise((r) => setTimeout(r, 1400))
+  console.log(`  ${deliver.length >= 1 ? '✅' : '❌'} 闸门打开（切回 MC 模式）→ 立刻恢复注入（${deliver.length} 次；不用重新 arm）`)
 
   wd.disarm('自检结束')
   console.log(`  ${wd.armed === false ? '✅' : '❌'} disarm 后停止监听`)

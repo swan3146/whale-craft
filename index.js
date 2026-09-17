@@ -307,8 +307,10 @@ class McRegistry {
 /**
  * 拿到（或创建）本会话的看门狗。
  * 看门狗要往会话里注入消息，必须绑 agent —— 在这里补齐并随时刷新引用。
+ * @param gate - 可选：**模式闸门**，返回 false 时看门狗不往会话里注入（见 `Watchdog#gate`）。
+ *   切出 MC 模式后仍 armed 的看门狗靠它闭嘴；切回 MC 模式自动恢复。
  */
-function ensureWatchdog (ctx, sess, agent, promptSignal = null) {
+function ensureWatchdog (ctx, sess, agent, promptSignal = null, gate = null) {
   if (!sess.watchdog) {
     // 注意：看门狗**不**往 sess.events 写（唯一写入方是 McSession.ensureWired）——
     // 两边都写会让同一句话进队列两遍。
@@ -317,6 +319,7 @@ function ensureWatchdog (ctx, sess, agent, promptSignal = null) {
     if (agent) sess.watchdog.agent = agent
     if (promptSignal) sess.watchdog.promptSignal = promptSignal
   }
+  if (gate) sess.watchdog.gate = gate
   return sess.watchdog
 }
 
@@ -1522,7 +1525,7 @@ export function apply(ctx, config) {
       sess.mode = 'active'
       const ready = await sess.bot.waitForChunks()
       // 进服自动挂看门狗（用户要求：进游戏自动打开）
-      const wd = ensureWatchdog(ctx, sess, exec?.agent, promptAbort.signal)
+      const wd = ensureWatchdog(ctx, sess, exec?.agent, promptAbort.signal, watchdogGate(sess))
       // 把自己的游戏名学进叫法（默认叫法里**没有**私人名字 —— 见 learnName 的注释）
       try { wd.learnName(sess.bot?.bot?.username) } catch { /* 拿不到就算了 */ }
       if (wd.config.autoArm && !wd.armed) {
@@ -1677,7 +1680,7 @@ export function apply(ctx, config) {
       const sess = getSession(exec)
       const agent = exec?.agent
       if (!agent) throw new Error('拿不到当前会话（exec.agent 不可用），看门狗必须绑定会话')
-      const wd = ensureWatchdog(ctx, sess, agent, promptAbort.signal)
+      const wd = ensureWatchdog(ctx, sess, agent, promptAbort.signal, watchdogGate(sess))
       const action = String(args.action ?? 'status')
       if (action === 'arm') return { ...wd.arm(), note: '看门狗已挂载，整局游戏期间有效（退服自动卸载并提醒你）。' }
       if (action === 'disarm') return wd.disarm(args.reason ? String(args.reason) : 'AI 主动关闭')
@@ -1699,7 +1702,7 @@ export function apply(ctx, config) {
     output: text(),
     async execute(args, exec) {
       const sess = getSession(exec)
-      const wd = ensureWatchdog(ctx, sess, exec?.agent, promptAbort.signal)
+      const wd = ensureWatchdog(ctx, sess, exec?.agent, promptAbort.signal, watchdogGate(sess))
       const clone = (v) => JSON.parse(JSON.stringify(v))
       if (args.reset) {
         wd.config = clone(WATCH_DEFAULTS)
@@ -2514,6 +2517,72 @@ export function apply(ctx, config) {
 
   /** agent → 实际投出去的文件（给 /api/mc/mode 与设置页报**真实投递**，不是"我们打算投"） */
   const noticesSent = new WeakMap()
+
+  /** 这条待投递消息是不是**我们**（whale_craft）投的插件提示行 */
+  const isOurNotice = (m) => String(m?.source?.plugin ?? '') === 'whale_craft' && m?.source?.form === 'notice'
+
+  /**
+   * 把一条插件提示行放进会话的"待投递"队列。
+   * 优先用宿主的 inbox API（`append` → 会**durable** 落事件 + 通知投影；宿主自己也走 splice 系列），
+   * 老版本/替身没有这个 API 才退回直接 push。
+   */
+  const pushNotice = (inbox, message) => {
+    if (typeof inbox.append === 'function') { inbox.append('next-step', message); return true }
+    if (Array.isArray(inbox.nextStep)) { inbox.nextStep.push(message); return true }
+    return false
+  }
+
+  /**
+   * **撤回**本插件投出去的提示行（切出 MC 模式时必须做）。
+   *
+   * 🔴 2026-09-17 真机事故（用户："开到 mc 模式再开回去标准，居然注入了 mc 模式提示词"）：
+   *    提示行是**队列式**投递的 —— 切到 MC 模式时把三条（行事准则 / 版本提示 / 记忆索引）放进
+   *    `inbox.nextStep`，**到下一条消息进来时才真正投递**。所以"切到 MC模式 → 一句话没发 → 切回标准模式"
+   *    的会话，那三条还躺在队列里等着，用户一开口就注进了一个**标准模式**会话。
+   *    真机复现 `session-55d48701`：04:51 切 minecraft（只入队）、06:34 切回 standard，之后第一轮
+   *    才投递 → 标准模式会话里出现了 MC 行事准则。
+   *
+   * 处理分两种：
+   *   ① **还在队列里** → 直接从 `inbox.nextStep` 删掉（用户遇到的就是这种，删了就干净）。
+   *   ② **已经进了对话历史** → 摘不掉；补一条**一行作废声明**，明确告诉模型那几条不再适用。
+   * 最后清掉 `noticesSent` 去重标记 → 再切回 MC 模式会重新投递。
+   * @param agent - 宿主 Agent
+   * @returns {{removed: number, delivered: boolean}} 撤回条数 / 是否"已经投递过"（需要作废声明）
+   */
+  const withdrawAgentsMdNotices = (agent) => {
+    const inbox = agent?.inbox
+    const recorded = noticesSent.get(agent)
+    let removed = 0
+    if (inbox && Array.isArray(inbox.nextStep)) {
+      for (const m of [...inbox.nextStep]) {
+        if (!isOurNotice(m)) continue
+        try {
+          if (typeof inbox.remove === 'function' && m?.id !== undefined && inbox.remove(m.id) === true) { removed++; continue }
+          const i = inbox.nextStep.indexOf(m)
+          if (i >= 0) { inbox.nextStep.splice(i, 1); removed++ }
+        } catch (e) { logLine(`撤回待投递提示行失败：${e?.message ?? e}`) }
+      }
+    }
+    const delivered = removed === 0 && Array.isArray(recorded) && recorded.length > 0
+    noticesSent.delete(agent)
+    if (delivered) {
+      // 已经进对话的摘不掉 —— 补一行"作废"，否则模型会继续按 MC 行事准则办事
+      try {
+        const ok = pushNotice(inbox ?? {}, createUserMessage({
+          content: [{ type: 'text', text: 'Instructions from: whale_craft@' + PLUGIN_VERSION + '\n\n'
+            + '本会话已**退出 MC 模式**（preset 已切走）：上面那条「Whale Craft 行事准则」、版本提示与记忆索引'
+            + '**自此刻起作废**，请按本会话当前的模式（普通模式）行事。' }],
+          source: { kind: 'plugin', plugin: 'whale_craft', form: 'notice', summary: '已退出 MC 模式：MC 行事准则作废' },
+        }))
+        if (!ok) logLine('退出 MC 模式：作废声明没能投出去（没有可用的 inbox）')
+      } catch (e) { logLine(`退出 MC 模式：作废声明投递失败：${e?.message ?? e}`) }
+    }
+    if (removed || delivered) {
+      logLine(`已退出 MC 模式：撤回待投递提示行 ${removed} 条${delivered ? '，并补发 1 条"MC 行事准则作废"声明（那几条已经进过对话）' : ''}`)
+    }
+    return { removed, delivered }
+  }
+
   const injectAgentsMdNotices = (agent) => {
     if (!agent || noticesSent.has(agent)) return false
     if (!agent.ctx || !isMcModeAgent(agent)) return false
@@ -2561,10 +2630,11 @@ export function apply(ctx, config) {
     for (const it of items) {
       try {
         // 正文首行照 DSH 原生的形状写相对路径 → AI 也知道这段话出自哪个文件
-        inbox.nextStep.push(createUserMessage({
+        const msg = createUserMessage({
           content: [{ type: 'text', text: `Instructions from: ${it.rel}\n\n${it.text}` }],
           source: { kind: 'plugin', plugin: 'whale_craft', form: 'notice', summary: it.title },
-        }))
+        })
+        if (!pushNotice(inbox, msg)) throw new Error('inbox 既没有 append 也没有 nextStep')
         sent++
       } catch (e) { logLine(`提示词投递失败（${it.rel}）：${e?.message ?? e}`) }
     }
@@ -3082,6 +3152,17 @@ export function apply(ctx, config) {
     } catch { return false }
   }
 
+  /**
+   * 看门狗的**模式闸门**：只有"仍然是 MC 模式"的会话才允许它往会话里注入。
+   *
+   * 🔴 同类残留（2026-09-17）：狗是**黏**的 —— `armed` 挂在会话实例上，切模式不会自动关它，
+   *    于是切回普通模式后它仍会把"有人叫你 / 你被打了一下"注进一个已经不是 MC 模式的会话。
+   *    闸门按**现场判据**（preset）开关：切出闭嘴、切回自动恢复（不必重新 arm）。
+   * @param sess - McSession（闸门在注入那一刻读 `sess.watchdog.agent`）
+   * @returns {() => boolean} 供 `Watchdog#gate` 用的回调
+   */
+  const watchdogGate = (sess) => () => isMcModeAgent(sess?.watchdog?.agent)
+
   /** 取某个 agent scope 上的 tools 服务：restrict **必须**用 scoped 服务，否则会被宿主拒绝 */
   const scopedTools = (agentCtx) => {
     const pickers = [() => agentCtx.get('tools'), () => agentCtx.tools]
@@ -3209,6 +3290,14 @@ export function apply(ctx, config) {
     if (!agent) return
     // 这个会话已经不是 MC 模式了 → "因没选工作区被拒绝"的旧标记也一起清掉
     if (agent.id) noWorkspaceRefused.delete(String(agent.id))
+    // ① 撤回提示行（还没投递的直接删；已经进对话的补一条作废声明）——见 withdrawAgentsMdNotices
+    try { withdrawAgentsMdNotices(agent) } catch (e) { logLine(`撤回 MC 提示行失败：${e?.message ?? e}`) }
+    // ② 看门狗：armed 挂在会话实例上、切模式不会自动关 → 关掉它的**注入闸门**
+    //    （不 disarm：切回 MC 模式时自动恢复，不用重新 arm）
+    try {
+      const wd = agent.id ? registry.peek(String(agent.id))?.watchdog : null
+      if (wd?.armed) logLine(`本会话已退出 MC 模式：看门狗注入已闸掉（仍 armed，切回 MC 模式即恢复）`)
+    } catch { /* 只是记一行日志，失败无所谓 */ }
     const release = mcRestrictRelease.get(agent)
     if (release) {
       mcRestrictRelease.delete(agent)
