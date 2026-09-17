@@ -45,7 +45,9 @@ const ok = (t) => console.log(`  ✅ ${t}`)
 const warn = (t) => console.log(`  ⚠️  ${t}`)
 const die = (t) => { console.error(`\n❌ ${t}\n`); process.exit(1) }
 const capture = (cmd, args) => {
-  try { return { code: 0, out: execFileSync(cmd, args, { cwd: ROOT, stdio: 'pipe', encoding: 'utf8', shell: process.platform === 'win32' }).trim() } } catch (e) {
+  // ⚠️ 只有 npm 走 shell（Windows 上是 npm.cmd）；git/node.exe 一律直接 spawn，
+  //    否则带空格的路径（D:\Program Files\…）会被 cmd 拆开（2026-09-17 真踩过）
+  try { return { code: 0, out: execFileSync(cmd, args, { cwd: ROOT, stdio: 'pipe', encoding: 'utf8', shell: process.platform === 'win32' && cmd === 'npm' }).trim() } } catch (e) {
     return { code: e.status ?? 1, out: String(e.stdout ?? '').trim(), err: String(e.stderr ?? '').trim() }
   }
 }

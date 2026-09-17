@@ -53,13 +53,18 @@ const ok = (text) => console.log(`  ✅ ${text}`)
 const warn = (text) => console.log(`  ⚠️  ${text}`)
 const die = (text) => { console.error(`\n❌ ${text}\n`); process.exit(1) }
 
-/** 跑一个命令并把输出接过来（stdio inherit：npm 的彩色/进度照常显示） */
+/**
+ * 跑一个命令并把输出接过来（stdio inherit：npm 的彩色/进度照常显示）。
+ * ⚠️ 只有 `npm` 需要 shell：Windows 上它是 `npm.cmd`；而 `node.exe` 的路径常带空格
+ *    （`D:\Program Files\…`），套 shell 会被拆成两个 token —— 2026-09-17 真踩过。
+ */
+const NEEDS_SHELL = (cmd) => process.platform === 'win32' && cmd === 'npm'
 const run = (cmd, args, opts = {}) =>
-  execFileSync(cmd, args, { cwd: ROOT, stdio: 'inherit', shell: process.platform === 'win32', ...opts })
+  execFileSync(cmd, args, { cwd: ROOT, stdio: 'inherit', shell: NEEDS_SHELL(cmd), ...opts })
 /** 跑一个命令只取输出（用于判断，不打印） */
 const capture = (cmd, args, opts = {}) => {
   try {
-    return { code: 0, out: execFileSync(cmd, args, { cwd: ROOT, stdio: 'pipe', encoding: 'utf8', shell: process.platform === 'win32', ...opts }).trim() }
+    return { code: 0, out: execFileSync(cmd, args, { cwd: ROOT, stdio: 'pipe', encoding: 'utf8', shell: NEEDS_SHELL(cmd), ...opts }).trim() }
   } catch (e) {
     return { code: e.status ?? 1, out: String(e.stdout ?? '').trim(), err: String(e.stderr ?? '').trim() }
   }
