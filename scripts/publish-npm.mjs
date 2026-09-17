@@ -55,16 +55,21 @@ const die = (text) => { console.error(`\n❌ ${text}\n`); process.exit(1) }
 
 /**
  * 跑一个命令并把输出接过来（stdio inherit：npm 的彩色/进度照常显示）。
- * ⚠️ 只有 `npm` 需要 shell：Windows 上它是 `npm.cmd`；而 `node.exe` 的路径常带空格
- *    （`D:\Program Files\…`），套 shell 会被拆成两个 token —— 2026-09-17 真踩过。
+ * ⚠️ Windows 上 `npm` 是 `npm.cmd`，只能经 cmd 跑；但**不能**用 `shell: true`
+ *   （Node 会警告 DEP0190，而且 `node.exe` 的路径 `D:\Program Files\…` 会被拆开 —— 2026-09-17 真踩过）。
+ *   所以显式走 `cmd.exe /c npm …`，其它命令一律直接 spawn。
  */
-const NEEDS_SHELL = (cmd) => process.platform === 'win32' && cmd === 'npm'
-const run = (cmd, args, opts = {}) =>
-  execFileSync(cmd, args, { cwd: ROOT, stdio: 'inherit', shell: NEEDS_SHELL(cmd), ...opts })
+const spawnFor = (cmd, args) =>
+  process.platform === 'win32' && cmd === 'npm' ? ['cmd.exe', ['/c', 'npm', ...args]] : [cmd, args]
+const run = (cmd, args, opts = {}) => {
+  const [c, a] = spawnFor(cmd, args)
+  return execFileSync(c, a, { cwd: ROOT, stdio: 'inherit', ...opts })
+}
 /** 跑一个命令只取输出（用于判断，不打印） */
 const capture = (cmd, args, opts = {}) => {
+  const [c, a] = spawnFor(cmd, args)
   try {
-    return { code: 0, out: execFileSync(cmd, args, { cwd: ROOT, stdio: 'pipe', encoding: 'utf8', shell: NEEDS_SHELL(cmd), ...opts }).trim() }
+    return { code: 0, out: execFileSync(c, a, { cwd: ROOT, stdio: 'pipe', encoding: 'utf8', ...opts }).trim() }
   } catch (e) {
     return { code: e.status ?? 1, out: String(e.stdout ?? '').trim(), err: String(e.stderr ?? '').trim() }
   }
