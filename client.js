@@ -142,6 +142,16 @@ window.__ModuleLoader__.load({
 /* 「提示词」页顶部的注入状态（2026-09-16）：一眼看出会不会注入、为什么不会 */
 [data-wc-injectstatus]{font-size:12px;line-height:18px;color:var(--dsh-text-2,#9aa0a6);margin:0 0 8px;}
 [data-wc-injectstatus] [data-wc-note]{font-size:11px;line-height:16px;color:var(--dsh-text-3,#7a8085);margin-top:2px;}
+[data-wc-modes]{display:flex;gap:8px;margin:0 0 8px;}
+[data-wc-mode]{flex:1;display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 14px;
+  border:1px solid var(--dsw-alias-border-secondary,rgba(128,128,128,.3));border-radius:8px;background:transparent;
+  color:var(--dsw-alias-label-primary,#e6e6e6);font-size:13px;font-family:inherit;line-height:1;cursor:pointer;
+  transition:background .12s,border-color .12s;}
+[data-wc-mode]:hover:not(:disabled){border-color:var(--dsw-alias-state-business-primary,#4a8cff);}
+[data-wc-mode][data-wc-mode-on]{border-color:transparent;font-weight:600;
+  background:var(--dsw-alias-state-business-primary,rgba(74,140,255,.22));}
+[data-wc-mode]:disabled{opacity:.5;cursor:default;}
+[data-wc-hint] strong{font-weight:600;color:var(--dsw-alias-label-primary,#e6e6e6);}
 [data-wc-verprompt]{margin:0 0 10px;font-size:12px;color:var(--dsh-text-2,#9aa0a6);}
 [data-wc-verprompt] summary{cursor:pointer;}
 [data-wc-verprompt] pre{margin:6px 0 0;padding:8px 10px;border-radius:6px;white-space:pre-wrap;
@@ -1190,10 +1200,124 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       )
     }
 
+    /* ------------------------------------------------------------ 页 4：文件分享 */
+
+    /**
+     * 「文件分享」页（用户 2026-09-17 定）：两种模式 + 在线 base + 清除分享数据。
+     *   关闭（默认）/ 在线 —— 决定 `mc_kit_express` 回什么、以及那条服务开不开：
+     *     · 关闭：AI 只会把**绝对路径**告诉用户（服务不开）；
+     *     · 在线：回 `base + 路径` 的**完整 URL**（只有这个模式开服务，图能直接在对话里显示）。
+     */
+    function SharePane(props) {
+      const {
+        mode, base, share, busyKey,
+        onPickMode, onSaveBase, onUseCurrent, onClear,
+      } = props
+      const busy = busyKey !== null
+      const [baseText, setBaseText] = React.useState(base ?? '')
+      const [confirmClear, setConfirmClear] = React.useState(false)
+      React.useEffect(() => { setBaseText(base ?? '') }, [base])
+
+      const MODES = [
+        { id: 'off', name: '关闭', desc: '不分享：AI 只会告诉你文件的绝对路径，让你自己打开' },
+        { id: 'online', name: '在线', desc: '回完整 URL：要填 base，图片可以直接在对话里显示' },
+      ]
+      const online = mode === 'online'
+      const activeDesc = MODES.find((m) => m.id === mode)?.desc ?? ''
+      const baseBusy = busyKey === 'share:base'
+      const clearBusy = busyKey === 'share:clear'
+      const dirty = (baseText ?? '') !== (base ?? '')
+
+      return React.createElement(
+        'div',
+        { 'data-wc-pane-page': 'share' },
+        React.createElement('div', { 'data-wc-sec': '' },
+          React.createElement('div', { 'data-wc-h': '' }, '分享模式'),
+          // 两个模式做成一排等宽的按钮（别用账户页那种带 × 的小标签：太窄、字也不居中）
+          React.createElement('div', { 'data-wc-modes': '' },
+            ...MODES.map((m) => React.createElement('button', {
+              key: m.id,
+              type: 'button', 'data-wc-mode': '', ...(mode === m.id ? { 'data-wc-mode-on': '' } : {}),
+              disabled: busy, title: m.desc,
+              onClick: () => { if (mode !== m.id) onPickMode(m.id) },
+            }, m.name))),
+          React.createElement('p', { 'data-wc-hint': '' }, activeDesc),
+        ),
+        // base 只属于「在线」模式：关闭时不显示（免得让人以为关闭模式也吃 base）
+        online
+          ? React.createElement('div', { 'data-wc-sec': '' },
+            React.createElement('div', { 'data-wc-h': '' }, '在线 base'),
+            React.createElement('div', { 'data-wc-field': '' },
+              React.createElement('input', {
+                'data-wc-in': '', value: baseText, spellCheck: false, disabled: busy,
+                placeholder: 'https://example.com（可以带路径前缀）',
+                onChange: (e) => setBaseText(e.target.value),
+              }),
+            ),
+            React.createElement('p', { ...(!base ? { 'data-wc-hint': '', 'data-wc-dirty': '' } : { 'data-wc-hint': '' }) },
+              !base
+                ? '还没填 base：AI 暂时只能让你去设置。'
+                : '填你访问这台 DSH 用的地址。'),
+            React.createElement('div', { 'data-wc-acts': '' },
+              React.createElement('button', {
+                type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-primary': '',
+                disabled: busy || !dirty, onClick: () => onSaveBase(baseText.trim()),
+              }, baseBusy ? '保存中…' : '保存 base'),
+              React.createElement('button', {
+                type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '',
+                disabled: busy, title: '用你现在访问这个页面的地址填好并保存',
+                onClick: onUseCurrent,
+              }, '获取当前')),
+          )
+          : null,
+        React.createElement('div', { 'data-wc-sec': '' },
+          React.createElement('div', { 'data-wc-h': '' }, '分享数据'),
+          React.createElement('p', { 'data-wc-hint': '' },
+            share?.dir
+              ? `目录：${share.dir}${share.exists ? `　（${share.files} 个文件 / ${fmtBytes(share.bytes)}）` : '　（还没有这个目录）'}`
+              : '目录：读取中…'),
+          // 清除与分享模式无关：关闭模式下也一样能清（不然关掉分享就没法收拾旧文件）
+          React.createElement('div', { 'data-wc-acts': '' },
+            confirmClear
+              ? [
+                React.createElement('button', {
+                  key: 'yes', type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-danger': '',
+                  disabled: busy, title: '再点一次确认',
+                  onClick: () => { setConfirmClear(false); onClear() },
+                }, clearBusy ? '清除中…' : '确认清除'),
+                React.createElement('button', {
+                  key: 'no', type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', disabled: busy,
+                  onClick: () => setConfirmClear(false),
+                }, '取消'),
+              ]
+              : React.createElement('button', {
+                type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-danger': '',
+                disabled: busy,
+                title: '删掉上面那个目录里的所有文件',
+                onClick: () => setConfirmClear(true),
+              }, '清除分享数据')),
+          // ⚠️ 这里是 HTML（React 文本节点），不是 markdown —— 别再用 `**` 当粗体（用户指出过一次）
+          React.createElement('p', { 'data-wc-hint': '' },
+            '「清除分享数据」会把上面那个目录里的文件',
+            React.createElement('strong', {}, '全部删掉'),
+            '，不可撤销。'),
+        ),
+      )
+    }
+
+    function fmtBytes (n) {
+      const v = Number(n ?? 0)
+      if (!Number.isFinite(v) || v <= 0) return '0 B'
+      if (v < 1024) return `${v} B`
+      if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`
+      return `${(v / 1024 / 1024).toFixed(1)} MB`
+    }
+
     const TABS = [
       { id: 'accounts', label: '账户' },
       { id: 'whitelist', label: '指令白名单' },
       { id: 'prompt', label: '提示词' },
+      { id: 'share', label: '文件分享' },
     ]
 
     function McSettingsModal(props) {
@@ -1226,6 +1350,10 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const [mdPath, setMdPath] = React.useState('')
       const [injectWc, setInjectWc] = React.useState(true)
       const [injectWs, setInjectWs] = React.useState(false)
+      // 「文件分享」：模式（off 关闭 / online 在线）+ base + 发布区现状
+      const [shareMode, setShareMode] = React.useState('off')
+      const [shareBase, setShareBase] = React.useState('')
+      const [shareInfo, setShareInfo] = React.useState(null)
       const [wsPath, setWsPath] = React.useState('')
       const [wsExists, setWsExists] = React.useState(false)
       const [injectStatus, setInjectStatus] = React.useState(null)
@@ -1263,6 +1391,11 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             setAllowAll(c.allowAllCommands === true)
             setInjectWc(c.injectWhaleCraftAgentsMd !== false)
             setInjectWs(c.injectWorkspaceAgentsMd === true)
+            setShareMode(c.expressMode === 'online' ? 'online' : 'off')
+            setShareBase(String(c.expressBase ?? ''))
+          }).catch((e) => { setError(errorText(e)) }),
+          apiGet(withSid('/api/mc/express')).then((s) => {
+            setShareInfo(s ?? null)
           }).catch((e) => { setError(errorText(e)) }),
           apiGet(agentsMdPath).then((m) => {
             setMdText(String(m.text ?? ''))
@@ -1377,6 +1510,51 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         run('cfg:ws', () => apiPatch(withSid('/api/mc/config'), { injectWorkspaceAgentsMd: next === true }),
           next ? '已开启工作区 AGENTS.md 注入' : '已关闭工作区 AGENTS.md 注入'), [run])
 
+      /* ── 页 4：文件分享 ──
+       * 模式**一点就存**（同"允许所有指令"那个开关：错了回滚）；base 走「保存」按钮；
+       * 「获取当前」= 用**你现在访问这个页面的地址**填好并保存；
+       * 🔴 切到「在线」而 base 还没设时，自动做一次"获取当前"（不然在线模式当场没用）；
+       * 但**不去调就不写**：不切到在线、不点按钮，base 永远保持原样。
+       * 清除分享数据**必须确认**（不可撤销）。
+       * ⚠️ 输入框的文本状态在 SharePane 内部（`baseText`），这里**不能**去 setBaseText：
+       *    保存完 `load()` 会刷新 `shareBase`，pane 的 useEffect（+ key 变化）会自己同步回输入框。 */
+      /** 向服务端要「当前地址」：把浏览器**自己正在用的** origin 一起报上去（最精准）。 */
+      const fetchCurrentBase = React.useCallback(() => {
+        const here = (typeof location !== 'undefined' && location.origin) ? location.origin : ''
+        const q = here ? '&clientOrigin=' + encodeURIComponent(here) : ''
+        return apiGet(withSid('/api/mc/express') + q).then((s) => String(s?.currentBase ?? ''))
+      }, [withSid])
+
+      const pickShareMode = React.useCallback((next) => {
+        const prev = shareMode
+        if (next === prev) return Promise.resolve(true)
+        setShareMode(next)                                           // 乐观更新
+        // 切到在线且还没 base → 顺手把当前地址一起保存（一次动作，别让用户自己去找地址）
+        const autoBase = next === 'online' && !shareBase
+        return run('share:mode', () => (autoBase
+          ? fetchCurrentBase().then((cur) => apiPatch(withSid('/api/mc/config'),
+            cur ? { expressMode: next, expressBase: cur } : { expressMode: next }))
+          : apiPatch(withSid('/api/mc/config'), { expressMode: next })),
+        next === 'online'
+          ? (autoBase ? '已切到在线，base 用当前地址填好了' : '文件分享：在线')
+          : '文件分享：已关闭')
+          .then((ok) => { if (!ok) setShareMode(prev); return ok })   // 失败回滚
+      }, [run, shareMode, shareBase, fetchCurrentBase])
+
+      const saveShareBase = React.useCallback((text) =>
+        run('share:base', () => apiPatch(withSid('/api/mc/config'), { expressBase: String(text ?? '') }),
+          'base 已保存'), [run])
+
+      /** 「获取当前」：填进输入框并立即保存（拿不到就明确报错，别存一个空值） */
+      const useCurrentBase = React.useCallback(() =>
+        run('share:base', () => fetchCurrentBase().then((cur) => {
+          if (!cur) throw new Error('拿不到当前地址：请手动填写（例如 http://127.0.0.1:14640）')
+          return apiPatch(withSid('/api/mc/config'), { expressBase: cur })
+        }), '已用当前地址填好'), [run, fetchCurrentBase])
+
+      const clearShare = React.useCallback(() =>
+        run('share:clear', () => apiDelete(withSid('/api/mc/express')), '分享数据已清除'), [run])
+
       if (!open) return null
 
       const busy = busyKey !== null
@@ -1394,12 +1572,18 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             onMdText: setMdText, onSave: saveAgentsMd, onReset: resetAgentsMd,
             onInjectWc: toggleInjectWc, onInjectWs: toggleInjectWs,
           })
-          : React.createElement(AccountsPane, {
+          : (tab === 'share'
+            ? React.createElement(SharePane, {
+              key: 'share:' + shareMode + ':' + shareBase,
+              mode: shareMode, base: shareBase, share: shareInfo, busyKey,
+              onPickMode: pickShareMode, onSaveBase: saveShareBase, onUseCurrent: useCurrentBase, onClear: clearShare,
+            })
+            : React.createElement(AccountsPane, {
             accounts, servers, defaultAccount, busyKey,
             onPatch: patchAccount, onRefresh: refreshAccount, onDelete: deleteAccount,
             onCreate: createAccount, onAddServer: addServer, onAddCard: addServerCard,
             onRemoveServer: removeServer,
-          }))
+          })))
 
       return React.createElement(
         'div',

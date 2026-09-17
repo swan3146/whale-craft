@@ -20,6 +20,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
+import { EXPRESS_MODES, normalizeExpressBase, resolveExpressMode } from './express.mjs'
 
 /** 插件在 `$DSH_HOME` 下的目录名 */
 export const STATE_DIR_NAME = 'whale_craft'
@@ -99,6 +100,21 @@ export const DEFAULT_CONFIG = {
    * （极简工具面）；**已存在就绝不动**。关掉它就回到"要自己建 preset"。
    */
   ensureMcPreset: true,
+  /**
+   * 「文件分享」模式（用户 2026-09-17 定）：`off` 关闭（默认） / `online` 在线。
+   *
+   *   · `off`    关闭：`mc_kit_express` 只回一句话（"文件分享已关闭，请告知用户文件绝对路径…"），
+   *              让 AI 把**绝对路径**告诉用户，用户自己打开；`/api/mc/whale-craft/…` 服务**不开**；
+   *   · `online` 在线：回 `expressBase + 相对路径` 的**完整 URL**；**只有这个模式**才开那条服务。
+   *
+   * 🔴 用户 2026-09-17 砍掉了原先的"Windows 本地"模式（"Windows 很鸡肋"）：它只是把绝对路径
+   *    原样回给 AI，而 DSH 前端不认相对/本地路径 —— 点不开也内联不了，不如只留"关"和"在线"两种。
+   * ⚠️ 老配置里可能还留着 `local`：{@link resolveExpressMode} 一律当 `off`（不会再开服务）。
+   * 两种模式都仍然**只认发布区**（`.whale-craft/.express/`）。
+   */
+  expressMode: 'off',
+  /** 在线模式的 base（如 `https://dsh.example.com`，可带路径前缀）；空 = 还没配 */
+  expressBase: '',
 
 }
 
@@ -347,6 +363,9 @@ export class PluginConfig {
     }
     if (SECRET_KEYS.has(top)) throw new Error('这一项不允许通过工具修改')
     validate(top, rest, value)
+    // 落盘前归一化（存的永远是规范形态：模式小写、base 去尾斜杠）
+    if (top === 'expressMode') value = String(value).trim().toLowerCase()
+    if (top === 'expressBase') value = normalizeExpressBase(value) ?? ''
     writePath(this.data, p.split('.'), value)
     this.save()
     return { path: p, value: this.get(p), file: this.file }
@@ -388,6 +407,16 @@ export class PluginConfig {
   get memoryDir () {
     const v = this.get('memoryDir')
     return typeof v === 'string' && v.trim() ? v.trim() : null
+  }
+
+  /** 「文件分享」模式：只有 `online` 是开，其余（含老配置里的 `local`）一律 `off` */
+  get expressMode () {
+    return resolveExpressMode(this.get('expressMode'))
+  }
+
+  /** 在线模式的 base（归一化：去尾斜杠；非法/空 = `''`） */
+  get expressBase () {
+    return normalizeExpressBase(this.get('expressBase')) ?? ''
   }
 
   /** 这个 preset id 算不算 MC 模式 */
@@ -443,6 +472,20 @@ function validate (top, rest, value) {
   }
   if (top === 'allowAllCommands' || top === 'injectWhaleCraftAgentsMd' || top === 'injectWorkspaceAgentsMd' || top === 'ensureMcPreset') {
     if (typeof value !== 'boolean') throw new Error(`${top} 必须是 true/false`)
+    return
+  }
+  if (top === 'expressMode') {
+    const v = String(value ?? '').trim().toLowerCase()
+    if (!EXPRESS_MODES.includes(v)) {
+      throw new Error(`expressMode 必须是 ${EXPRESS_MODES.join(' / ')} 之一`)
+    }
+    return
+  }
+  if (top === 'expressBase') {
+    if (typeof value !== 'string') throw new Error('expressBase 必须是字符串（如 https://example.com；空 = 未设置）')
+    if (value.trim() && normalizeExpressBase(value) === null) {
+      throw new Error('expressBase 必须是 http(s) 开头的完整地址（如 https://example.com，可带路径前缀）')
+    }
     return
   }
   if (top === 'mcMode') {

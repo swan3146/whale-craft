@@ -89,7 +89,7 @@ dsh plugin --profile web add link:/path/to/whale-craft
 ## 配置
 
 「MC设置」入口有**两个，按会话状态互斥**（任何时刻只出现一个）：**新会话页**上贴在**模式芯片的右边**；
-**已有会话**时落在**对话标题条的操作区**。点开就是账户 / 指令白名单 / 提示词三个标签页。
+**已有会话**时落在**对话标题条的操作区**。点开就是账户 / 指令白名单 / 提示词 / 文件分享四个标签页。
 配置落在 `$DSH_HOME/whale_craft/config.json`，改完立即生效。
 
 非 MC 模式下的 AI 可以用 `mc_admin_config` 工具改这些键（**MC 模式会话看不见、也调不动它**）：
@@ -103,6 +103,8 @@ dsh plugin --profile web add link:/path/to/whale-craft
 | `mcMode.hideAdminTools` | 是否把 `mc_admin_*` 也放进白名单（默认隐藏，另有 guard 硬拒） | `true` |
 | `injectWhaleCraftAgentsMd` | 是否把 `.whale-craft/RULES.md`（行事准则）注入 MC 模式会话 | `true` |
 | `injectWorkspaceAgentsMd` | 是否**额外**注入工作区根上的 `AGENTS.md` | `false` |
+| `expressMode` | 文件分享：「文件分享」页选的模式：`off` 关闭 / `online` 在线 | `"off"` |
+| `expressBase` | 在线模式的 base（你访问这台 DSH 的地址，可带路径前缀） | `""` |
 | `memoryDir` | 记忆根目录（`null` = 用会话工作区的 `.whale-craft/`） | `null` |
 | `ensureMcPreset` | 启动时若 `mcModePresets` 里**一个 preset 都不存在**，就复制官方 `minimal` 建一个「MC模式」（已存在则绝不动） | `true` |
 
@@ -131,7 +133,7 @@ dsh plugin --profile web add link:/path/to/whale-craft
 | 层 | 数量 | 工具 |
 | --- | --- | --- |
 | **游戏内** `mc_*` | 24 | `mc_status` `mc_connect` `mc_lan` `mc_accounts` `mc_capabilities` `mc_disconnect` `mc_stop` `mc_config` `mc_sessions` `mc_diag` `mc_say` `mc_events` `mc_watch` `mc_map` `mc_scan` `mc_entities` `mc_inventory` `mc_move` `mc_act` `mc_dig` `mc_build` `mc_give` `mc_sequence` `mc_command` |
-| **游戏外辅助** `mc_kit_*` | 3 | `mc_kit_memory`（记忆树：按服/主题定位、`key` 覆盖、搜索、删除、把文件与图片**存进记忆**）· `mc_kit_image`（SVG→PNG / 引图 / 拼网格）· `mc_kit_express`（把发布区里的文件换成可访问路径） |
+| **游戏外辅助** `mc_kit_*` | 3 | `mc_kit_memory`（记忆树：按服/主题定位、`key` 覆盖、搜索、删除、把文件与图片**存进记忆**）· `mc_kit_image`（SVG→PNG / 引图 / 拼网格）· `mc_kit_express`（把发布区里的文件按「文件分享」模式换成路径 / URL / 一句提示） |
 | **管理** `mc_admin_*` | 1 | `mc_admin_config`（读写全局配置；**MC 模式看不见、也调不动**） |
 
 几个设计点：
@@ -188,28 +190,41 @@ dsh plugin --profile web add link:/path/to/whale-craft
 
 ---
 
-## 把文件给用户看（发布区）
+## 把文件给用户看（发布区 + 「文件分享」开关）
 
 > 让 AI「画了图给你看」这件事，插件自带一条最小通道：**目录即白名单**，不依赖任何外部图床/文件服务。
+> 分享方式由你在「MC设置 → 文件分享」里选（默认**关闭**）。
 
-| 目录 | 谁能访问 | 用途 |
+| 目录 | 谁能拿到 | 用途 |
 | --- | --- | --- |
-| `<工作区>/.whale-craft/.out/` | **谁都访问不到** | 默认输出（草稿、中间产物） |
-| `<工作区>/.whale-craft/.express/` | 可以被访问（**支持子目录**） | 发布区：要让用户看到的图/文件 |
+| `<工作区>/.whale-craft/.out/` | **谁都拿不到** | 默认输出（草稿、中间产物） |
+| `<工作区>/.whale-craft/.express/` | 取决于分享模式 | 发布区：要给你看的图/文件（**支持子目录**） |
 
-1. **把文件放进去**：出图时把 `out` 写成 `.whale-craft/.express/<子目录>/x.png`；
-   已有文件用 `mc_kit_memory {action:"put", source:"…", path:".express/<子目录>/x.png"}` 复制过去。
-2. **换路径**：`mc_kit_express {path:"…"}` → 返回一行可访问路径
-   （形如 `/api/mc/whale-craft/<工作区目录名>/<子目录>/x.png`）。
-3. **引用它**：图片 `![名字](路径)`、其它文件 `[名字](路径)`。
+两种模式（`expressMode`）：
 
-- 服务端：`GET|HEAD /api/mc/whale-craft/<工作区目录名>/<剩余路径>`，挂在既有 `/api/mc` 上（复用信任栅栏）。
+| 模式 | `mc_kit_express` 返回什么 | 那条访问服务 |
+| --- | --- | --- |
+| **关闭（默认）** | 恒回一句「文件分享已关闭，请告知用户文件绝对路径，让用户自行打开」——AI 把文件的**绝对路径**给你，你自己打开 | **不开**（访问即 404） |
+| **在线** | `base` + `/api/whale-craft/express/<工作区 uuid>/<相对路径>` 的**完整 URL**（图片能直接在对话里内联显示） | **只在**这个模式开 |
+
+**在线模式**要填 `base` = 你访问这台 DSH 用的地址（如 `https://dsh.example.com`，可带路径前缀）；
+设置页有「获取当前」，也可以直接切到在线 —— base 为空时会**自动**用当前访问地址填上。
+（精度：浏览器把**自己正在用的** `location.origin` 报给服务端 → 否则看 `Origin` 头 → 同源 `Referer`
+→ `X-Forwarded-Proto` + `Host` → `Host`。注意 `location.origin` **不含路径**，所以反代额外加的
+路径前缀得你自己补 —— DSH 本身没有"挂载前缀"概念。）
+
+**两种模式都只认发布区**：文件得先放进 `.express/` 或其子目录（出图时把 `out` 写成那里，
+或用 `mc_kit_memory {action:"put"}` 复制过去），再让 AI 调 `mc_kit_express` 取那一行。
+
+- 服务端地址：`GET|HEAD /api/whale-craft/express/<工作区 uuid>/<剩余路径>`（自己的顶层前缀路由，
+  自带同一道信任栅栏）。**uuid 是 DSH 工作区注册表里那个稳定 id** —— 不同父目录下的同名工作区不会撞，
+  目录改名链接也不失效；查不到对应工作区就 404（不退回目录名）。
 - 安全：**只用纯文件名逐段拼接**（`..`、`.`、空段、段内分隔符、盘符、`~` 一律拒），拼完再 `realpath` 复查
   "真实路径仍在发布区里" ⇒ **路径穿越与符号链接都出不去**；不列目录；单文件上限 32 MB；
   所有扩展名放行，只给 svg/html 这类"被当文档打开会执行脚本"的加一个 `Content-Security-Policy: sandbox` 头。
-- ⚠️ **已知限制（发布 0.1.0 时的状态）**：DSH 的 Markdown 渲染器**只接受绝对 http(s) 图片地址**
-  （相对地址被明确禁用），所以上面那行路径**不会**在对话里内联成图 —— 目前它适合"拿到链接、自己拼上
-  实例地址打开"。见「已知限制」。
+- 设置页还有 **「清除分享数据」**：**与模式无关、随时可点**（二次确认后删掉当前工作区 `.express/` 里的
+  所有文件，目录本身重建）。
+- ⚠️ 前端渲染只认**绝对 http(s)** 图片地址 ⇒ 只有**在线**模式的 URL 能内联显示；关闭模式本来就是"给你路径自己开"。
 
 ---
 
@@ -251,20 +266,21 @@ dsh plugin --profile web add link:/path/to/whale-craft
 
 ```bash
 node tools/check-core.mjs     # 全树语法 + 动态 import + 私有字段一致性（改 core.mjs 必跑）
-node selfcheck.mjs            # 512 条离线断言（假 ctx，不需要 MC 服务器、不连网）
+node selfcheck.mjs            # 563 条离线断言（假 ctx，不需要 MC 服务器、不连网）
 # 起一个隔离 DSH 实例验证"整树加载"（需要一份 DSH checkout）：
 DSH_ROOT=/path/to/deepseek-harness node tools/isolate.mjs start
 ```
 
 `selfcheck.mjs` 覆盖：工具面与参数、每会话实例隔离、超时/中断、放置判据（与 `minecraft-data` 真值表比对）、
 看门狗唤醒投递与 job 结算、未签名/系统位置聊天的识别、记忆树读写与路径穿越防护、**发布区的防穿透与真路由**、
-账户库与凭据隔离、配置校验、提示词注入去重与版本提示、preset 自检与重建、**强制停止的四步顺序**、
+**「文件分享」两种模式与 base 推导**（含反代 `Referer` 一档）、账户库与凭据隔离、配置校验、
+提示词注入去重与版本提示、preset 自检与重建、**强制停止的四步顺序**、
 依赖面（含"`vec3` 与 `mineflayer` 必须是同一份"这类运行时断言），以及客户端 bundle 的静态检查。
 
 CI 跑的就是这两条（`.github/workflows/ci.yml`）：**ubuntu（Node 22 / 24）+ windows（Node 22）**；
 另有一个「打包产物」job，`npm pack` 之后核对 tarball 里该有的文件都在、且没混进 `node_modules` / 日志 / 账户。
 
-发布走 tag（`.github/workflows/release.yml`）：`git tag v0.1.0 && git push --tags` →
+发布走 tag（`.github/workflows/release.yml`）：`git tag v0.1.1 && git push --tags` →
 先跑上面两条 + 校验 tag 与 `package.json` 版本一致，再 `npm pack` 并把 tarball 挂到 GitHub Release；
 仓库里配了 `NPM_TOKEN` secret 的话顺带发 npm（没配就只发 Release，不会失败）。
 `npm publish` 前还会自动跑一遍这两条（`prepublishOnly`）—— **坏树发不出去**。
@@ -274,9 +290,10 @@ CI 跑的就是这两条（`.github/workflows/ci.yml`）：**ubuntu（Node 22 / 
 ## 已知限制
 
 - **微软正版登录未实现**（只有离线 / Yggdrasil 皮肤站）。
-- **图片目前不会在对话里内联显示**：DSH 的 Markdown 渲染器只接受绝对 http(s) 图片地址，反而**禁用相对地址**；
-  而 `mc_kit_express` 返回的是实例内的相对路径 ⇒ 适合"拿链接自己打开"。想内联，需要把它拼成绝对地址
-  （或改走宿主自带的 `/api/file` 机制）。这条留待后续版本处理。
+- **文件分享默认是关的**（`expressMode: "off"`）：AI 画了图只会把**绝对路径**给你，要让它直接在对话里显示，
+  得在「MC设置 → 文件分享」里切到**在线**并填好 `base`。前端只认绝对 http(s) 图片地址，所以关闭模式下的
+  本地路径**不会**内联成图（这是设计如此，不是 bug）。
+- 在线模式的 `base` **不做连通性自检**：填错了只有你自己能发现（AI 拿到的 URL 打不开）。
 - 🔴 **行事准则为什么叫 `RULES.md`**（见上）：`AGENTS.md` 会被 DSH 当工作区指令自动注入到任何碰过该目录的会话，
   与 MC 模式无关 —— 所以这个名字是刻意的。
 - 工具描述与文档目前是**中文**。
@@ -313,9 +330,13 @@ read the world and keep notes — and wake itself up when something worth notici
   and injected as a plugin notice when the session starts.
 - **A per-release built-in prompt** — a hard-coded, non-editable note that ships with each version
   ("which tools are still immature, how to hand files to the user").
+- **File sharing switch** — per-workspace publish area (`.whale-craft/.express/`, "the directory *is* the
+  allow-list"), two modes: **off** (default — the agent just hands you an absolute path) or **online**
+  (the agent hands back a full URL built from your `base`, and images render inline in the chat).
+  The HTTP route that serves those files exists **only** in online mode.
 - **Passwords never reach the model** — credentials live in the host credential store; accounts are
   managed from the in-app **MC Settings** dialog.
-- **Offline regression suite** — 512 assertions, no Minecraft server required.
+- **Offline regression suite** — 563 assertions, no Minecraft server required.
 
 ### Install
 
@@ -358,7 +379,7 @@ HTTP responses, or the model context.
 ### Verify offline
 
 ```bash
-node tools/check-core.mjs && node selfcheck.mjs   # 512 assertions, no MC server needed
+node tools/check-core.mjs && node selfcheck.mjs   # 563 assertions, no MC server needed
 ```
 
 CI runs exactly this on Linux (Node 22 and 24) and Windows (Node 22), and packs the tarball on every push.
