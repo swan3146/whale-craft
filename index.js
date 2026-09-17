@@ -555,9 +555,10 @@ export function apply(ctx, config) {
   // 凭据服务可能晚就绪 → 必须 ctx.inject 等（老教训：apply() 时 ctx.get() 常是 undefined）
   ctx.inject(['credentials'], (scope) => {
     accounts.credentials = scope.get('credentials') ?? null
+    // 🔴 必须 catch：未处理的 Promise 拒绝会被宿主的 fail-loud 当致命错误 → exit(1)（2026-09-17 真炸过）
     void accounts.refreshCredentialIndex().then(() => {
       logLine(`账户库就绪：${accounts.list().length} 个账户｜凭据服务 ${accounts.credentialsReady ? '可用' : '不可用（拒绝存密码）'}`)
-    })
+    }).catch((e) => { logLine(`凭据索引刷新失败（不影响启动）：${e?.message ?? e}`) })
   })
 
   /** 账户 → core 的 auth 描述符（**唯一**读凭据的地方；返回值含密码，绝不外传） */
@@ -1487,7 +1488,12 @@ export function apply(ctx, config) {
       if (args.subserver) opts.subserver = String(args.subserver)
       if (args.version)   opts.version   = String(args.version)
       // 登录成功后把（皮肤站的）档案信息与新令牌回写；回调只活在插件层，不进工具返回值
-      opts.onAuth = ({ profile, session }) => { void persistAuth(resolved, profile, session) }
+      // ⚠️ 回写是"顺带"的事：失败只能记日志，**绝不能**变成未处理拒绝（那会 exit(1)）
+      opts.onAuth = ({ profile, session }) => {
+        Promise.resolve()
+          .then(() => persistAuth(resolved, profile, session))
+          .catch((e) => logLine(`登录后回写账户信息失败（不影响本次进服）：${e?.message ?? e}`))
+      }
 
       try {
         await sess.bot.connect(opts)
@@ -2868,7 +2874,8 @@ export function apply(ctx, config) {
   let agentPresetsSvc = null
   ctx.inject(['agentPresets'], (scope) => {
     agentPresetsSvc = scope.get('agentPresets') ?? null
-    void ensureMcPreset()
+    // 🔴 同上：preset 自检/自建失败只能记日志，不能让 rejection 漏出去（fail-loud → exit(1)）
+    void ensureMcPreset().catch((e) => logLine(`MC 模式 preset 自检失败（不影响启动）：${e?.message ?? e}`))
   })
 
   /**

@@ -38,6 +38,75 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const requireFromMineflayer = (() => {
   try { return createRequire(createRequire(import.meta.url).resolve('mineflayer')) } catch { return createRequire(import.meta.url) }
 })()
+
+/* ─────────── 「Yggdrasil 会话 join」的兼容补丁（用户 2026-09-17：它把整个 DSH 搞崩过）───────────
+ * 事故链（真机实测栈）：
+ *   minecraft-protocol/src/client/encrypt.js:41
+ *     yggdrasilServer.join(accessToken, profileId, serverId, secret, pubkey, cb)   ← **老式回调**
+ *   yggdrasil/src/Server.js:20  join 是 **async 函数，根本不调那个 cb**
+ *   yggdrasil/src/utils.js:35   `if (body?.error !== undefined) throw new Error(body.error)`
+ *                               → 皮肤站令牌失效时抛 `ForbiddenOperationException`
+ *   ⇒ 这个 rejection **没有任何人接**（回调没人调、返回的 promise 没人 await）
+ *   ⇒ 宿主的 `installFailLoud` 把"未处理的 Promise 拒绝"当致命错误 → `dsh: fatal load failure` → **exit(1)**
+ *
+ * 所以这里把 `yggdrasil.server(...)` 返回的对象包一层：
+ *   · 调用方传了回调 → 我们替新版库把回调调起来（成功/失败都调）⇒ 恢复老式调用的语义、不产生悬空拒绝；
+ *   · 没传回调 → 至少 `.catch()` 掉，别把它变成 unhandledRejection。
+ * 同时把这类认证失败记下来（`takeAuthJoinError()`），好让上层给出"去 MC设置重新登录"的明确指引。
+ *
+ * ⚠️ 只动这一个方法；resolver 锚在 **mineflayer 自己的依赖树**上（保证和 minecraft-protocol 用的是同一份）。
+ * ─────────────────────────────────────────────────────────────────────────────────────────── */
+let lastAuthJoinError = null
+/** 取出（并清空）最近一次 session-join 失败 */
+export function takeAuthJoinError () { const e = lastAuthJoinError; lastAuthJoinError = null; return e }
+
+/**
+ * 把 `yggdrasil.server()` 的对象包一层（**纯函数**，自检直接测它）。
+ * @param {object} server `yggdrasil.server({...})` 的返回值
+ * @param {(e:Error)=>void} [onError] 失败时的记录钩子
+ */
+export function wrapYggdrasilServer (server, onError = (e) => { lastAuthJoinError = e }) {
+  if (!server || typeof server.join !== 'function' || server.__wcJoinWrapped) return server
+  const orig = server.join.bind(server)
+  server.join = (...args) => {
+    const cb = typeof args[args.length - 1] === 'function' ? args.pop() : null
+    const p = orig(...args)
+    if (cb) {
+      // 回调式调用方（minecraft-protocol 就是这个）：替新版库把回调调起来
+      Promise.resolve(p).then((r) => cb(null, r), (e) => { try { onError(e) } catch {} ; cb(e) })
+      return p
+    }
+    return Promise.resolve(p).catch((e) => { try { onError(e) } catch {} })
+  }
+  server.__wcJoinWrapped = true
+  return server
+}
+
+/** 一次性装上补丁（模块加载时装；拿不到 yggdrasil 就静默跳过） */
+const yggCompat = (() => {
+  try {
+    const mod = requireFromMineflayer('yggdrasil')
+    if (!mod || typeof mod.server !== 'function') return 'no-server-export'
+    const orig = mod.server
+    const wrapped = function (...args) { return wrapYggdrasilServer(orig.apply(this, args)) }
+    try { mod.server = wrapped } catch { return 'readonly-export' }
+    return 'patched'
+  } catch (e) { return `skip:${e?.code ?? e?.message ?? 'unknown'}` }
+})()
+
+/** 认证类失败 → 给用户看的可执行错误（needUserAction 让前端/工具照原样转达） */
+export function friendlyAuthError (e) {
+  const raw = String(e?.message ?? e ?? '')
+  if (/ForbiddenOperationException|InvalidToken|invalid session|Unauthorized|HTTP 40[13]|HTTP 400/i.test(raw)) {
+    const err = new Error(`皮肤站认证被拒（${raw}）：这个账户当前的登录令牌在那个认证服上无效`)
+    err.needUserAction = true
+    err.hint = '请让用户在「MC设置」里重新登录这个账户（或点该账户的「刷新」），再重新进服'
+    err.cause = e
+    return err
+  }
+  return e instanceof Error ? e : new Error(raw)
+}
+
 let _itemLoader = null
 function itemLoader () {
   if (!_itemLoader) _itemLoader = requireFromMineflayer('prismarine-item')
@@ -558,7 +627,19 @@ export class McBot extends EventEmitter {
           options.haveCredentials = true
           options.accessToken = session.accessToken
           options.session = session
-          options.connect(client)            // ⚠️ 必须显式调用
+          // ⚠️ 必须显式调用；而且**必须接住它的 rejection**：
+          //    皮肤站的 session join 失败（令牌失效）会从这里冒出来，
+          //    不接住就是"未处理的 Promise 拒绝"→ 宿主的 fail-loud 直接 exit(1)（2026-09-17 真炸过）。
+          const p = options.connect(client)
+          if (p && typeof p.catch === 'function') {
+            p.catch((e) => {
+              const err = friendlyAuthError(e)
+              this.lastError = err.message
+              this.autoReconnect = false            // 认证失败重连多少次都一样，别刷屏
+              this.log(`连接失败（认证/入服阶段）：${err.message}`)
+              try { this.emit('error', err) } catch { /* 没有监听者也无所谓 */ }
+            })
+          }
         },
       })
       b._createdAt = Date.now()
@@ -598,7 +679,10 @@ export class McBot extends EventEmitter {
           return attemptOnce(attempt + 1)
         }
         if (previous?.entity) { this.bot = previous; this.log('新连接失败，保留原有连接') }
-        throw e
+        // 认证/入服失败（令牌失效等）：转成"需要用户处理"的明确错误；
+        // 顺便把 yggdrasil 兼容层记下的那个 session-join 失败也捞出来当原因。
+        const joinErr = takeAuthJoinError()
+        throw friendlyAuthError(joinErr ?? e)
       }
 
       if (previous && previous !== b) { try { previous.quit() } catch {} }
@@ -618,6 +702,9 @@ export class McBot extends EventEmitter {
     }
 
     this.connecting = attemptOnce(1)
+    // 🔴 再挂一个 catch：调用方可能被 abort/取消而不再 await 这个 promise，
+    //    那样它的 rejection 就成了"未处理拒绝"→ 宿主 fail-loud 直接 exit(1)。
+    this.connecting.catch(() => {})
     try { return await this.connecting } finally { this.connecting = null }
   }
 
@@ -1778,7 +1865,7 @@ export class McBot extends EventEmitter {
  * 给 `mc_capabilities` 工具用；**不连服、不产生副作用**。
  */
 export function libraryInfo () {
-  const out = { mineflayer: null, testedVersions: [], oldest: null, latest: null, dataVersions: null, error: null }
+  const out = { mineflayer: null, testedVersions: [], oldest: null, latest: null, dataVersions: null, error: null, yggdrasilCompat: yggCompat }
   try {
     const pkg = requireFromMineflayer('./package.json')
     out.mineflayer = pkg?.version ?? null

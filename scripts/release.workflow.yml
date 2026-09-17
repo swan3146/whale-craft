@@ -3,10 +3,10 @@ name: Release
 # 打一个 v* tag（例如 v0.1.2）就自动：跑检查 → 校验 tag 与 package.json 版本一致 →
 # 打 **zip** 产物 → 建 GitHub Release，把 zip 挂上去，正文用 CHANGELOG.md 里本版本那一节。
 #
-# 🔴 本工作流**不碰 npm**（老大 2026-09-17："不要再让它碰 npm 了！"）——
+# 🔴 本工作流**不碰 npm**（用户 2026-09-17："不要再让它碰 npm 了！"）——
 #    以前最后一步会 `npm publish`，token 一失效就红叉，而发布其实早就成功了。整段已删除。
 #    想发 npm 就在本机跑 `npm run publish:npm`（见 RELEASING.md）。
-# 🔴 更新日志**不引用 diff/commit 列表**（老大要求）：正文只来自 CHANGELOG.md，
+# 🔴 更新日志**不引用 diff/commit 列表**（用户要求）：正文只来自 CHANGELOG.md，
 #    不再用 `gh release create --generate-notes`（那会写出 "Full Changelog: …/compare/…"）。
 on:
   push:

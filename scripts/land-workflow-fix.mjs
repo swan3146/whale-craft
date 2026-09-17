@@ -1,7 +1,7 @@
 /**
  * whale_craft · 落地"Release 工作流修复"（`npm run release:workflow-fix`）
  * ============================================================================
- * 为什么需要它（老大 2026-09-17）：
+ * 为什么需要它（用户 2026-09-17）：
  *   · 旧 `release.yml` 最后一步是 `npm publish`（`if: env.NODE_AUTH_TOKEN != ''`）——
  *     仓库里那个 `NPM_TOKEN` 一失效，每次打 tag 都会**红叉**，而发布其实早就成功了；
  *   · 修好的版本已经放在 `scripts/release.workflow.yml`（**普通文件**，所以能随代码推上去）：
@@ -109,7 +109,7 @@ const add = capture('git', ['add', '.github/workflows/release.yml'])
 if (add.code !== 0) die(`git add 失败：${add.err || add.out}`)
 const staged = capture('git', ['diff', '--cached', '--name-only'])
 if (!staged.out) { ok('没有变化（可能刚才已经写过了）'); process.exit(0) }
-const commit = capture('git', ['-c', 'user.name=yzi1b', '-c', 'user.email=yzi1b@qq.com', 'commit', '-m',
+const commit = capture('git', ['-c', 'user.name=' + (process.env.GIT_AUTHOR_NAME ?? 'whale-craft'), '-c', 'user.email=' + (process.env.GIT_AUTHOR_EMAIL ?? 'noreply@example.com'), 'commit', '-m',
   'Release 工作流：删掉 npm 步骤（红叉来源）；产物改 zip；正文取 CHANGELOG（不再 --generate-notes）'])
 if (commit.code !== 0) die(`git commit 失败：${commit.err || commit.out}`)
 ok('已提交')

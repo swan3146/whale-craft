@@ -2001,6 +2001,66 @@ console.log('\n--- 认证请求 URL（真机 bug 回归）---')
   globalThis.fetch = realFetch
 }
 
+/* ── 🔴 2026-09-17 真机致命事故：未处理的 Promise 拒绝把**整个 DSH** 干掉了 ──────────────
+ * 事故链（用户贴的真机栈）：
+ *   minecraft-protocol/src/client/encrypt.js:41  yggdrasilServer.join(..., cb)   ← 老式回调
+ *   yggdrasil/src/Server.js:20                   join 是 async，**不调那个 cb**
+ *   yggdrasil/src/utils.js:35                    皮肤站令牌失效 → throw ForbiddenOperationException
+ *   ⇒ 这个 rejection 无人接管 → 宿主的 `installFailLoud`（未处理拒绝=致命）打印
+ *     `dsh: fatal load failure` 并 **exit(1)**。
+ * 这里锁死两件事：① yggdrasil 的 join 兼容层（回调照调 + 不产生悬空拒绝）；
+ *               ② 我们自己代码里**不许**再有 `void x.then(...)` 这种没 catch 的火忘式 promise。 */
+console.log('\n--- 未处理拒绝（fail-loud → 整个 DSH exit(1)）防护 ---')
+{
+  const { wrapYggdrasilServer, takeAuthJoinError, friendlyAuthError } = await import('./src/core.mjs')
+
+  // ① 回调式调用（minecraft-protocol 就是这么用的）：错误必须进回调，而且不能有未处理拒绝
+  const rejections = []
+  const onUnhandled = (e) => rejections.push(String(e?.message ?? e))
+  process.on('unhandledRejection', onUnhandled)
+  const boom = new Error('ForbiddenOperationException')
+  const fakeServer = {
+    __calls: 0,
+    async join (...args) { fakeServer.__calls++; throw boom },
+  }
+  const wrapped = wrapYggdrasilServer(fakeServer)
+  const got = await new Promise((resolve) => { wrapped.join('tok', 'pid', 'sid', 'sec', 'key', (err, res) => resolve({ err, res })) })
+  console.log(`  ${got.err === boom && got.res === undefined ? '✅' : '❌'} 🔴 回调式调用：错误被**回调**接住（新版库自己不会调它）：${String(got.err?.message)}`)
+  // ② 没有回调时也不能悬空
+  const p = wrapped.join('tok', 'pid', 'sid', 'sec', 'key')
+  await p.catch(() => {})
+  // ③ 失败被记下来（给上层翻译成人话）
+  const recorded = takeAuthJoinError()
+  console.log(`  ${recorded === boom ? '✅' : '❌'} 失败被记进 takeAuthJoinError()（供上层转成"去 MC设置重新登录"）`)
+  await new Promise((r) => setTimeout(r, 20))
+  process.removeListener('unhandledRejection', onUnhandled)
+  console.log(`  ${rejections.length === 0 ? '✅' : '❌'} 🔴 全程**零**未处理拒绝（这就是当初 exit(1) 的根因）：${rejections.join(' | ') || '无'}`)
+  console.log(`  ${wrapped.__wcJoinWrapped === true && fakeServer.__calls >= 1 ? '✅' : '❌'} 补丁只包一次（幂等标记 __wcJoinWrapped）`)
+
+  // ④ 认证类错误 → 可执行的用户指引
+  const friendly = friendlyAuthError(boom)
+  console.log(`  ${/皮肤站认证被拒/.test(friendly.message) && friendly.needUserAction === true && /「MC设置」/.test(friendly.hint ?? '') ? '✅' : '❌'} 🔴 ForbiddenOperationException → needUserAction + "去 MC设置重新登录"指引`)
+  const other = friendlyAuthError(new Error('连接 mc.example 超时'))
+  console.log(`  ${other.message === '连接 mc.example 超时' && !other.needUserAction ? '✅' : '❌'} 其它错误原样透传（不乱贴"重新登录"标签）`)
+
+  // ⑤ 源码卫生：`void …then(…)` 必须带 catch（我们自己的火忘式 promise）
+  const { readFileSync: rf } = await import('node:fs')
+  const files = ['index.js', 'src/core.mjs', 'src/watchdog.mjs', 'src/memory.mjs', 'src/accounts.mjs']
+  const dangling = []
+  for (const f of files) {
+    const text = rf(new URL('./' + f, import.meta.url), 'utf8')
+    for (const m of text.matchAll(/\bvoid\s+[^\n;]*/g)) {
+      if (!/\.then\(/.test(m[0])) continue
+      // ⚠️ `.catch()` 常在后续几行（多行链）——要往后看一段，别只盯这一行（否则自己误报）
+      const window = text.slice(m.index, m.index + 600)
+      if (!/\.catch\(/.test(window)) dangling.push(`${f}: ${m[0].trim().slice(0, 70)}…`)
+    }
+  }
+  console.log(`  ${dangling.length === 0 ? '✅' : '❌'} 🔴 源码里没有"没 catch 的 fire-and-forget then"：${dangling.join(' ｜ ') || '无'}`)
+  const info = (await import('./src/core.mjs')).libraryInfo()
+  console.log(`  ${typeof info.yggdrasilCompat === 'string' ? '✅' : '❌'} libraryInfo 报出 yggdrasil 兼容层状态：${info.yggdrasilCompat}`)
+}
+
 // ── 看门狗唤醒投递（2026-09-15 真机 bug 回归：喊我没反应）──
 // 真机症状：看门狗检测正常（woke:true）、但注入报
 //   `Cannot read properties of undefined (reading 'throwIfAborted')`
