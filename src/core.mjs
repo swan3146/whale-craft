@@ -107,6 +107,23 @@ export function friendlyAuthError (e) {
   return e instanceof Error ? e : new Error(raw)
 }
 
+/**
+ * 交给 minecraft-protocol 的**凭据开关**（纯函数，自检直接测）。
+ *
+ * 🔴 2026-09-17 真机致命事故的另一半：`haveCredentials` 的语义是"**有真凭据**能拿给认证服看"
+ *   （minecraft-protocol `microsoftAuth.js:33` / `mojangAuth.js:24` 都是这么设的），
+ *   而我们以前**无条件设 true** ⇒ 离线账户也会被拖去 `sessionserver.mojang.com` 做 session join，
+ *   假 token 必然被拒（`ForbiddenOperationException`）→ 那条 rejection 没人接 →
+ *   宿主的 fail-loud 直接 `exit(1)`，整个 Harness 死。
+ *   离线账户必须走 encrypt.js 的"无凭据"分支（不发 session join）。
+ * @param {'offline'|'yggdrasil'} mode 账户类型
+ * @returns {{haveCredentials:boolean, useAccessToken:boolean}}
+ */
+export function sessionFlags (mode) {
+  const ygg = mode === 'yggdrasil'
+  return { haveCredentials: ygg, useAccessToken: ygg }
+}
+
 let _itemLoader = null
 function itemLoader () {
   if (!_itemLoader) _itemLoader = requireFromMineflayer('prismarine-item')
@@ -624,9 +641,15 @@ export class McBot extends EventEmitter {
           client.uuid = uuid
           client.username = profile.name
           client.emit('session', session)
-          options.haveCredentials = true
-          options.accessToken = session.accessToken
-          options.session = session
+          // 🔴 只有**皮肤站**（有真凭据）才 haveCredentials=true；离线账户必须 false，
+          //    否则 encrypt.js 会拿假 token 去 sessionserver 做 session join → ForbiddenOperationException
+          //    → 悬空拒绝 → 宿主 fail-loud exit(1)（2026-09-17 真炸过，见 .agent-docs）
+          const flags = sessionFlags(auth.mode)
+          options.haveCredentials = flags.haveCredentials
+          if (flags.useAccessToken) {
+            options.accessToken = session.accessToken
+            options.session = session
+          }
           // ⚠️ 必须显式调用；而且**必须接住它的 rejection**：
           //    皮肤站的 session join 失败（令牌失效）会从这里冒出来，
           //    不接住就是"未处理的 Promise 拒绝"→ 宿主的 fail-loud 直接 exit(1)（2026-09-17 真炸过）。

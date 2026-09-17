@@ -1272,6 +1272,25 @@ export function apply(ctx, config) {
   logLine(startup)
   ctx.logger?.info?.(`[whale_craft] ${startup}`)
 
+  /* ─────────── 「遗言」网：未处理拒绝会要了整个 Harness 的命，至少把原因留下来 ───────────
+   * 背景（2026-09-17 真机）：宿主的 `installFailLoud`（`apps/cli/src/profile-boot.ts:311` →
+   * `packages/boot/app-boot/src/index.ts:652`）把**任何**未处理拒绝当致命，打印
+   * `dsh: fatal load failure` 然后 `exit(1)`。插件**无法否决**它的 exit（别的监听的
+   * `process.exit` 拦不住），所以能做的只有两件：① 自己链路零悬空 + 把第三方已知的悬空点补掉
+   * （见 core.mjs 的 yggdrasil 兼容层与 sessionFlags）；
+   * ② 在进程被杀之前**把那条拒绝的栈写进我们的日志**，免得下次只能看到一句 fatal load failure。
+   * ⚠️ 只记录，不吞：宿主该怎么处置还是怎么处置（我们不改变它的行为）。
+   * ------------------------------------------------------------------------ */
+  try {
+    let logged = 0
+    process.on('unhandledRejection', (reason) => {
+      if (logged >= 5) return                    // 别刷爆日志
+      logged++
+      const stack = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)
+      logLine(`⚠️ 未处理拒绝（宿主可能会因此 exit(1)，栈如下，请据此定位）：${stack.split('\n').slice(0, 6).join(' ⏎ ')}`)
+    })
+  } catch (e) { logLine(`装未处理拒绝记录器失败（不影响使用）：${e?.message ?? e}`) }
+
   const text = (value, render) => ({
     schema: { type: 'object', properties: {}, additionalProperties: true },
     render: (args, value2) => [{ type: 'text', text: render ? render(args, value2) : String(value2?.text ?? JSON.stringify(value2, null, 2)) }],

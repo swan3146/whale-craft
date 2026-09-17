@@ -2059,6 +2059,18 @@ console.log('\n--- 未处理拒绝（fail-loud → 整个 DSH exit(1)）防护 -
   console.log(`  ${dangling.length === 0 ? '✅' : '❌'} 🔴 源码里没有"没 catch 的 fire-and-forget then"：${dangling.join(' ｜ ') || '无'}`)
   const info = (await import('./src/core.mjs')).libraryInfo()
   console.log(`  ${typeof info.yggdrasilCompat === 'string' ? '✅' : '❌'} libraryInfo 报出 yggdrasil 兼容层状态：${info.yggdrasilCompat}`)
+
+  /* ⑥ 离线账户**不许**走 session join（2026-09-17 事故的另一半：我们把 haveCredentials 无条件设 true，
+   *    离线账户于是拿假 token 去 sessionserver.mojang.com → ForbiddenOperationException → 悬空拒绝 → exit(1)） */
+  const { sessionFlags } = await import('./src/core.mjs')
+  const off = sessionFlags('offline')
+  const ygg = sessionFlags('yggdrasil')
+  console.log(`  ${off.haveCredentials === false && off.useAccessToken === false ? '✅' : '❌'} 🔴 离线账户：haveCredentials=false（不走 session join，不递假 token）`)
+  console.log(`  ${ygg.haveCredentials === true && ygg.useAccessToken === true ? '✅' : '❌'} 皮肤站账户：haveCredentials=true + 带 accessToken（要跟 session server 报备）`)
+  const idxSrc = rf(new URL('./index.js', import.meta.url), 'utf8')
+  const coreSrc = rf(new URL('./src/core.mjs', import.meta.url), 'utf8')
+  console.log(`  ${/const flags = sessionFlags\(auth\.mode\)/.test(coreSrc) && !/options\.haveCredentials = true/.test(coreSrc) ? '✅' : '❌'} 🔴 连接时按账户类型取开关（没有"无条件 true"了）`)
+  console.log(`  ${/process\.on\('unhandledRejection'/.test(idxSrc) ? '✅' : '❌'} 装上了"遗言"记录器（宿主 exit(1) 之前把栈写进插件日志）`)
 }
 
 // ── 看门狗唤醒投递（2026-09-15 真机 bug 回归：喊我没反应）──
