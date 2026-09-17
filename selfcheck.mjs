@@ -1402,6 +1402,8 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
 
   // ⑤ 会话建立时应用策略：MC 模式 → 工具白名单 + 投提示行；普通模式 → 什么都不做
   const restrictCalls = []
+  /** 被**撤销**的 restrict（宿主契约：`restrict()` 返回 disposer；我们切出 MC 模式时必须调它） */
+  const restrictReleased = []
   const guidanceCtxs = []
   /**
    * 照抄宿主的 `tools.restrict()` 契约：**名字不认识就抛错**（错误里带 known global tools 清单）。
@@ -1427,8 +1429,10 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
               throw new Error(`tools.restrict() names unknown global tool${unknown.length > 1 ? 's' : ''} `
                 + `${unknown.map((n) => `"${n}"`).join(', ')}; known global tools: ${[...KNOWN_TOOLS].sort().join(', ')}`)
             }
-            restrictCalls.push({ preset, f })
-            return () => {}
+            const call = { preset, f }
+            restrictCalls.push(call)
+            // 宿主契约：返回**撤销手柄**。切出 MC 模式时我们必须要用它（见 ⑦c）。
+            return () => { restrictReleased.push(call) }
           },
         }
       : k === 'systemPrompt'
@@ -1525,6 +1529,36 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   const lateRestrict = restrictCalls.find((c) => c.preset === undefined)
   console.log(`  ${Array.isArray(lateRestrict?.f?.allow) && !lateRestrict.f.allow.includes('pwsh') ? '✅' : '❌'} 模式晚选上时工具白名单也补上了（allow 有 ${lateRestrict?.f?.allow?.length ?? 0} 个、无 pwsh）`)
   console.log(`  ${eventHandlers.some((h) => h.ev === 'agent-preset/selected') ? '✅' : '❌'} 挂了宿主的 agent-preset/selected 事件（会话里切模式才生效）`)
+
+  /* ⑦c 🔴🔴 2026-09-17 真机事故（用户报的"标准模式会话无法执行命令"）：**从 MC模式 切回普通模式时，
+   *    工具白名单必须撤销**。`tools.restrict()` 是**黏**的（挂在 agent scope 上，会话不死就不消失），
+   *    而老代码只"套用"、从不撤销（返回的 disposer 直接丢了）⇒ 切回标准模式的会话永久留在 MC 白名单里
+   *    （没有 pwsh/bash，连 shell 都没有）。
+   *    真机复现 `session-55d48701`：建会话 standard → 04:51:47 切 minecraft（白名单生效）
+   *    → 06:34:20 切回 standard → 之后那个"标准模式"会话还是 mc_* + read/write/edit/read_image/present，
+   *    它在记录里写"My list definitely has no bash. So how do I run commands?"，只能让子代理替它跑命令。 */
+  {
+    const switchTo = (preset, agent = lateAgent) => {
+      presetByCtx.set(agent.ctx, preset)
+      eventHandlers.filter((h) => h.ev === 'agent-preset/selected').forEach((h) => h.fn(agent.id, preset))
+    }
+    const applied = restrictCalls.at(-1)                 // ⑦ 里那次"晚选上 MC模式"套的白名单
+    const releasedBefore = restrictReleased.length
+    switchTo('standard')
+    console.log(`  ${restrictReleased.length === releasedBefore + 1 && restrictReleased.at(-1) === applied ? '✅' : '❌'} 🔴 切回普通模式**撤销**了工具白名单（pwsh/命令工具回来了）`)
+    const callsBefore = restrictCalls.length
+    switchTo('minecraft')
+    const reapplied = restrictCalls.at(-1)
+    console.log(`  ${restrictCalls.length === callsBefore + 1 ? '✅' : '❌'} 再切回 MC模式 重新套上白名单（撤销 ≠ 以后不再管）：allow ${reapplied?.f?.allow?.length ?? 0} 个`)
+    console.log(`  ${Array.isArray(reapplied?.f?.allow) && !reapplied.f.allow.includes('pwsh') ? '✅' : '❌'} 重新套上的仍然是白名单（没有 pwsh）`)
+    switchTo('standard')                                 // 收尾：留成普通模式
+    console.log(`  ${restrictReleased.at(-1) === reapplied ? '✅' : '❌'} 套用与撤销一一对应（每次套的都撤掉了）`)
+    // 静态防回归：撤销路径的三块拼图必须在源码里（谁删了这里就红）
+    const srcIdx = (await import('node:fs')).readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+    console.log(`  ${/const mcRestrictRelease = new WeakMap\(\)/.test(srcIdx) && /const liftMcModePolicy = \(agent\)/.test(srcIdx) ? '✅' : '❌'} 源码里有撤销路径（mcRestrictRelease + liftMcModePolicy）`)
+    console.log(`  ${/if \(isMcModeAgent\(agent\)\) applyMcModePolicy\(agent\)[\s\S]{0,80}else liftMcModePolicy\(agent\)/.test(srcIdx) ? '✅' : '❌'} touch() 是**双向**的（是 MC 就套、不是就撤）`)
+    console.log(`  ${/mcRestrictRelease\.set\(agent, release\)/.test(srcIdx) ? '✅' : '❌'} 套用时**存下** disposer（不存就没法撤）`)
+  }
 
   /* ⑦b 记忆索引**是活的**：写一条记忆 → 新会话的提示行里必须带上它；删掉就不再出现。
    *    （以前这条测的是 systemPrompt 段的 `text()`；现在同一份文字走提示行，测法一样。） */

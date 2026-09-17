@@ -3102,6 +3102,22 @@ export function apply(ctx, config) {
   const mcPolicyApplied = new WeakSet()
 
   /**
+   * MC 模式工具白名单的**撤销手柄**：`tools.restrict()` 返回的 disposer。
+   *
+   * 🔴 2026-09-17 修（用户报的"标准模式会话无法执行命令"）：`restrict()` 是**黏**的 ——
+   *    它挂在 agent scope 上，**会话不死就不消失**；而我们以前把返回的 disposer 丢掉了，
+   *    `agent-preset/selected` 又只"套用"不"撤销" ⇒ 从 MC模式 切回 标准模式 的会话
+   *    会一直留着 MC 白名单（没有 pwsh/bash），看起来就像"标准模式坏了"。
+   *    真机复现：`session-55d48701`（standard → 04:51 切 minecraft → 06:34 切回 standard，
+   *    之后那个"标准模式"会话的工具面仍是 mc_* + read/write/edit/read_image/present）。
+   *    现在：切到非 MC 模式 → `release()` 摘掉白名单，并从 `mcPolicyApplied` 里删掉，
+   *    这样再切回 MC模式 还能重新套上。
+   *    （只有白名单是黏的：admin/文件越界那两道在 **guard** 里，每次调用现场判 `isMcModeAgent`，
+   *      切模式立刻自愈，不需要撤销。）
+   */
+  const mcRestrictRelease = new WeakMap()
+
+  /**
    * 已确认属于 MC 模式的会话 id（给前端 `/api/mc/mode` 兜底用）。
    * 主路径是现场问 `agentPresets`（见 handleMcApi 的 /api/mc/mode），
    * 这里只是"agent 已经不在了 / 拿不到 agentPresets"时的退路。
@@ -3158,22 +3174,52 @@ export function apply(ctx, config) {
       //    所以：**失败 → 从宿主的报错里读出"它认识的名字"，过滤一次再试**（只重试一次，之后才认输）。
       const applyAllow = (names) => {
         try {
-          t.restrict({ allow: names })
-          return names
+          return { allow: names, release: t.restrict({ allow: names }) }
         } catch (e) {
           const knownPart = /known global tools:\s*([\s\S]*)$/.exec(String(e?.message ?? ''))
           const known = new Set((knownPart?.[1] ?? '').split(',').map((s) => s.trim()).filter(Boolean))
           const usable = names.filter((n) => known.has(n))
           if (!known.size || !usable.length) throw e
-          t.restrict({ allow: usable })
+          const release = t.restrict({ allow: usable })
           logLine(`MC 模式：白名单里有宿主不认识的名字（${names.filter((n) => !known.has(n)).join(', ')}）→ 已按实际在场的工具过滤`)
-          return usable
+          return { allow: usable, release }
         }
       }
-      const allow = applyAllow(wanted)
+      const { allow, release } = applyAllow(wanted)
+      // 存下撤销手柄（切出 MC 模式时用；见 mcRestrictRelease 的说明）
+      mcRestrictRelease.set(agent, release)
       logLine(`MC 模式：工具白名单已生效（${agent.id}）：${allow.join(', ')}`)
     } catch (e) {
       logLine(`MC 模式工具白名单**没生效**（${String(e?.message).slice(0, 160)}）—— 管理工具与文件越界仍由 guard 兜底`)
+    }
+  }
+
+  /**
+   * 退出 MC 模式：**把工具白名单摘掉**（切回普通模式必须能再用 pwsh/bash）。
+   *
+   * 🔴 2026-09-17 新增（用户报的"标准模式会话无法执行命令"）：`applyMcModePolicy` 是"只套一次"
+   *    （`mcPolicyApplied`），而**没有任何地方撤销** —— 从 MC模式 切回 标准模式 的会话就永久
+   *    留在 MC 白名单里。这里与其对称：套用/撤销都由 `touch()` 按**现场判据**决定。
+   *
+   * 幂等：没套过就什么都不做（`mcRestrictRelease` 里没有手柄）。
+   * 撤销后 `mcPolicyApplied` 也删掉 → 再切回 MC模式 能重新套上。
+   * @param agent - 宿主 Agent 对象（WeakMap 键，不阻止回收）
+   */
+  const liftMcModePolicy = (agent) => {
+    if (!agent) return
+    // 这个会话已经不是 MC 模式了 → "因没选工作区被拒绝"的旧标记也一起清掉
+    if (agent.id) noWorkspaceRefused.delete(String(agent.id))
+    const release = mcRestrictRelease.get(agent)
+    if (release) {
+      mcRestrictRelease.delete(agent)
+      try { release() } catch (e) { logLine(`撤销 MC 模式工具白名单失败（guard 仍会兜底）：${e?.message ?? e}`) }
+    }
+    if (mcPolicyApplied.has(agent)) {
+      mcPolicyApplied.delete(agent)
+      if (agent.id) mcModeAgentIds.delete(String(agent.id))
+      logLine(`已退出 MC 模式（preset=${lastPresetSeen.get(agent) ?? '?'}，${agent.id ?? '?'}）：工具白名单已撤销`)
+    } else if (release) {
+      logLine(`已撤销 MC 模式工具白名单（${agent.id ?? '?'}）`)
     }
   }
 
@@ -3243,14 +3289,21 @@ export function apply(ctx, config) {
   //    preset 完全可能在 agent 建好之后才选上（在会话里点「MC模式」芯片），宿主为这种情况
   //    专门发 **`agent-preset/selected`**（`agent-presets/src/index.ts` 里 emit，两个位置参数：
   //    `(sessionId, presetId)`）。当时没挂它 → 策略与提示词都不会生效。
-  //    每个 agent 只做两件事：① 若是 MC 模式就投提示行（在 applyMcModePolicy 里）② 套权限。
+  //    每个 agent 只做两件事：① 若是 MC 模式就投提示行并套白名单（applyMcModePolicy）
+  //    ② **若不是 MC 模式就把白名单摘掉**（liftMcModePolicy，2026-09-17 补 —— 见 mcRestrictRelease）。
   ctx.effect(() => {
     const handlers = []
     const touch = (agent) => {
       if (!agent?.ctx) return
       // ⚠️ 这里**不再**建 `.whale-craft/` —— 建文件只发生在"首次发起 MC 模式会话"
       //    （applyMcModePolicy 里）和"点开 MC设置"（HTTP 接口里）这两个时机（用户 2026-09-16 定）。
-      try { applyMcModePolicy(agent) } catch (e) { logLine(`MC 模式策略失败：${e.message}`) }
+      try {
+        // 🔴 2026-09-17：**两个方向都要处理** —— 是 MC 模式就套用，**不是就撤销**。
+        //    以前只"套用"，于是 MC模式 → 标准模式 的会话会一直留着 MC 白名单（没有 pwsh），
+        //    表现就是"标准模式会话无法执行命令"（用户真机报的，见 mcRestrictRelease 的说明）。
+        if (isMcModeAgent(agent)) applyMcModePolicy(agent)
+        else liftMcModePolicy(agent)
+      } catch (e) { logLine(`MC 模式策略失败：${e.message}`) }
     }
     for (const ev of ['agent/created', 'agent/session-start']) {
       try { handlers.push(ctx.on(ev, ({ agent } = {}) => touch(agent))) } catch { /* 宿主没有这个事件就跳过 */ }
@@ -3258,7 +3311,9 @@ export function apply(ctx, config) {
     // 模式被选上/切换：两个位置参数，agent 要自己找回来
     try {
       handlers.push(ctx.on('agent-preset/selected', (sessionId, presetId) => {
+        // 🔴 两个方向都记：切到 MC模式 才进兜底名单，切走要**移出去**（否则前端入口判据会残留）
         if (pluginConfig.isMcModePreset(presetId)) mcModeAgentIds.add(String(sessionId))
+        else mcModeAgentIds.delete(String(sessionId))
         touch(safeAgentById(sessionId))
       }))
     } catch { /* 老宿主没有这个事件 */ }
