@@ -103,7 +103,7 @@ if (DRY) {
 
 /**
  * 🔴 2026-09-17 实测结论（很关键）：**git push 这条通道推不了工作流文件** ——
- *   即便 token 的 `x-oauth-scopes` 里明明有 `workflow`，走代理 `gh.yunr.cc` 推送仍被 GitHub
+ *   即便 token 的 `x-oauth-scopes` 里明明有 `workflow`，经过某个 GitHub 代理通道推送仍被 GitHub
  *   以 "without `workflow` scope" 拒（那一跳的凭据/转发方式有问题）。
  *   而 **Contents API 可以**（实测 PUT 成功）。所以优先走 API，git push 只当兜底。
  */

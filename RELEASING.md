@@ -28,6 +28,19 @@ GITHUB_TOKEN=<你带 workflow scope 的 token> node scripts/land-workflow-fix.mj
 
 脚本会校验 scope、复制、提交、推送，并回读确认远端已经**没有** `npm publish` 了。
 
+### 🔴 实测结论（2026-09-17）：工作流文件走 **Contents API**，别用 git push
+
+- 本机这个 token 的 scopes 里**明明有 workflow**，但经代理通道推送仍被 GitHub 以
+  "without workflow scope" 拒 —— 是**那条推送通道**的问题，不是 token 的问题。
+- **Contents API 可以**（实测 PUT contents/.github/workflows/release.yml 成功）。
+  所以 `scripts/land-workflow-fix.mjs` 现在**优先走 API**，git push 只当兜底：
+  ```bash
+  GITHUB_TOKEN=<带 workflow 的 token> node scripts/land-workflow-fix.mjs --dry
+  GITHUB_TOKEN=<带 workflow 的 token> node scripts/land-workflow-fix.mjs
+  ```
+- 不想折腾 token 也行：把 `scripts/release.workflow.yml` 的内容粘到网页上的
+  `.github/workflows/release.yml`（网页编辑不需要 workflow scope）。
+
 ---
 
 ## 1. 发 GitHub Release（CI 自动）
