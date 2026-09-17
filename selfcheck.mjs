@@ -234,6 +234,9 @@ console.log('\n--- 工具面（share 移除 / present 接入）---')
   console.log(`  ${/const workspaceIdOfCwd = \(cwd\)/.test(idx) && /workspaceCwdById/.test(idx) ? '✅' : '❌'} 🔴 地址用**工作区 uuid**（查宿主 workspaceRegistry，不再用目录名）`)
   console.log(`  ${!/serveExpressFile/.test(idx) && !/knownWorkspaces/.test(idx) ? '✅' : '❌'} 🔴 旧的"目录名 + 进程内见过的工作区集合"那套已删干净`)
   console.log(`  ${/realpathSync\(target\)/.test(idx) && /拒绝越界（符号链接）/.test(idx) ? '✅' : '❌'} 🔴 防穿透：段级校验 + realpath 复查（符号链接也跳不出去）`)
+  // 「随版本更新」（用户 2026-09-17）：在"备好记忆目录"那两个时机执行，版本变了才替换
+  console.log(`  ${/syncRulesVersion\(root, PLUGIN_VERSION, \{ follow: pluginConfig\.get\('rulesFollowVersion'\) !== false \}\)/.test(idx) ? '✅' : '❌'} 🔴 「随版本更新」挂在"备好记忆目录"时机上（follow 来自配置，默认开）`)
+  console.log(`  ${/行事准则已替换为新版本默认内容/.test(idx) ? '✅' : '❌'} 真替换时会写一行日志（便于排查"我的准则怎么变了"）`)
   console.log(`  ${!/read_image \{file_path/.test(codeOnly) && !/present \{files/.test(codeOnly) ? '✅' : '❌'} 🔴 旧的"用 read_image / present 发图"提示已清干净（注释里的历史说明不算）`)
   const vp = readFileSync(new URL('./src/version-prompt.mjs', import.meta.url), 'utf8')
   console.log(`  ${/\.whale-craft\/\.express\//.test(vp) && /mc_kit_express/.test(vp) && /!\[图片名\]\(url\)/.test(vp) && /\[文件名\]\(url\)/.test(vp) ? '✅' : '❌'} 版本提示里写清交付流程（先放发布区 → mc_kit_express 拿路径 → 自己拼 ![]/[]）`)
@@ -514,6 +517,11 @@ console.log('\n--- 强制停止：UI 路径的真实顺序（停LLM → 退游�
   await callApi('PATCH', '/api/mc/config', { allowAllCommands: false })
   const md0 = await callApi('GET', '/api/mc/agents-md')
   console.log(`  ${md0.ok && /行事准则/.test(String(md0.text)) ? '✅' : '❌'} 提示词接口能读准则（source=${md0.source}）`)
+  console.log(`  ${md0.followVersion === true && typeof md0.pluginVersion === 'string' ? '✅' : '❌'} 提示词接口带「随版本更新」开关与插件版本（follow=${md0.followVersion} v${md0.pluginVersion}）`)
+  const cfgFollow = await callApi('PATCH', '/api/mc/config', { rulesFollowVersion: false })
+  const md3 = await callApi('GET', '/api/mc/agents-md')
+  console.log(`  ${cfgFollow.ok && cfgFollow.rulesFollowVersion === false && md3.followVersion === false ? '✅' : '❌'} PATCH 能关掉「随版本更新」（配置里记着，页面也读得到）`)
+  await callApi('PATCH', '/api/mc/config', { rulesFollowVersion: true })
   const mdPut = await callApi('PUT', '/api/mc/agents-md', { text: '# 自检临时准则' })
   const md1 = await callApi('GET', '/api/mc/agents-md')
   console.log(`  ${mdPut.ok && md1.source === 'custom' && /自检临时准则/.test(md1.text) ? '✅' : '❌'} PUT 保存自定义准则后立刻生效`)
@@ -1825,6 +1833,53 @@ console.log('\n--- 行事准则 RULES.md / 新开关 / 边界信息 ---')
     console.log(`  ${!/\.whale-craft\/AGENTS\.md/.test(def) && /\.whale-craft\/RULES\.md/.test(def) ? '✅' : '❌'} 默认行事准则正文里自指的文件名也是 RULES.md（否则等于教它去读一个不存在的文件）`)
   }
 
+  /* ── 「随版本更新」（用户 2026-09-17）────────────────────────────────────────
+   * 插件版本一变 → 用新版本默认准则替换 `.whale-craft/RULES.md`；靠 `.rules-version` 标记判断。
+   * 默认**开**；第一次遇到这个功能（没标记）只记版本不覆盖；关着时也只记版本（以后打开不翻旧账）。 */
+  {
+    const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const { syncRulesVersion, readRulesVersion, rulesVersionPath, agentsMdPath, DEFAULT_AGENTS_MD } = await import('./src/agentsmd.mjs')
+    const mk = () => mkdtempSync(join(tmpdir(), 'whale-rules-ver-'))
+    const rd = (d) => { try { return readFileSync(agentsMdPath(d), 'utf8') } catch { return '' } }
+
+    // ① 没文件 → 建默认 + 记版本
+    const a = mk()
+    const r1 = syncRulesVersion(a, '1.2.3')
+    console.log(`  ${r1.action === 'created' && rd(a).trim() === DEFAULT_AGENTS_MD.trim() && readRulesVersion(a) === '1.2.3' ? '✅' : '❌'} 没文件 → 写默认 + 记版本（${r1.action}）`)
+    console.log(`  ${rulesVersionPath(a).endsWith('.rules-version') ? '✅' : '❌'} 标记文件是点开头的 .rules-version（不进记忆索引）`)
+
+    // ② 版本没变 → 什么都不做
+    const r2 = syncRulesVersion(a, '1.2.3')
+    console.log(`  ${r2.action === 'kept' && readRulesVersion(a) === '1.2.3' ? '✅' : '❌'} 版本没变 → kept（不做任何写操作）`)
+
+    // ③ 版本变了 + 开关开（默认）→ **替换**成新默认（用户改过的也换）
+    const b = mk()
+    writeFileSync(agentsMdPath(b), '# 我自己改过的准则\n', 'utf8')
+    writeFileSync(rulesVersionPath(b), '0.1.0\n', 'utf8')
+    const r3 = syncRulesVersion(b, '0.1.1')
+    console.log(`  ${r3.action === 'replaced' && r3.from === '0.1.0' && r3.to === '0.1.1' && rd(b).trim() === DEFAULT_AGENTS_MD.trim() ? '✅' : '❌'} 🔴 版本变了 + 开关开 → 用新默认**替换**（from=${r3.from} → ${r3.to}）`)
+    console.log(`  ${readRulesVersion(b) === '0.1.1' ? '✅' : '❌'} 替换后标记更新到新版本`)
+
+    // ④ 版本变了但开关关 → 只记版本，内容原样
+    const c = mk()
+    writeFileSync(agentsMdPath(c), '# 我自己改过的准则\n', 'utf8')
+    writeFileSync(rulesVersionPath(c), '0.1.0\n', 'utf8')
+    const r4 = syncRulesVersion(c, '0.1.1', { follow: false })
+    console.log(`  ${r4.action === 'kept' && rd(c).includes('我自己改过的') && readRulesVersion(c) === '0.1.1' ? '✅' : '❌'} 开关关 → 保留用户内容，只把标记推到当前版本（以后打开**不翻旧账**）`)
+    const r5 = syncRulesVersion(c, '0.1.1', { follow: true })
+    console.log(`  ${r5.action === 'kept' && rd(c).includes('我自己改过的') ? '✅' : '❌'} 紧接着打开开关：同一版本内**不会**再覆盖`)
+
+    // ⑤ 第一次遇到这个功能（有文件、没标记）→ 只记版本，**不覆盖**
+    const d = mk()
+    writeFileSync(agentsMdPath(d), '# 老工作区里的自定义准则\n', 'utf8')
+    const r6 = syncRulesVersion(d, '0.1.1')
+    console.log(`  ${r6.action === 'marked' && r6.from === null && rd(d).includes('老工作区里的自定义准则') && readRulesVersion(d) === '0.1.1' ? '✅' : '❌'} 🔴 第一次遇到（没标记）→ 只记版本、**不覆盖**（免得插件一升级就冲掉人家改的准则）`)
+    const r7 = syncRulesVersion(d, '0.2.0')
+    console.log(`  ${r7.action === 'replaced' && rd(d).trim() === DEFAULT_AGENTS_MD.trim() ? '✅' : '❌'} 之后再更新版本 → 正常替换`)
+  }
+
   // 开关：允许所有指令
   await tools.get('mc_admin_config').execute({ action: 'set', path: 'allowAllCommands', value: true }, A)
   const anyCmd = await tools.get('mc_command').execute({ command: '/definitely-not-whitelisted' }, A).catch((e) => e.message)
@@ -1837,6 +1892,10 @@ console.log('\n--- 行事准则 RULES.md / 新开关 / 边界信息 ---')
   const wsDefault = await tools.get('mc_admin_config').execute({ action: 'get', path: 'injectWorkspaceAgentsMd' }, A)
   const wcDefault = await tools.get('mc_admin_config').execute({ action: 'get', path: 'injectWhaleCraftAgentsMd' }, A)
   console.log(`  ${wsDefault.value === false && wcDefault.value === true ? '✅' : '❌'} 注入默认：whale-craft 开、工作区关`)
+  const followDefault = await tools.get('mc_admin_config').execute({ action: 'get', path: 'rulesFollowVersion' }, A)
+  console.log(`  ${followDefault.value === true ? '✅' : '❌'} 🔴 「随版本更新」默认**开**（rulesFollowVersion=true）`)
+  const badFollow = await tools.get('mc_admin_config').execute({ action: 'set', path: 'rulesFollowVersion', value: 'yes' }, A).catch((e) => e.message)
+  console.log(`  ${/必须是 true\/false/.test(String(badFollow)) ? '✅' : '❌'} 开关类型校验（rulesFollowVersion）`)
 
   /* 「文件分享」模式：管理员工具能设 / 非法值被拒 / 砍掉的 local 被拒 / base 必须是 http(s) */
   const setShare = (value, path = 'expressMode') =>
@@ -2512,6 +2571,11 @@ console.log('\n--- 客户端 bundle（client.js 静态检查）---')
     ['不可撤销那句用 <strong>（HTML 不认 markdown 的 **）', /React\.createElement\('strong', \{\}, '全部删掉'\)/.test(code)],
     ['UI 里没有 markdown 式 `**`（渲染出来是字面星号）', !/'[^'\n]*\*\*[^'\n]*'/.test(code)],
     ['清除走 DELETE /api/mc/express', /apiDelete\(withSid\('\/api\/mc\/express'\)\)/.test(code)],
+    // 「随版本更新」（提示词页）：开关 + 版本提示行 + 一拨就存 + 失败回滚
+    ['「提示词」页有「随版本更新」开关', /label: '随版本更新'/.test(code) && /onToggle: \(next\) => onFollowVersion\(next\)/.test(code)],
+    ['开关说明写清"会覆盖你的修改"', /用新版本的默认提示词替换当前内容（会覆盖你的修改）/.test(code)],
+    ['页面显示"当前内容对应哪个版本"', /当前内容对应：\$\{rulesVersion \? `v\$\{rulesVersion\}` : '未知（还没同步过）'\}/.test(code)],
+    ['开关一拨就存（乐观更新 + 失败回滚）', /run\('cfg:follow', \(\) => apiPatch\(withSid\('\/api\/mc\/config'\), \{ rulesFollowVersion: next === true \}\)/.test(code) && /if \(!ok\) setFollowVersion\(prev\)/.test(code)],
     ['页面上能看见发布区目录与大小', /data-wc-hint/.test(code) && /share\.files\} 个文件/.test(code) && /fmtBytes/.test(code)],
     // 地址只能走 connectionView()（host/port/subserver）；`_connectionProfile` 还带账号名，别发到浏览器
     ['后端只把 connectionView() 发给前端（不发含账号的 _connectionProfile）', !/connection: (sess|this)\.bot\._connectionProfile/.test(readFileSync(new URL('./index.js', import.meta.url), 'utf8'))],

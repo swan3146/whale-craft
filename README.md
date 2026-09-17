@@ -103,6 +103,7 @@ dsh plugin --profile web add link:/path/to/whale-craft
 | `mcMode.hideAdminTools` | 是否把 `mc_admin_*` 也放进白名单（默认隐藏，另有 guard 硬拒） | `true` |
 | `injectWhaleCraftAgentsMd` | 是否把 `.whale-craft/RULES.md`（行事准则）注入 MC 模式会话 | `true` |
 | `injectWorkspaceAgentsMd` | 是否**额外**注入工作区根上的 `AGENTS.md` | `false` |
+| `rulesFollowVersion` | 「提示词」页的「随版本更新」：插件版本一变，就用新版本默认准则**替换** `.whale-craft/RULES.md` | `true` |
 | `expressMode` | 文件分享：「文件分享」页选的模式：`off` 关闭 / `online` 在线 | `"off"` |
 | `expressBase` | 在线模式的 base（你访问这台 DSH 的地址，可带路径前缀） | `""` |
 | `memoryDir` | 记忆根目录（`null` = 用会话工作区的 `.whale-craft/`） | `null` |
@@ -187,6 +188,9 @@ dsh plugin --profile web add link:/path/to/whale-craft
   （`AGENTS.md.bak-<时间>`）。
 - 行事准则**只有你能改**：AI 不能读写它（工具与记忆工具两条路都挡），要改就在「MC设置 → 提示词」里编辑，
   那里也能一键**恢复默认**。
+- **「随版本更新」（默认开）**：插件升级后，用新版本的默认准则**替换**当前内容（**会覆盖你的修改**）；
+  判定靠记忆目录里的 `.rules-version` 标记。想长期维持自己那份就把它**关掉** —— 关掉后插件永不动它，
+  且关着期间不会"攒着"：以后再打开也不会突然覆盖。
 
 ---
 
@@ -266,7 +270,7 @@ dsh plugin --profile web add link:/path/to/whale-craft
 
 ```bash
 node tools/check-core.mjs     # 全树语法 + 动态 import + 私有字段一致性（改 core.mjs 必跑）
-node selfcheck.mjs            # 563 条离线断言（假 ctx，不需要 MC 服务器、不连网）
+node selfcheck.mjs            # 594 条离线断言（假 ctx，不需要 MC 服务器、不连网）
 # 起一个隔离 DSH 实例验证"整树加载"（需要一份 DSH checkout）：
 DSH_ROOT=/path/to/deepseek-harness node tools/isolate.mjs start
 ```
@@ -336,7 +340,7 @@ read the world and keep notes — and wake itself up when something worth notici
   The HTTP route that serves those files exists **only** in online mode.
 - **Passwords never reach the model** — credentials live in the host credential store; accounts are
   managed from the in-app **MC Settings** dialog.
-- **Offline regression suite** — 563 assertions, no Minecraft server required.
+- **Offline regression suite** — 594 assertions, no Minecraft server required.
 
 ### Install
 
@@ -379,7 +383,7 @@ HTTP responses, or the model context.
 ### Verify offline
 
 ```bash
-node tools/check-core.mjs && node selfcheck.mjs   # 563 assertions, no MC server needed
+node tools/check-core.mjs && node selfcheck.mjs   # 594 assertions, no MC server needed
 ```
 
 CI runs exactly this on Linux (Node 22 and 24) and Windows (Node 22), and packs the tarball on every push.

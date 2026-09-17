@@ -38,6 +38,7 @@
     "tools",
     "extensions",
     "README.md",
+    "CHANGELOG.md",
     "THIRD_PARTY_NOTICES.md"
   ],
   "dependencies": {

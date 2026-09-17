@@ -90,6 +90,16 @@ export const DEFAULT_CONFIG = {
    */
   injectWorkspaceAgentsMd: false,
   /**
+   * 「提示词」页的「随版本更新」（用户 2026-09-17 定，**默认开**）：
+   * 插件版本一变，就用**新版本的默认行事准则**替换 `<工作区>/.whale-craft/RULES.md`
+   * （用户改过的也会被换掉 —— 这就是这个开关的语义）。
+   *
+   * 判定靠记忆目录里的 `.rules-version` 标记（记"当前内容对应哪个插件版本"）：
+   *   · 第一次遇到这个功能（没有标记）→ 只记版本、**不覆盖**（免得插件一升级就冲掉用户改的准则）；
+   *   · 关掉时只把标记更新到当前版本 ⇒ 以后打开也**不翻旧账**。
+   */
+  rulesFollowVersion: true,
+  /**
    * 启动时若 `mcModePresets` 里**一个都不存在**，就自动建一个「MC模式」preset。
    *
    * 2026-09-16 用户定的：插件**不塞** preset 目录，但"没有 preset 就没有 MC 模式"这件事必须自己解决
@@ -470,7 +480,7 @@ function validate (top, rest, value) {
     if (value !== null && typeof value !== 'string') throw new Error('memoryDir 必须是字符串（绝对路径）或 null')
     return
   }
-  if (top === 'allowAllCommands' || top === 'injectWhaleCraftAgentsMd' || top === 'injectWorkspaceAgentsMd' || top === 'ensureMcPreset') {
+  if (top === 'allowAllCommands' || top === 'injectWhaleCraftAgentsMd' || top === 'injectWorkspaceAgentsMd' || top === 'ensureMcPreset' || top === 'rulesFollowVersion') {
     if (typeof value !== 'boolean') throw new Error(`${top} 必须是 true/false`)
     return
   }

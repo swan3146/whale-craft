@@ -33,7 +33,7 @@ import { Watchdog, WATCH_DEFAULTS } from './src/watchdog.mjs'
 import { MemoryStore } from './src/memory.mjs'
 import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction, patchPersonaInComposition, disableShellInComposition, patchToolGroupsIntoComposition, MC_PRESET_TOOL_GROUPS } from './src/config.mjs'
 import { AccountStore, parseAuthlibCard, normalizeServerUrl, dashUuid } from './src/accounts.mjs'
-import { DEFAULT_AGENTS_MD, agentsMdPath, legacyAgentsMdPath, migrateLegacyAgentsMd, readAgentsMd, writeAgentsMd, resetAgentsMd, isAgentsMdPath } from './src/agentsmd.mjs'
+import { DEFAULT_AGENTS_MD, agentsMdPath, legacyAgentsMdPath, migrateLegacyAgentsMd, readAgentsMd, writeAgentsMd, resetAgentsMd, isAgentsMdPath, syncRulesVersion, readRulesVersion } from './src/agentsmd.mjs'
 import { encodePng } from './src/png.mjs'
 import { ImageEngine, imageEngineAvailable, imageEngineError } from './src/image.mjs'
 import {
@@ -812,6 +812,8 @@ export function apply(ctx, config) {
     allowAllCommands: pluginConfig.get('allowAllCommands'),
     injectWhaleCraftAgentsMd: pluginConfig.get('injectWhaleCraftAgentsMd'),
     injectWorkspaceAgentsMd: pluginConfig.get('injectWorkspaceAgentsMd'),
+    // 「提示词」页的「随版本更新」（默认开）
+    rulesFollowVersion: pluginConfig.get('rulesFollowVersion') !== false,
     // 「MC设置 → 文件分享」：模式 + 在线 base（两种模式：off 关闭 / online 在线）
     expressMode: pluginConfig.expressMode,
     expressBase: pluginConfig.expressBase,
@@ -961,7 +963,7 @@ export function apply(ctx, config) {
     if (path === '/api/mc/config' && req.method === 'PATCH') {
       const gate = await gateOf(body)
       if (!gate.ok) return sendJson(res, 400, { ok: false, error: gate.error })
-      for (const k of ['commandWhitelist', 'allowAllCommands', 'injectWhaleCraftAgentsMd', 'injectWorkspaceAgentsMd', 'expressMode', 'expressBase']) {
+      for (const k of ['commandWhitelist', 'allowAllCommands', 'injectWhaleCraftAgentsMd', 'injectWorkspaceAgentsMd', 'rulesFollowVersion', 'expressMode', 'expressBase']) {
         if (body[k] !== undefined) pluginConfig.set(k, body[k])
       }
       return ok(configView())
@@ -1007,6 +1009,10 @@ export function apply(ctx, config) {
           path: cur.path,
           isDefault: cur.source === 'default',
           defaultText: DEFAULT_AGENTS_MD,
+          // 「随版本更新」：开关（配置里那份）+ 当前内容对应的版本（`.rules-version` 标记）
+          followVersion: pluginConfig.get('rulesFollowVersion') !== false,
+          rulesVersion: readRulesVersion(promptDir),
+          pluginVersion: PLUGIN_VERSION,
           workspacePath: wsPath,
           workspaceExists: existsSync(wsPath),
           // 「提示词」页要能直接告诉用户"这几段到底会不会进模型"（省得靠猜）
@@ -2671,6 +2677,12 @@ export function apply(ctx, config) {
       }
       try { if (memoryFor(cwd).ensureReadme()) logLine(`已写入默认记忆索引：${join(root, 'README.md')}`) } catch (e) { logLine(`写默认索引失败：${e.message}`) }
       if (ensureAgentsMdFile(root)) logLine(`已写入默认行事准则：${agentsMdPath(root)}`)
+      /* 「随版本更新」（默认开）：插件版本变了就用新版本默认准则替换文件里那份。
+       * 首次遇到这个功能（没有 `.rules-version` 标记）只记版本、不覆盖；关着时也只记版本。 */
+      const sync = syncRulesVersion(root, PLUGIN_VERSION, { follow: pluginConfig.get('rulesFollowVersion') !== false })
+      if (sync.action === 'replaced') logLine(`插件已更新到 v${sync.to}：「随版本更新」开启 → 行事准则已替换为新版本默认内容（原为 v${sync.from}）`)
+      else if (sync.action === 'created') logLine(`已写入默认行事准则：${agentsMdPath(root)}（v${sync.to}）`)
+      else if (sync.error) logLine(`行事准则版本同步失败（不影响使用）：${sync.error}`)
       return true
     } catch (e) { logLine(`初始化记忆目录失败（${root}）：${e.message}`); return false }
   }

@@ -1121,11 +1121,13 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const {
         mdText, wsExists, injectStatus,
         injectWc, injectWs, busyKey, onMdText, onSave, onReset, onInjectWc, onInjectWs,
+        followVersion, rulesVersion, pluginVersion, onFollowVersion,
       } = props
       const busy = busyKey !== null
       const [confirmReset, setConfirmReset] = React.useState(false)
       const saveBusy = busyKey === 'md:save'
       const resetBusy = busyKey === 'md:reset'
+      const followBusy = busyKey === 'cfg:follow'
       const seg = injectStatus?.segments ?? {}
       const mark = (on) => (on ? '✓' : '✗')
 
@@ -1184,6 +1186,17 @@ select[data-wc-in]{appearance:none;padding-right:22px;
                 `本版本内置提示（随插件版本更新，不可编辑）：whale_craft v${injectStatus.versionPrompt.version}`),
               React.createElement('pre', {}, String(injectStatus.versionPrompt.text ?? '')))
             : null,
+          // 「随版本更新」（默认开）：插件升级时用新版本默认准则替换当前这份（会覆盖你的修改）
+          React.createElement(Switch, {
+            label: '随版本更新',
+            desc: followBusy ? '保存中…' : '插件升级时，用新版本的默认提示词替换当前内容（会覆盖你的修改）',
+            disabled: busy,
+            on: followVersion === true,
+            onToggle: (next) => onFollowVersion(next),
+          }),
+          React.createElement('p', { 'data-wc-hint': '' },
+            `当前内容对应：${rulesVersion ? `v${rulesVersion}` : '未知（还没同步过）'}`,
+            `　·　本插件：v${pluginVersion || '?'}`),
           React.createElement(Switch, {
             label: '注入本提示词',
             on: injectWc === true,
@@ -1350,6 +1363,10 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const [mdPath, setMdPath] = React.useState('')
       const [injectWc, setInjectWc] = React.useState(true)
       const [injectWs, setInjectWs] = React.useState(false)
+      // 「提示词 → 随版本更新」（默认开）：开关存在全局配置里；marker 是记忆目录里的 .rules-version
+      const [followVersion, setFollowVersion] = React.useState(true)
+      const [rulesVersion, setRulesVersion] = React.useState(null)
+      const [pluginVersion, setPluginVersion] = React.useState('')
       // 「文件分享」：模式（off 关闭 / online 在线）+ base + 发布区现状
       const [shareMode, setShareMode] = React.useState('off')
       const [shareBase, setShareBase] = React.useState('')
@@ -1404,6 +1421,9 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             setWsPath(String(m.workspacePath ?? ''))
             setWsExists(m.workspaceExists === true)
             setInjectStatus(m.injection ?? null)
+            setFollowVersion(m.followVersion !== false)
+            setRulesVersion(m.rulesVersion ?? null)
+            setPluginVersion(String(m.pluginVersion ?? ''))
           }).catch((e) => { setError(errorText(e)) }),
         ])
           .then(() => { setLoaded(true) })
@@ -1510,6 +1530,15 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         run('cfg:ws', () => apiPatch(withSid('/api/mc/config'), { injectWorkspaceAgentsMd: next === true }),
           next ? '已开启工作区 AGENTS.md 注入' : '已关闭工作区 AGENTS.md 注入'), [run])
 
+      /** 「随版本更新」：一拨就存；**打开时不会立刻覆盖**（只在插件版本变化时才替换） */
+      const toggleFollowVersion = React.useCallback((next) => {
+        const prev = followVersion
+        setFollowVersion(next === true)
+        return run('cfg:follow', () => apiPatch(withSid('/api/mc/config'), { rulesFollowVersion: next === true }),
+          next ? '已开启：插件升级时用新版本默认提示词替换' : '已关闭：保留你自己改的内容')
+          .then((ok) => { if (!ok) setFollowVersion(prev); return ok })
+      }, [run, followVersion])
+
       /* ── 页 4：文件分享 ──
        * 模式**一点就存**（同"允许所有指令"那个开关：错了回滚）；base 走「保存」按钮；
        * 「获取当前」= 用**你现在访问这个页面的地址**填好并保存；
@@ -1569,8 +1598,9 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           ? React.createElement(PromptPane, {
             key: 'prompt:' + mdSource + ':' + wsExists,
             mdText, mdSource, mdPath, wsPath, wsExists, injectStatus, injectWc, injectWs, busyKey,
+            followVersion, rulesVersion, pluginVersion,
             onMdText: setMdText, onSave: saveAgentsMd, onReset: resetAgentsMd,
-            onInjectWc: toggleInjectWc, onInjectWs: toggleInjectWs,
+            onInjectWc: toggleInjectWc, onInjectWs: toggleInjectWs, onFollowVersion: toggleFollowVersion,
           })
           : (tab === 'share'
             ? React.createElement(SharePane, {

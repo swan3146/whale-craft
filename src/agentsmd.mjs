@@ -1,4 +1,4 @@
-﻿// -*- coding: utf-8 -*-
+// -*- coding: utf-8 -*-
 /**
  * whale_craft / agentsmd.mjs —— 本模式的「行事准则」RULES.md
  * ============================================================================
@@ -103,6 +103,79 @@ export function agentsMdPath (dir) { return join(dir, FILE) }
 
 /** 老名字的路径（`AGENTS.md`）：只用于迁移与守卫，不再作为存储位置 */
 export function legacyAgentsMdPath (dir) { return join(dir, LEGACY_FILE) }
+
+/**
+ * 「随版本更新」的**版本标记**文件（点开头：与 AI 的内容分开，也不进记忆索引）。
+ *
+ * 它只记一件事：**当前这份 `RULES.md` 对应哪个插件版本**。
+ * 插件在"备好记忆目录"那两个时机（首次进 MC 模式会话 / 点开「MC设置」）读它，决定要不要替换。
+ */
+const VERSION_FILE = '.rules-version'
+
+/** 版本标记文件路径 */
+export function rulesVersionPath (dir) { return join(dir, VERSION_FILE) }
+
+/** 读版本标记（没有/读不到 = null） */
+export function readRulesVersion (dir) {
+  try {
+    const v = readFileSync(rulesVersionPath(dir), 'utf8').trim()
+    return v || null
+  } catch { return null }
+}
+
+/** 写版本标记（失败只当没记上，不影响使用） */
+function writeRulesVersion (dir, version) {
+  try {
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+    writeFileSync(rulesVersionPath(dir), `${String(version ?? '').trim() || 'unknown'}\n`, 'utf8')
+    return true
+  } catch { return false }
+}
+
+/**
+ * 「随版本更新」（用户 2026-09-17 定，**默认启用**）：插件版本一变，就用**本版本的默认准则**
+ * 替换 `.whale-craft/RULES.md` 里那份（用户自己改过的也换掉 —— 这正是这个开关要的语义）。
+ *
+ * 四种情形：
+ *   · `RULES.md` 不存在 → 建默认 + 记版本（`created`）；
+ *   · 有文件、**没有标记**（老工作区第一次遇到这个功能）→ **只记版本，不动内容**（`marked`）——
+ *     "更新版本时才替换"，第一次遇到不算更新，免得插件一升级就把人家改的准则冲掉；
+ *   · 标记 ≠ 当前版本 且开关**开** → 覆盖成默认 + 记版本（`replaced`）；
+ *   · 标记 ≠ 当前版本 但开关**关** → 只把标记更新到当前版本（`kept`）——
+ *     这样以后再把开关打开也**不会翻旧账**。
+ *   · 标记 = 当前版本 → 什么都不做（`kept`）。
+ * @param {string} dir 记忆根（`<工作区>/.whale-craft`）
+ * @param {string} version 当前插件版本
+ * @param {{follow?:boolean}} [opts] `follow` = 「随版本更新」开关（缺省视为开）
+ * @returns {{action:'created'|'replaced'|'kept'|'marked', from:string|null, to:string, error?:string}}
+ */
+export function syncRulesVersion (dir, version, { follow = true } = {}) {
+  const to = String(version ?? '').trim() || 'unknown'
+  const p = agentsMdPath(dir)
+  if (!existsSync(p)) {
+    try {
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+      writeFileSync(p, DEFAULT_AGENTS_MD, 'utf8')
+      writeRulesVersion(dir, to)
+      return { action: 'created', from: null, to }
+    } catch (e) {
+      return { action: 'kept', from: null, to, error: e.message }
+    }
+  }
+  const from = readRulesVersion(dir)
+  if (from === to) return { action: 'kept', from, to }
+  if (from === null || follow !== true) {           // 第一次遇到 / 开关关着：只记版本，不动内容
+    writeRulesVersion(dir, to)
+    return { action: from === null ? 'marked' : 'kept', from, to }
+  }
+  try {
+    writeFileSync(p, DEFAULT_AGENTS_MD, 'utf8')
+    writeRulesVersion(dir, to)
+    return { action: 'replaced', from, to }
+  } catch (e) {
+    return { action: 'kept', from, to, error: e.message }
+  }
+}
 
 /**
  * 把老的 `.whale-craft/AGENTS.md` 迁到新名字（**幂等**，只在需要时动）。
