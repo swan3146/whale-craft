@@ -31,7 +31,7 @@ import { versionPromptText, versionPromptTitle, versionPromptSource } from './sr
 import { EXPRESS_DIR, OUT_DIR, expressRootOf, outRootOf, parseExpressPath, safeExpressTarget, mimeOf, SANDBOX_TYPES, expressRefFor, EXPRESS_OFF_TEXT, EXPRESS_NEED_BASE_TEXT, normalizeExpressBase, onlineUrlOf } from './src/express.mjs'
 import { Watchdog, WATCH_DEFAULTS } from './src/watchdog.mjs'
 import { MemoryStore } from './src/memory.mjs'
-import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction, patchPersonaInComposition, disableShellInComposition, patchToolGroupsIntoComposition, MC_PRESET_TOOL_GROUPS } from './src/config.mjs'
+import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction, patchPersonaInComposition, personaTextKeyOf, disableShellInComposition, patchToolGroupsIntoComposition, MC_PRESET_TOOL_GROUPS } from './src/config.mjs'
 import { AccountStore, parseAuthlibCard, normalizeServerUrl, dashUuid } from './src/accounts.mjs'
 import { DEFAULT_AGENTS_MD, agentsMdPath, legacyAgentsMdPath, migrateLegacyAgentsMd, readAgentsMd, writeAgentsMd, resetAgentsMd, isAgentsMdPath, syncRulesVersion, readRulesVersion } from './src/agentsmd.mjs'
 import { encodePng } from './src/png.mjs'
@@ -2752,22 +2752,36 @@ export function apply(ctx, config) {
     return s.startsWith('~') ? join(homedir(), s.slice(1).replace(/^[/\\]+/, '')) : s
   }
 
+  /** 只有**我们建的**那份才修：persona 键名对不对（以"本版本源 preset"为标尺） */
+  const repairPersonaKeyIfNeeded = (svc, id, { composition, sourceKey, mine, stillComplete }) => {
+    const mineKey = personaTextKeyOf(composition)
+    if (!mine || composition === null) return false
+    if (!((sourceKey && mineKey !== sourceKey) || stillComplete)) return false
+    const fixed = patchMcPresetComposition(svc, id, { key: sourceKey ?? null })
+    logLine(fixed
+      ? `MC 模式 preset「${id}」persona 键名与本版本不符（${mineKey ?? '认不出'} → ${sourceKey ?? '跟随文件'}${stillComplete ? '，且 complete 还是 true' : ''}）→ 已自动修正`
+      : `MC 模式 preset「${id}」persona 键名需要修正，但这次没改成（下次启动再试；必要时手动编辑 agent.cordis.yml）`)
+    return fixed
+  }
+
   /**
    * 复制完官方 preset 之后，把**我们自己的几处**覆盖上去：
    *   ① persona（官方那句 "You are a helpful software engineer assistant." + `complete: true` 都不要）
    *   ② 关掉那个持久 shell（MC 模式的指导写着"本模式没有 shell"，两边必须一致）
    *   ③ 补齐 MC 模式需要的工具组（tool-fs / tool-jobs / present）—— 官方 `minimal` 里一个都没有
+   * @param {string} id 目标 preset
+   * @param {{key?: 'prefix'|'text'|null}} [opts] `key` = **本版本源 preset 用的那个键**（新版 prefix / 老版 text）
    * @returns {boolean} 是否改动过（false = 结构不认识 / 无需改动，日志里说明）
    */
-  const patchMcPresetComposition = (svc, id) => {
+  const patchMcPresetComposition = (svc, id, opts = {}) => {
     try {
       const dir = mcPresetDir(svc, id)
       if (!dir) return false
       const p = join(dir, 'agent.cordis.yml')
       if (!existsSync(p)) return false
       const cur = readFileSync(p, 'utf8')
-      const withPersona = patchPersonaInComposition(cur, MC_PERSONA_TEXT)
-      if (withPersona === null) { logLine('MC 模式 preset：composition 里没找到 persona 行 → 保持原样（人设还是官方那句）'); return false }
+      const withPersona = patchPersonaInComposition(cur, MC_PERSONA_TEXT, opts)
+      if (withPersona === null) { logLine('MC 模式 preset：composition 里没找到可用的 persona 段 → 保持原样（人设还是官方那句）'); return false }
       let finalText = disableShellInComposition(withPersona) ?? withPersona
       finalText = patchToolGroupsIntoComposition(finalText, availableToolGroups()) ?? finalText
       if (finalText === cur) return false
@@ -2949,6 +2963,18 @@ export function apply(ctx, config) {
           // 只有一件例外：**补 present 组**（显式文件交付）—— 删掉 mc_kit_share 之后，这是
           // "让本地用户看到产出文件"的唯一正路；只做"没有才加"，不动别的行。
           ensureToolGroupsInPreset(svc, existingId)
+          /* 🔴 启动自检之二（用户 2026-09-17）：**persona 的键名必须跟本版本的源 preset 一致** ——
+           * 新版 DSH 要 `prefix`、老版要 `text`（我们曾写死 prefix，把老环境的 preset 建坏了：
+           * 加载即 `$text missing required value`，MC 模式直接切不进去）。 */
+          try {
+            const sourceKey = personaTextKeyOf(compositionOf(rows.get(String(marker?.source ?? source ?? ''))))
+            repairPersonaKeyIfNeeded(svc, existingId, {
+              composition,
+              sourceKey,
+              mine: marker !== null || isCopiedPresetDescription(row?.description, shippedDescs),
+              stillComplete: /^\s{2,}complete\s*:\s*true\s*$/m.test(String(composition ?? '')),
+            })
+          } catch (e) { logLine(`persona 键名自检失败（不影响启动）：${e?.message ?? e}`) }
           return
         }
         if (plan.action === 'meta') {
@@ -2962,7 +2988,7 @@ export function apply(ctx, config) {
             //    会把我们注入的 context 段整个压掉）。用户改过人设的 preset 不会被碰。
             const stillShippedPersona = /You are a helpful software engineer assistant\./.test(composition)
               && /complete:\s*true/.test(composition)
-            if (stillShippedPersona) fixedComp = patchMcPresetComposition(svc, existingId)
+            if (stillShippedPersona) fixedComp = patchMcPresetComposition(svc, existingId, { key: personaTextKeyOf(compositionOf(rows.get(source))) })
           }
           logLine(`MC 模式 preset「${existingId}」${plan.reason} → 已修好显示名/简介`
             + `${fixedComp ? '，并把 persona 换成 MC 的、关掉了 shell' : ''}`
@@ -2975,6 +3001,15 @@ export function apply(ctx, config) {
             })
           }
           ensureToolGroupsInPreset(svc, existingId)
+          // 同一件事也在这条路上做一遍：显示名/简介要修的那份，persona 键名可能也是坏的
+          try {
+            repairPersonaKeyIfNeeded(svc, existingId, {
+              composition,
+              sourceKey: personaTextKeyOf(compositionOf(rows.get(String(marker?.source ?? source ?? '')))),
+              mine: marker !== null || isCopiedPresetDescription(row?.description, shippedDescs),
+              stillComplete: /^\s{2,}complete\s*:\s*true\s*$/m.test(String(composition ?? '')),
+            })
+          } catch (e) { logLine(`persona 键名自检失败（不影响启动）：${e?.message ?? e}`) }
           return
         }
         // plan.action === 'rebuild'：先备份整个目录，再用官方接口重新复制一遍
@@ -2985,7 +3020,7 @@ export function apply(ctx, config) {
             renameSync(dir, backup)
           }
           await svc.copy(String(marker?.source ?? source), existingId, MC_PRESET_NAME)
-          patchMcPresetComposition(svc, existingId)
+          patchMcPresetComposition(svc, existingId, { key: personaTextKeyOf(compositionOf(rows.get(String(marker?.source ?? source)))) })
           writeMcPresetMetadata(svc, existingId)
           writeMcPresetMarker(svc, existingId, { source: marker?.source ?? source, composition: compositionOf(rows.get(String(marker?.source ?? source ?? ''))) })
           logLine(`MC 模式 preset「${existingId}」${plan.reason} → 已重建${backup ? `（旧的备份在 ${backup}）` : ''}`)
@@ -3010,7 +3045,7 @@ export function apply(ctx, config) {
       }
       await svc.copy(source, target, MC_PRESET_NAME)
       // 复制完立刻打我们的补丁：persona 换成 MC 的、关掉那个 shell（否则就是"软件助手"+一个 pwsh）
-      const patched = patchMcPresetComposition(svc, target)
+      const patched = patchMcPresetComposition(svc, target, { key: personaTextKeyOf(compositionOf(rows.get(source))) })
       // copy() 会**保留源 preset 的简介**（官方只改 name）→ 必须把元数据改回来，否则简介跟极简模式一样
       const meta = writeMcPresetMetadata(svc, target)
       // 留个"这是我们建的"标记（含规格版本 + 组成 hash）→ 下次启动才能"检查不对就重建"

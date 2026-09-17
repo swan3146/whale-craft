@@ -2,6 +2,20 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.3] - 2026-09-17
+
+### 修复（部分 DSH 版本上「切不进 MC 模式」）
+
+- **插件自动创建的「MC模式」在部分 DSH 版本上加载失败**，切换时报：
+  `无法切换到「MC 模式」：… persona (@deepseek-ai/dsh-persona): invalid config: - $text missing required value`。
+  原因：persona 的"人设正文"字段名**跨 DSH 版本变过** —— 老版是 `text`，新版是 `prefix`，
+  而此前我们**写死了 `prefix`**。
+- 现在**两种都支持**：键名**跟着你那份 DSH 自带的源 preset** 走（源用 `text` 就用 `text`，源用 `prefix`
+  就用 `prefix`），我们只替换它的正文值；**绝不新增对方 schema 里没有的键**；认不出结构就一行都不动并记日志。
+- **启动自检 + 自动修复**：每次启动都检查**插件自己建的**那份 preset，发现 persona 键名与本版本不符
+  （或 `complete: true` 还在）就自动改对 —— **升级插件即可修好老环境**，不必手工编辑 preset 文件。
+  （自建规格 `MC_PRESET_SPEC` 升到 6：升级时会把旧规格建的 preset 重建一遍。）
+- 边界不变：**只有插件自己建的 preset 会被动**；你手写/改过的那份（无自建标记或组成被改过）一律不碰。
 ## [0.1.2] - 2026-09-17
 
 ### 修复（重要：0.1.1 里有一条会把**整个 DSH 带崩**的路径）

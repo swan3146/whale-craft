@@ -167,22 +167,22 @@ export function isCopiedPresetDescription (desc, shippedDescriptions) {
  *      **3 = persona 换成用户定稿的那一句**（"你在一台真实的 Minecraft Java 版服务器里扮演一名玩家…"）；
  *      **4 = 补上 `present`（显式文件交付）组** —— 删掉 mc_kit_share 之后，"让用户看到文件"改走宿主自带机制；
  *      **5 = 补齐 MC 模式需要的**那几组工具（tool-fs / tool-jobs / present）—— 官方 minimal 里一个都没有，
- *      不补的话复制出来的 preset 既没有文件工具、也没有 job controller（看门狗只能降级成"无 job 模式"）。
+ *      不补的话复制出来的 preset 既没有文件工具、也没有 job controller（看门狗只能降级成"无 job 模式"）；
+ *      **6 = persona 键名跨版本跟随源 preset**（新版要 `prefix`、老版要 `text`）——
+ *      升级到这一版会把 5 建的那些 preset **重建一遍**，顺手修好老环境里"键名写坏、加载失败"的那份。
  */
-export const MC_PRESET_SPEC = 5
+export const MC_PRESET_SPEC = 6
 
 /**
- * 把 composition 里的 **persona 行**换成我们自己的（纯函数，好测）。
- *
- * 只动 `- id: persona` 那一段：保留它的 `id` / `name`，**整段重建 `config`** ——
- * 因为官方 `minimal` 里带着 `complete: true`（"人设即全部系统提示"，会压掉所有其它 section）
- * 与 `includeRuntimeContext: false`，这两个都不该出现在 MC 模式里。
- *
- * @param {string} text composition 文本（`agent.cordis.yml`）
- * @param {string} personaText 我们的人设正文
- * @returns {string|null} 改好的文本；找不到 persona 行 → null（调用方据此跳过并记日志）
+ * persona 段里"人设正文"用的键名。**跨 DSH 版本有两种**：
+ *   · 新版 `prefix`（`z.string().required()`）； · 老版 `text`（同样是 required）。
+ * 2026-09-17 真机事故就是因为这里**写死了 `prefix`**：老环境自动建出来的 preset 加载直接失败
+ * （`persona (@deepseek-ai/dsh-persona): invalid config: - $text missing required value`）→ 切不进 MC 模式。
  */
-export function patchPersonaInComposition (text, personaText) {
+export const PERSONA_TEXT_KEYS = ['prefix', 'text']
+
+/** 取出 `- id: persona` 那一段（找不到返回 null） */
+function personaRow (text) {
   const lines = String(text ?? '').split('\n')
   const start = lines.findIndex((l) => /^-\s+id:\s*persona\s*$/.test(l))
   if (start < 0) return null
@@ -190,18 +190,88 @@ export function patchPersonaInComposition (text, personaText) {
   for (let i = start + 1; i < lines.length; i++) {
     if (/^-\s/.test(lines[i])) { end = i; break }
   }
-  const row = lines.slice(start, end)
-  const idLine = row.find((l) => /^-\s+id:/.test(l)) ?? '- id: persona'
-  const nameLine = row.find((l) => /^\s+name:/.test(l)) ?? "  name: '@deepseek-ai/dsh-persona'"
+  return { lines, start, end, seg: lines.slice(start, end) }
+}
+
+/** 这段 composition 里 persona 拿哪个键写正文（`prefix` / `text`；都没有 → null） */
+export function personaTextKeyOf (text) {
+  const row = personaRow(text)
+  if (!row) return null
+  for (const key of PERSONA_TEXT_KEYS) {
+    if (row.seg.some((l) => new RegExp(`^\\s{2,}${key}\\s*:`).test(l))) return key
+  }
+  return null
+}
+
+/** 从段里删掉某个键**以及它的块标量值行**（返回新数组） */
+function dropKeyFromSegment (seg, key) {
+  const re = new RegExp(`^(\\s*)${key}\\s*:`)
+  const out = []
+  for (let i = 0; i < seg.length; i++) {
+    const m = re.exec(seg[i])
+    if (!m) { out.push(seg[i]); continue }
+    const base = m[1].length
+    let j = i + 1
+    while (j < seg.length) {
+      const line = seg[j]
+      if (/^\s*$/.test(line)) { j++; continue }                    // 块标量里的空行
+      if (/^\s*/.exec(line)[0].length > base) { j++; continue }     // 值行（缩进更深）
+      break
+    }
+    i = j - 1                                                      // 连值一起丢掉
+  }
+  return out
+}
+
+/**
+ * 把 composition 里 persona 段的**人设正文**换成我们的（纯函数，自检直接测）。
+ *
+ * 规矩（用户 2026-09-17："同时支持两者"）：
+ *   · **键名跟着源 preset**（`opts.key` 优先；没有就用文件里现成的 `prefix`/`text`）—— 不假设版本；
+ *   · **只改值、不加键、不删键**：`complete:` / `includeRuntimeContext:` 只把值改成安全值
+ *     （老版本 schema 里没有的键，我们绝不会凭空写进去）；
+ *   · 找不到 persona 段 / 找不到 config 段 / 两种键都认不出 → 返回 `null`（调用方保持原样并记日志）。
+ *
+ * @param {string} text composition 文本（`agent.cordis.yml`）
+ * @param {string} personaText 我们的人设正文
+ * @param {{key?: 'prefix'|'text'|null}} [opts] `key` = 源 preset 用的那个键（版本判据）
+ * @returns {string|null}
+ */
+export function patchPersonaInComposition (text, personaText, opts = {}) {
+  const row = personaRow(text)
+  if (!row) return null
+  const { lines, start, end } = row
+  const wanted = PERSONA_TEXT_KEYS.includes(String(opts?.key ?? '')) ? String(opts.key) : null
+  const fileKey = PERSONA_TEXT_KEYS.find((k) => row.seg.some((l) => new RegExp(`^\\s{2,}${k}\\s*:`).test(l))) ?? null
+  const key = wanted ?? fileKey
+  if (!key) return null
+
+  // ① 先把**两个键**都摘掉（含块标量值行）——免得 prefix/text 同时在场打架
+  let seg = row.seg
+  for (const k of PERSONA_TEXT_KEYS) seg = dropKeyFromSegment(seg, k)
+
+  // ② 把我们的正文插回 `config:` 之后（没有 config 段就不猜，保持原样）
   const body = String(personaText).replace(/\s+$/, '').split('\n')
-  const block = [
-    idLine,
-    nameLine,
-    '  config:',
-    '    prefix: |-',
-    ...body.map((l) => '      ' + l),
-  ]
-  return [...lines.slice(0, start), ...block, ...lines.slice(end)].join('\n')
+  let ci = seg.findIndex((l) => /^\s{2,}config\s*:/.test(l))
+  if (ci < 0) {
+    const ni = seg.findIndex((l) => /^\s+name\s*:/.test(l))
+    if (ni < 0) return null
+    const indent = (/^(\s*)/.exec(seg[ni])[1]) + '  '
+    seg = [...seg.slice(0, ni + 1), `${indent}config:`, `${indent}  ${key}: |-`, ...body.map((l) => `${indent}    ${l}`), ...seg.slice(ni + 1)]
+    ci = ni + 1
+  } else {
+    const indent = (/^(\s*)/.exec(seg[ci])[1]) + '  '
+    seg = [...seg.slice(0, ci + 1), `${indent}${key}: |-`, ...body.map((l) => `${indent}  ${l}`), ...seg.slice(ci + 1)]
+  }
+
+  // ③ **只改值**：complete → false；includeRuntimeContext → true（键在才改）
+  seg = seg.map((l) => {
+    if (/^\s{2,}complete\s*:\s*true\s*$/.test(l)) return l.replace(/true\s*$/, 'false')
+    if (/^\s{2,}includeRuntimeContext\s*:\s*false\s*$/.test(l)) return l.replace(/false\s*$/, 'true')
+    return l
+  })
+
+  return [...lines.slice(0, start), ...seg, ...lines.slice(end)].join('\n')
 }
 
 /**

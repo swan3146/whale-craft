@@ -1195,6 +1195,23 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   {
     const C = await import('./src/config.mjs')
     console.log(`  ${C.patchPersonaInComposition('# 没有 persona 行\n', 'x') === null ? '✅' : '❌'} 没有 persona 行 → 返回 null（不瞎改）`)
+
+    /* 🔴 2026-09-17 真机事故：persona 的**正文键名跨版本不同**（新版 `prefix` / 老版 `text`），
+     *    我们曾写死 `prefix` ⇒ 老环境自动建的 preset 加载失败（`$text missing required value`）
+     *    → MC 模式直接切不进去。现在的规矩：**键名跟着源 preset**、只改值、不加键不删键。 */
+    const OLD_MINIMAL = ['# old minimal', '- id: persona', "  name: '@deepseek-ai/dsh-persona'", '  config:', '    text: |', '      You are a helpful software engineer assistant.', ''].join('\n')
+    const NEW_MINIMAL = ['# new minimal', '- id: persona', "  name: '@deepseek-ai/dsh-persona'", '  config:', '    prefix: You are a helpful software engineer assistant.', '    suffix: Your working directory is {{cwd}}.', '    complete: true', '    includeRuntimeContext: false', ''].join('\n')
+    console.log(`  ${C.personaTextKeyOf(OLD_MINIMAL) === 'text' && C.personaTextKeyOf(NEW_MINIMAL) === 'prefix' ? '✅' : '❌'} 🔴 认得出两种版本的键名：老版 text / 新版 prefix`)
+    const pOld = C.patchPersonaInComposition(OLD_MINIMAL, 'MC 人设', { key: C.personaTextKeyOf(OLD_MINIMAL) })
+    const pNew = C.patchPersonaInComposition(NEW_MINIMAL, 'MC 人设', { key: C.personaTextKeyOf(NEW_MINIMAL) })
+    console.log(`  ${/^\s+text: \|-$/m.test(pOld ?? '') && /MC 人设/.test(pOld ?? '') && !/prefix:/.test(pOld ?? '') ? '✅' : '❌'} 🔴 老版（text）：用 text 写正文，**不塞 prefix**`)
+    console.log(`  ${!/complete|includeRuntimeContext/.test(pOld ?? '') ? '✅' : '❌'} 老版 schema 里没有的键，我们一个都不加（complete / includeRuntimeContext）`)
+    console.log(`  ${/^\s+prefix: \|-$/m.test(pNew ?? '') && /MC 人设/.test(pNew ?? '') && !/^\s+text:/m.test(pNew ?? '') ? '✅' : '❌'} 新版（prefix）：用 prefix 写正文，**不塞 text**`)
+    console.log(`  ${/complete: false/.test(pNew ?? '') && /includeRuntimeContext: true/.test(pNew ?? '') ? '✅' : '❌'} 新版里只**改值**：complete→false、includeRuntimeContext→true（键保留）`)
+    console.log(`  ${/suffix: Your working directory/.test(pNew ?? '') ? '✅' : '❌'} 别的键（suffix）原样保留`)
+    // 跨版本"自修"：一份用 prefix 写坏的老环境 preset + 源 preset 用 text → 按源的键修好
+    const broken = C.patchPersonaInComposition(NEW_MINIMAL, '修好的人设', { key: 'text' })
+    console.log(`  ${/^\s+text: \|-$/m.test(broken ?? '') && !/^\s+prefix:/m.test(broken ?? '') && /修好的人设/.test(broken ?? '') ? '✅' : '❌'} 🔴 跨版本自修：把写坏的 prefix 那份按**源的键**改成 text（启动自检走的就是这条）`)
     console.log(`  ${C.disableShellInComposition('# 没有 shell 组\n') === null ? '✅' : '❌'} 没有 shell 组 → 返回 null`)
     const twice = C.disableShellInComposition(C.disableShellInComposition('- id: persistent-shell\n  group: true\n', '') ?? '')
     console.log(`  ${(twice.match(/disabled: true/g) ?? []).length === 1 ? '✅' : '❌'} 关 shell 是幂等的（不会写两遍 disabled）`)
@@ -1209,7 +1226,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     console.log(`  ${partial && (partial.match(/dsh-tool-fs/g) ?? []).length === 1 && partial.includes('dsh-tool-jobs') ? '✅' : '❌'} 已经有的那组不会被重复加（只补缺的）`)
     const oneOnly = C.patchToolGroupsIntoComposition(mini, [C.MC_PRESET_TOOL_GROUPS[0]])
     console.log(`  ${oneOnly && oneOnly.includes('dsh-tool-fs') && !oneOnly.includes('dsh-tool-jobs') ? '✅' : '❌'} 只把"部署里真的有的"那几组传进来时，只补那几组`)
-    console.log(`  ${C.MC_PRESET_SPEC === 5 ? '✅' : '❌'} MC_PRESET_SPEC=5（自建 preset 下次启动会重建 → 带上这几组）`)
+    console.log(`  ${C.MC_PRESET_SPEC === 6 ? '✅' : '❌'} 🔴 MC_PRESET_SPEC=6（升到这一版会把 5 建的 preset 重建一遍 → 顺手修好"persona 键名写坏"的老环境）`)
   }
   // 🔴 **已经建好的**那份也要能修（用户那台测试机上就是旧版建出来的）：
   //    只在"简介恰好等于某个官方 preset 的简介"（明显是复制残留）时才动，用户自己写的不碰。
@@ -1223,7 +1240,10 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     console.log(`  ${/writeMcPresetMarker\(svc, target, \{/.test(src) && /MC_PRESET_MARKER = '\.whale-craft\.json'/.test(src) ? '✅' : '❌'} 建完留下"自建标记"（下次启动才知道这份是我们建的）`)
     // 🔴 2026-09-16 真机事故：复制 minimal 带来的 persona（含 complete:true / includeRuntimeContext:false）
     //    会让宿主把**我们注入的 context 段整个丢掉** → "设置页显示正常、AI 却什么都没收到"
-    console.log(`  ${/patchMcPresetComposition\(svc, target\)/.test(src) && /patchMcPresetComposition\(svc, existingId\)/.test(src) ? '✅' : '❌'} 新建/重建都会把 persona 换成我们的、并关掉 shell`)
+    // 🔴 2026-09-17：新建/重建**必须把"本版本源 preset 的 persona 键名"传下去** ——
+    //    写死 prefix 会把老版 DSH 的 preset 建坏（$text missing required value）。
+    console.log(`  ${/patchMcPresetComposition\(svc, target, \{ key: personaTextKeyOf\(compositionOf\(rows\.get\(source\)\)\) \}\)/.test(src) && /patchMcPresetComposition\(svc, existingId, \{ key: personaTextKeyOf\(/.test(src) ? '✅' : '❌'} 新建/重建都会把 persona 换成我们的、并关掉 shell（且**带上本版本的键名**）`)
+    console.log(`  ${/personaTextKeyOf\(composition\)/.test(src) && /已自动修正/.test(src) ? '✅' : '❌'} 🔴 启动自检：persona 键名与本版本不符 → **自动修正**（插件升级即修好老环境）`)
     console.log(`  ${/stillShippedPersona/.test(src) && /You are a helpful software engineer assistant/.test(src) ? '✅' : '❌'} 旧版（无标记）那份：只在"官方那句人设还在"时才动它`)
     console.log(`  ${/runtimeContextSuppressed \? \[\]/.test(src) ? '✅' : '❌'} 状态块注释里钉住了宿主那段 contexts: runtimeContextSuppressed ? [] （这是根因）`)
     console.log(`  ${/notices: sent/.test(src) && /segments: \{/.test(src) ? '✅' : '❌'} 状态块报的是**实际投出去的文件**（noticesSent，不许再撒谎）`)
