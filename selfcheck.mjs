@@ -1746,6 +1746,8 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
 
   /* ⑧ 🔴 用户："插件初始化就要检查 `.whale-craft` 是否存在，不存在则建立；README.md 是否存在，
    *    不存在则写入默认值。"（AGENTS.md 同理：提示词页编辑的就是这个文件，文件必须先在） */
+  /** 没工作区的 MC 会话替身：在块外声明，好让后面的 `/api/mc/mode` agent 替身能引用到 */
+  let noWs
   {
     const { mkdtempSync, existsSync, readFileSync, writeFileSync } = await import('node:fs')
     const { tmpdir } = await import('node:os')
@@ -1786,7 +1788,9 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     console.log(`  ${!existsSync(join(ws2, '.whale-craft')) ? '✅' : '❌'} 🔴 普通会话**不会**被建 .whale-craft/（时机：只在 MC 模式会话/点开设置）`)
 
     // 🔴 没有选中工作区 → **拒绝发起 MC 模式会话**（不套隔离、不建文件）
-    const noWs = { id: 'sess-NOWS', session: { header: {} }, ctx: makeAgentCtx('minecraft') }
+    // ⚠️ `noWs` 在**块外**声明（见下面那条 `let noWs`）：`/api/mc/mode` 的 agent 替身要在闭包里引用它，
+    //    留在块内会让闭包抛 ReferenceError → 被 handler 的 try/catch 吞掉 → 断言变成假绿。
+    noWs = { id: 'sess-NOWS', session: { header: {} }, ctx: makeAgentCtx('minecraft') }
     const restrictBefore = restrictCalls.length
     fire('agent/created', noWs)
     console.log(`  ${restrictCalls.length === restrictBefore ? '✅' : '❌'} 没工作区的 MC 会话**不套权限策略**（拒绝进入 MC 模式）`)
@@ -1808,6 +1812,14 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     await p
     try { return JSON.parse(rs.body || '{}') } catch { return {} }
   }
+  // agent 服务替身：**必须在第一组模式断言之前就位** ——
+  // 否则 `/api/mc/mode` 拿到的是 `undefined`，那几条断言会"恰好因为期望 false 而通过"（假绿）。
+  fakeCtx.agents = {
+    get: (id) => (id === 'sess-MC2' ? mcAgent
+      : id === 'sess-P2' ? plainAgent
+        : id === 'sess-NOWS' ? noWs
+          : undefined),
+  }
   const modeMc = await callMc('/api/mc/mode?sessionId=sess-MC2')
   const modePlain = await callMc('/api/mc/mode?sessionId=sess-P2')
   const modeNoId = await callMc('/api/mc/mode')
@@ -1816,12 +1828,6 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   console.log(`  ${modeNoId.mcMode === false ? '✅' : '❌'} /api/mc/mode：没给 sessionId → false（保守，宁可不显示）`)
 
   // agent 服务在场时现场问 agentPresets；**把模式切回普通要立刻变 false**（不残留按钮）
-  fakeCtx.agents = {
-    get: (id) => (id === 'sess-MC2' ? mcAgent
-      : id === 'sess-P2' ? plainAgent
-        : id === 'sess-NOWS' ? noWs
-          : undefined),
-  }
   const liveMc = await callMc('/api/mc/mode?sessionId=sess-MC2')
   presetByCtx.set(mcAgent.ctx, 'standard')
   const afterSwitch = await callMc('/api/mc/mode?sessionId=sess-MC2')
@@ -1830,11 +1836,16 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   console.log(`  ${afterSwitch.mcMode === false ? '✅' : '❌'} 🔴 模式切成普通后立刻变 false（按钮不会残留）`)
 
   /* ⑨ 🔴 用户 2026-09-16："没有选中工作区，则拒绝发起 MC 模式会话**和设置**"。
-   *    · 模式接口：MC 模式但没工作区 → mcMode=false + diag.reason='no-workspace'（前端据此隐藏入口）
-   *    · 设置接口：没有 sessionId / 会话没有工作区 → **400 拒绝**
-   *    · 有工作区 → 放行，并且**在这个时机**把该工作区的 `.whale-craft/` 备好（"点开设置即建"）。 */
+   *    · 设置接口：没有 sessionId / 会话没有工作区 → **400 拒绝**（这条没变）
+   *    · 有工作区 → 放行，并且**在这个时机**把该工作区的 `.whale-craft/` 备好（"点开设置即建"）。
+   *
+   *    🔴 2026-09-18 用户改口径：**有没有工作区，只要新对话选中了 MC 模式就显示按钮**，
+   *       工作区改到**点按钮那一刻**检查。所以模式接口**不再**把 mcMode 压成 false
+   *       （那正是前端藏入口的依据），改成额外报 `hasWorkspace` + `diag.reason='no-workspace'`。 */
   const modeNoWs = await callMc('/api/mc/mode?sessionId=sess-NOWS')
-  console.log(`  ${modeNoWs.mcMode === false && modeNoWs.diag?.reason === 'no-workspace' ? '✅' : '❌'} 🔴 没工作区的 MC 会话：mcMode=false + reason=no-workspace（前端据此隐藏「MC设置」）`)
+  console.log(`  ${modeNoWs.mcMode === true ? '✅' : '❌'} 🔴 没工作区的 MC 会话：mcMode 仍为 **true**（入口照常显示，不再藏按钮）`)
+  console.log(`  ${modeNoWs.hasWorkspace === false ? '✅' : '❌'} 同时报出 hasWorkspace=false（前端点击时据此提示"先选工作区"）`)
+  console.log(`  ${modeNoWs.diag?.reason === 'no-workspace' ? '✅' : '❌'} 诊断里仍写清原因 reason=no-workspace（排查用）`)
   console.log(`  ${modeNoWs.diag?.workspace === null || modeNoWs.diag?.workspace === undefined ? '✅' : '❌'} 诊断里明确报"没有工作区"（${JSON.stringify(modeNoWs.diag?.workspace ?? null)}）`)
 
   const callMc2 = async (method, url, body) => {
@@ -2783,7 +2794,7 @@ console.log('\n--- 客户端 bundle（client.js 静态检查）---')
     ['放置是幂等的（不会自己触发自己）', /btn\.previousElementSibling === anchor\) return/.test(code)],
     ['观察目标只限作曲器卡片', /querySelector\('\[data-composer-card\]'\)/.test(code) && /observer\.observe\(target, \{ childList: true, subtree: true \}\)/.test(code)],
     ['组件卸载就摘掉按钮', /btn\.remove\(\)/.test(code)],
-    ['注入由门控驱动（只有 show 为真才挂）', /if \(!show\) return undefined/.test(code) && /return mountHeroChipButton\(openSettings\)/.test(code)],
+    ['注入由门控驱动（只有 show 为真才挂）', /if \(!show\) return undefined/.test(code) && /return mountHeroChipButton\(/.test(code)],
     // 🔴 2026-09-16 二轮事故：门控**不许依赖一次性网络请求**。
     //    第一版问 `/api/mc/mode`，浏览器在新接口上线前 HMR 拿到新客户端 → 404 →
     //    永久当成"非 MC 模式" → MC 模式里也没有按钮。
@@ -2791,11 +2802,21 @@ console.log('\n--- 客户端 bundle（client.js 静态检查）---')
     ['MC设置按会话 preset 本地门控（useSessions）', /useSessions/.test(code) && /projectionValues\?\.agentPreset/.test(code)],
     ['新会话页入口走正经插槽（conversation.input.right）', /conversation\.input\.right/.test(code) && /whale_craft-mc-settings-hero/.test(code)],
     ['两个入口按 blank 互斥（不会同时挂两个模态框）', /useMcSettingsGate\(props, false\)/.test(code) && /useMcSettingsGate\(props, true\)/.test(code) && /s\.blank === true/.test(code)],
-    ['本地 preset 是主判据（不必等网络）', /const localShow = known && blank === wantBlank && mcPresetIds\.includes\(preset\)/.test(code) && /if \(localShow\) return !deniedNoWorkspace/.test(code)],
-    // 🔴 2026-09-16 用户："没有选中工作区，则拒绝发起 MC 模式会话和设置。"
-    //    前端：只有服务端**明确**说 no-workspace 才隐藏入口（请求失败/其它 false 一律维持本地判断
-    //    ——"一次性请求失败 = 入口永久消失"那个坑不能再踩）
-    ['没工作区才隐藏入口（服务端明确 no-workspace；失败不隐藏）', /diag\?\.reason === 'no-workspace'/.test(code) && /catch\(\(\) => \{ if \(alive\) setDeniedNoWorkspace\(false\) \}\)/.test(code)],
+    ['本地 preset 是主判据（不必等网络）', /const localShow = known && blank === wantBlank && mcPresetIds\.includes\(preset\)/.test(code)],
+    // 🔴 2026-09-18 用户改口径：**有没有工作区，只要新对话选中了 MC 模式就显示按钮**；
+    //    工作区改到**点击那一刻**再检查，没有就用**原生**提示让用户先选。
+    ['新对话入口不再因"没工作区"隐藏（wantBlank 分支恒真）', /if \(localShow\) return true/.test(code) && !/return wantBlank \? true/.test(code)],
+    ['两个入口口径统一：选中 MC 模式就显示（标题条那个也一样）', /useMcSettingsGate\(props, false\)/.test(code) && /useMcSettingsGate\(props, true\)/.test(code) && !/deniedNoWorkspace/.test(code)],
+    ['点击时才检查工作区（三态：拿不准就不拦）', /function useMcWorkspaceReady\(props, active\)/.test(code) && /if \(wsReadyRef\.current === false\) \{ window\.alert\(NO_WORKSPACE_TIP\); return \}/.test(code)],
+    ['工作区判定本地+服务端两处兜底（hasWorkspace）', /useWorkspaceCwd\(props\)/.test(code) && /typeof j\?\.hasWorkspace === 'boolean'/.test(code)],
+    ['提示优先用原生 alert（不做自定义模态框）', /window\.alert\(NO_WORKSPACE_TIP\)/.test(code) && /NO_WORKSPACE_TIP\s*=\s*'/.test(code) && !/data-wc-noworkspace/.test(code)],
+    // 服务端口径（读 index.js，别拿 client 的 src 判）
+    ['服务端不再因没工作区把 mcMode 压成 false（改报 hasWorkspace）', (() => {
+      const isrc = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+      return /hasWorkspace = Boolean\(workspaceOf\(agent\)\)/.test(isrc)
+        && /sendJson\(res, 200, \{ ok: true, sessionId, mcMode, hasWorkspace, diag \}\)/.test(isrc)
+        && !/if \(agent && !workspaceOf\(agent\) && isMcModeAgent\(agent\)\) \{ mcMode = false/.test(isrc)
+    })()],
     ['设置接口全都带上 sessionId（服务端要用它定位工作区）', /const withSid = \(p\) =>/.test(code) && /apiGet\(withSid\('\/api\/mc\/accounts'\)\)/.test(code) && /apiPatch\(withSid\('\/api\/mc\/config'\)/.test(code) && !/api(Get|Patch|Post|Delete)\('\/api\/mc\/(accounts|config|authservers)'/.test(code)],
     // 🔴 门控名单走**专门的小接口**（不需要工作区）：用 /api/mc/config 会被闸门拒 → 静默退回兜底名单
     ['前端门控名单取 /api/mc/presets（不带 sessionId）', /fetch\('\/api\/mc\/presets'/.test(code) && !/fetch\('\/api\/mc\/config'/.test(code)],

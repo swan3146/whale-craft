@@ -1126,27 +1126,40 @@ export function apply(ctx, config) {
       return sendJson(res, 200, { ok: true, sessions: registry.listSessions() })
     }
 
-    /* ── 「MC设置」入口的模式门控（2026-09-16）─────────────────────────────
-     * 前端只该在 **MC 模式**的会话里显示设置入口。以前前端要么无条件显示、
-     * 要么靠 DOM 猜测，都出过事故（普通会话也有按钮 / 输入框上方冒出长条）。
-     * 这里给出**与 restrict/guard 完全同一个判据**（isMcModeAgent）的真值，
-     * 前端拿到 false / 还没拿到就一律不渲染。
+    /* ── 「MC设置」入口的模式门控（2026-09-16；2026-09-18 调整）─────────────
+     * 前端只该在 **MC 模式**的会话里显示设置入口（普通会话显示过按钮，出过事故）。
+     * 这里给出**与 restrict/guard 完全同一个判据**（isMcModeAgent）的真值。
+     *
+     * 🔴 2026-09-18 用户要求改口径：**有没有选工作区，只要新对话选中了 MC 模式就显示按钮**；
+     *    工作区改到**点按钮时**再检查，没有就提示用户先选。
+     *    所以这里**不再**因为"没工作区"把 `mcMode` 压成 false（那正是前端藏入口的依据）——
+     *    改成额外报 `hasWorkspace`，让前端自己决定是打开设置还是提示。
+     *    注意：`applyMcModePolicy` 里"没工作区就不当 MC 会话"的**服务端行为没变**
+     *    （不套工具白名单、不注入提示词、`.whale-craft` 也不建），变的只是**入口可见性**。
      * ──────────────────────────────────────────────────────────────────── */
     if (req.method === 'GET' && path === '/api/mc/mode') {
       const sessionId = url.searchParams.get('sessionId') ?? ''
       let mcMode = false
       let agent = null
       let reason = null
+      let hasWorkspace = null
       if (sessionId) {
         try {
           agent = ctx.get('agents')?.get?.(sessionId) ?? null
+          // 🔴 判据是 **preset**（与 restrict/guard 同一个 isMcModeAgent）——
+          //    **不再**因为"没工作区"把它压成 false：那是前端藏入口的旧依据，
+          //    而 2026-09-18 起入口一律显示、工作区改到点击时检查（另报 hasWorkspace）。
           mcMode = agent ? isMcModeAgent(agent) : mcModeAgentIds.has(sessionId)
         } catch {
           mcMode = mcModeAgentIds.has(sessionId)
         }
-        // 🔴 没选中工作区 = 拒绝 MC 模式（用户 2026-09-16）：前端据此**隐藏「MC设置」入口**
-        if (agent && !workspaceOf(agent) && isMcModeAgent(agent)) { mcMode = false; reason = 'no-workspace' }
-        else if (!agent && noWorkspaceRefused.has(sessionId)) { reason = 'no-workspace' }
+        if (agent) {
+          hasWorkspace = Boolean(workspaceOf(agent))
+          if (!hasWorkspace && mcMode) reason = 'no-workspace'
+        } else if (noWorkspaceRefused.has(sessionId)) {
+          reason = 'no-workspace'
+          hasWorkspace = false
+        }
       }
       // 诊断：把"判定依据"和"各段实际长度"一并报出来。
       // 2026-09-16 事故的教训：只回一个 false，谁都查不出是 preset 没认出来还是段没注册。
@@ -1175,7 +1188,7 @@ export function apply(ctx, config) {
           }
         } catch (e) { diag = { reason, error: String(e.message) } }
       }
-      return sendJson(res, 200, { ok: true, sessionId, mcMode, diag })
+      return sendJson(res, 200, { ok: true, sessionId, mcMode, hasWorkspace, diag })
     }
 
     if (req.method === 'POST' && path === '/api/mc/stop') {

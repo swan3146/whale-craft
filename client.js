@@ -529,26 +529,51 @@ select[data-wc-in]{appearance:none;padding-right:22px;
 
       /**
        * 🔴 2026-09-16 用户："没有选中工作区，则拒绝发起 MC 模式会话和设置。"
-       * 服务端 `/api/mc/mode` 对"MC 模式但没工作区"会明确回 `{mcMode:false, diag:{reason:'no-workspace'}}`
-       * —— 这时**本地 preset 再像 MC 模式也不显示入口**。
-       * ⚠️ 只有"服务端**明确因为没工作区**而拒绝"才隐藏：请求失败、或别的 false 一律维持本地判断
-       *    （一次性请求失败 = 入口永久消失，这个坑 2026-09-16 刚踩过）。
+       *    当时的做法是"服务端说没工作区 ⇒ **本地 preset 再像 MC 模式也不显示入口**"。
+       *
+       * 🔴 2026-09-18 用户改口径：**有没有选工作区，只要选中了 MC 模式就显示按钮**，
+       *    工作区改到**点按钮那一刻**再检查（没有就提示先选）—— 两个入口**统一**这么办：
+       *      · 新对话页 hero 那个入口（`wantBlank`）；
+       *      · 已有会话标题条那个入口。
+       *    这样也顺手去掉了一条"服务端说不显示就不显示"的网络依赖（曾经让入口永久消失过）。
+       *    服务端"没工作区就不套白名单/不注入/不建记忆目录"的行为没变，变的只是入口可见性。
        */
-      const [deniedNoWorkspace, setDeniedNoWorkspace] = React.useState(false)
-      React.useEffect(() => {
-        if (!localShow || !sessionId) { setDeniedNoWorkspace(false); return undefined }
-        let alive = true
-        fetch('/api/mc/mode?sessionId=' + encodeURIComponent(sessionId), { headers: { accept: 'application/json' } })
-          .then((r) => (r.ok ? r.json() : null))
-          .then((j) => { if (alive) setDeniedNoWorkspace(j?.mcMode === false && j?.diag?.reason === 'no-workspace') })
-          .catch(() => { if (alive) setDeniedNoWorkspace(false) })
-        return () => { alive = false }
-      }, [localShow, sessionId])
-
-      if (localShow) return !deniedNoWorkspace
+      if (localShow) return true
       if (known) return false
       return !wantBlank && serverMode === true
     }
+
+    /* ==================================================================
+     * 「MC设置」的**工作区检查**（2026-09-18 用户要求）
+     * ----------------------------------------------------------------
+     * 口径变了：**入口一律显示**（只要选中 MC 模式），**点了才检查工作区**。
+     * 没选工作区 → 原生提示"先去选一个工作区"（不用自定义模态框：这件事一句话就说完）。
+     * 判定取两处，互相兜底：
+     *   · **本地**：`useWorkspaceCwd` 读会话的 `cwd`（新对话页工作区一选就落进 projection）；
+     *   · **服务端**：`/api/mc/mode` 的 `hasWorkspace`（本地还没落盘时的权威值）。
+     * 用三态：`true` 有 · `false` 明确没有 · `null` 还不知道（**拿不准就不拦**，让服务端去拒绝，
+     * 免得"一次请求失败 = 用不了设置"这类老坑重演）。
+     * ================================================================== */
+    function useMcWorkspaceReady(props, active) {
+      const sessionId = props?.sessionId ?? props?.session?.id
+      const localCwd = useWorkspaceCwd(props)
+      const [serverHas, setServerHas] = React.useState(null)
+      React.useEffect(() => {
+        if (!active || !sessionId) return undefined
+        let alive = true
+        fetch('/api/mc/mode?sessionId=' + encodeURIComponent(sessionId), { headers: { accept: 'application/json' } })
+          .then((r) => (r.ok ? r.json() : null))
+          .then((j) => { if (alive && typeof j?.hasWorkspace === 'boolean') setServerHas(j.hasWorkspace) })
+          .catch(() => { /* 拿不到就不下结论（返回 null ⇒ 不拦） */ })
+        return () => { alive = false }
+      }, [active, sessionId])
+      if (typeof localCwd === 'string' && localCwd) return true
+      return serverHas
+    }
+
+    /** 没选工作区时的提示（**优先原生**：用户要求） */
+    const NO_WORKSPACE_TIP = '请先在这个对话里选择一个工作区，再打开「MC设置」。\n\n'
+      + 'MC 模式的记忆与提示词都放在工作区的 .whale-craft 目录里，没有工作区就没有地方放。'
 
     /**
      * 当前会话（或新对话页那个 blank 会话）**选中的工作区**。
@@ -686,10 +711,19 @@ select[data-wc-in]{appearance:none;padding-right:22px;
     function McSettingsDockEntry(props) {
       const show = useMcSettingsGate(props, true)
       const wsCwd = useWorkspaceCwd(props)
+      // 🔴 2026-09-18：入口不再因"没工作区"隐藏，改为**点了才检查**（详见 useMcWorkspaceReady）。
+      const wsReady = useMcWorkspaceReady(props, show)
+      // 点击回调只建一次（DOM 监听不改），所以用 ref 带出"最新"的工作区判定。
+      const wsReadyRef = React.useRef(wsReady)
+      wsReadyRef.current = wsReady
 
       React.useEffect(() => {
         if (!show) return undefined
-        return mountHeroChipButton(openSettings)
+        // 门控只管"是不是 MC 模式"；工作区在**点击那一刻**判：明确没有（false）才拦。
+        return mountHeroChipButton(() => {
+          if (wsReadyRef.current === false) { window.alert(NO_WORKSPACE_TIP); return }
+          openSettings()
+        })
       }, [show])
 
       if (!show) return null
