@@ -38,6 +38,7 @@ import { encodePng } from './src/png.mjs'
 import { userMessage, messageFactoryKind, pluginLoadNote } from './src/user-message.mjs'
 import { ImageEngine, imageEngineAvailable, imageEngineError } from './src/image.mjs'
 import { listenLanBroadcast } from './src/lan.mjs'
+import { statusPing, parseAddress } from './src/ping.mjs'
 
 export const name = 'whale_craft'
 export const inject = ['webServer', 'tools']
@@ -1422,6 +1423,30 @@ export function apply(ctx, config) {
         found: broadcast.slice(0, 20),
         ...(broadcast.length ? {} : { hint: '没听到公告。确认对方已经"对局域网开放"（或服务端开了 enable-lan-visibility）；有些网络（部分 WiFi / VPN / 容器）会挡多播，那种情况原版客户端自己也看不到——直接问对方地址即可。' }),
       }
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_ping',
+    description: '【单地址探测】**已知地址**时，先问一句"你是谁、通不通"——发一次 Minecraft STATUS ping：\n'
+      + '拿 **通不通**（能不能拿到状态响应）/ **版本** / **协议号** / **MOTD** / **人数** / **延迟**。\n'
+      + '🔴 **不登录、不用账户、不进服**，拿到就断；超时由自己兜（默认 5 秒，上限 30 秒），**不会挂住**。\n'
+      + '和 `mc_connect` 的分工：先用 `mc_ping` 确认地址与版本（**推荐**），再 `mc_connect` 真进服；\n'
+      + '连不上时它会把原因说成人话（ECONNREFUSED=端口没人听 / ENOTFOUND=域名拼错 / 超时=防火墙或 enable-status=false）。\n'
+      + '和 `mc_lan` 的分工：`mc_lan` 是"不知道地址"时听局域网公告；`mc_ping` 是"知道地址"时主动探一次。',
+    parameters: {
+      address:   { type: 'string', description: '地址，认 `example.com` / `example.com:25566` / `[::1]:25565`（必填）' },
+      port:      { type: 'number', description: '端口（默认 25565）；address 里已经带 `:端口` 时以 address 为准' },
+      timeoutMs: { type: 'number', description: '超时（默认 5000，上限 30000）——超时就是这个工具的硬顶，不会更久' },
+      subserver: { type: 'string', description: '（可选）Velocity 之类的子服域名：握手里的 serverHost 用它路由到子服，如 mc.example.com' },
+    },
+    output: text(),
+    async execute(args) {
+      const { host, port } = parseAddress(args.address, Number(args.port) || 25565)
+      const timeoutMs = Number(args.timeoutMs) || 5000
+      const r = await statusPing({ host, port, timeoutMs, fakeHost: args.subserver ? String(args.subserver) : '' })
+      // 通了但版本表里没有对应话术的情况也用得上：把"能不能连"与"连上会怎样"分开说
+      return r
     },
   }))
 

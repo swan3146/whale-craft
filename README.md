@@ -135,7 +135,7 @@ dsh plugin --profile web add link:/path/to/whale-craft
 
 | 层 | 数量 | 工具 |
 | --- | --- | --- |
-| **游戏内** `mc_*` | 24 | `mc_status` `mc_connect` `mc_lan` `mc_accounts` `mc_capabilities` `mc_disconnect` `mc_stop` `mc_config` `mc_sessions` `mc_diag` `mc_say` `mc_events` `mc_watch` `mc_map` `mc_scan` `mc_entities` `mc_inventory` `mc_move` `mc_act` `mc_dig` `mc_build` `mc_give` `mc_sequence` `mc_command` |
+| **游戏内** `mc_*` | 25 | `mc_status` `mc_ping` `mc_connect` `mc_lan` `mc_accounts` `mc_capabilities` `mc_disconnect` `mc_stop` `mc_config` `mc_sessions` `mc_diag` `mc_say` `mc_events` `mc_watch` `mc_map` `mc_scan` `mc_entities` `mc_inventory` `mc_move` `mc_act` `mc_dig` `mc_build` `mc_give` `mc_sequence` `mc_command` |
 | **游戏外辅助** `mc_kit_*` | 3 | `mc_kit_memory`（记忆树：按服/主题定位、`key` 覆盖、搜索、删除、把文件与图片**存进记忆**）· `mc_kit_image`（SVG→PNG / 引图 / 拼网格）· `mc_kit_express`（把发布区里的文件按「文件分享」模式换成路径 / URL / 一句提示） |
 | **管理** `mc_admin_*` | 1 | `mc_admin_config`（读写全局配置；**MC 模式看不见、也调不动**） |
 
@@ -148,6 +148,11 @@ dsh plugin --profile web add link:/path/to/whale-craft
 - `mc_lan` 找**局域网房间**：只做原版那一件事 —— 听 `224.0.2.60:4445` 上"对局域网开放"的公告
   （`[MOTD]…[/MOTD][AD]端口[/AD]`，重发周期 1.5 秒），听到就拿到 host/端口/MOTD。🔴 **不扫端口**，
   所以恒定在 `seconds` 秒内返回（默认 3、上限 15）；多播被挡的网络里看不见，直接问对方地址；
+- `mc_ping` 是**已知地址**时的探路工具：发一次 STATUS ping（握手 + 状态请求），拿
+  **通不通 / 版本 / 协议号 / MOTD / 人数 / 延迟**——🔴 **不登录、不用账户、不进服**，拿到就断；
+  超时自己兜（默认 5 秒、上限 30 秒），连不上时把原因说成人话
+  （`ECONNREFUSED`=端口没人听 · `ENOTFOUND`=域名拼错 · 超时=防火墙或服务端 `enable-status=false`）。
+  与 `mc_lan` 正好互补：**不知道地址**听公告，**知道地址**用它探一次，再用 `mc_connect` 真进服；
 - 记忆是**语义层**不是文件别名：`topic`/`server` 自动定位路径、`append` 带 `key` 覆盖同 key 那条、
   跨文件 `search`、删除、把任意文件（含图片）`put` 进记忆再当**图片附件**读回来。
 

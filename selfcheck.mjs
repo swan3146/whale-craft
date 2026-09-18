@@ -218,7 +218,7 @@ console.log('\n--- 工具面（share 移除 / present 接入）---')
   const { readFileSync } = await import('node:fs')
   const idx = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
   console.log(`  ${!tools.has('mc_kit_share') ? '✅' : '❌'} 🔴 mc_kit_share 已移除（它只是在调宿主**另装**的 dsh-file-host，插件本身没有文件服务器）`)
-  console.log(`  ${tools.size === 28 ? '✅' : '❌'} 工具数 28（实际 ${tools.size}）：mc_* 24 + mc_kit_* 3 + mc_admin_* 1`)
+  console.log(`  ${tools.size === 29 ? '✅' : '❌'} 工具数 29（实际 ${tools.size}）：mc_* 25 + mc_kit_* 3 + mc_admin_* 1`)
   // 只看**代码**，不看注释：注释里留着"为什么删"的说明（那是要留的）
   const codeOnly = idx.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
   console.log(`  ${!/uploadToFileHost|dsh-file-host|\/serve\/file-host|mc_kit_share/.test(codeOnly) ? '✅' : '❌'} 源码里没有上传/文件服务器残留（注释里保留"为什么删"的说明）`)
@@ -2829,6 +2829,90 @@ console.log('\n--- 局域网探测（mc_lan）---')
   console.log(`  ${scanParams.length === 0 ? '✅' : '❌'} 扫段参数已从工具面移除（${scanParams.length ? '还在：' + scanParams.join(', ') : '没有 subnet/ports/timeoutMs/pingTimeoutMs/includeSelf'}）`)
   const lanDefault = await tools.get('mc_lan').execute({ seconds: 1 }, A)
   console.log(`  ${lanDefault?.mode === 'broadcast' && !('scanned' in (lanDefault ?? {})) ? '✅' : '❌'} 默认就是纯广播：mode=broadcast、没有 scanned 字段（听到 ${lanDefault?.count ?? '?'} 个）`)
+}
+
+// ── 单地址探测（mc_ping）：纯函数 + **真起一个 MC 服务端 ping 它** ──
+console.log('\n--- 单地址探测（mc_ping）---')
+{
+  const P = await import('./src/ping.mjs')
+
+  // ① 地址解析：这几种写法都必须认，含糊的必须拒绝
+  const forms = [
+    ['example.com', { host: 'example.com', port: 25565 }],
+    ['example.com:25566', { host: 'example.com', port: 25566 }],
+    ['127.0.0.1:1', { host: '127.0.0.1', port: 1 }],
+    ['[::1]:25570', { host: '::1', port: 25570 }],
+  ]
+  const parsedOk = forms.every(([in_, want]) => JSON.stringify(P.parseAddress(in_)) === JSON.stringify(want))
+  console.log(`  ${parsedOk ? '✅' : '❌'} 地址解析（域名 / 域名:端口 / IP:端口 / [IPv6]:端口）`)
+  const throws = ['', 'a:b:c', 'x:99999', 'x:0']
+  const throwOk = throws.every((s) => { try { P.parseAddress(s); return false } catch { return true } })
+  console.log(`  ${throwOk ? '✅' : '❌'} 空地址 / 多个冒号 / 端口越界 → 抛错（${throws.length} 种）`)
+  console.log(`  ${P.parseAddress('example.com', 25570).port === 25570 ? '✅' : '❌'} port 参数作默认值（address 里带端口时以 address 为准）`)
+
+  // ② MOTD 拍平（颜色码要去掉）——与 mc_connect 进服后看到的是同一份文本
+  console.log(`  ${P.flattenMotd({ text: 'A ', extra: [{ text: '§aFake' }, { text: ' §rServer' }] }) === 'A Fake Server' ? '✅' : '❌'} MOTD 组件拍平 + 去掉 § 颜色码`)
+
+  // ③ 错误要说人话（不然 LLM 得自己猜一轮）
+  const friendly = [
+    ['ECONNREFUSED', /没人听/],
+    ['ENOTFOUND', /解析不了/],
+    ['ETIMEDOUT', /没回应/],
+  ]
+  const friendlyOk = friendly.every(([code, re]) => re.test(P.friendlyNetError({ code })))
+  console.log(`  ${friendlyOk ? '✅' : '❌'} 常见网络错误 → 人话（${friendly.map(([c]) => c).join(' / ')}）`)
+
+  // ④ 🔴 没人听的端口：必须**立刻**返回 ECONNREFUSED（不是等超时、更不能把进程带走）
+  const refused = await P.statusPing({ host: '127.0.0.1', port: 1, timeoutMs: 3000 })
+  console.log(`  ${refused.ok === false && refused.code === 'ECONNREFUSED' && refused.elapsedMs < 3000 ? '✅' : '❌'} 端口没人听 → 立刻 ok:false + ECONNREFUSED（${refused.elapsedMs}ms｜${refused.hint}）`)
+
+  // ⑤ 域名解析不了：也要说清
+  const nodns = await P.statusPing({ host: 'no-such-host.invalid', port: 25565, timeoutMs: 3000 })
+  console.log(`  ${nodns.ok === false && /解析/.test(String(nodns.hint) + String(nodns.error)) ? '✅' : '❌'} 域名解析不了 → 指向 DNS（${nodns.hint}）`)
+
+  // ⑥ 黑洞（只 accept 不回包）：必须被**自己的硬超时**掐掉（上游默认是 120 秒，不能等它）
+  const { createServer: tcpServer } = await import('node:net')
+  const blackhole = tcpServer(() => { /* 收下连接，什么都不回 */ })
+  await new Promise((r) => blackhole.listen(0, '127.0.0.1', r))
+  const t0 = Date.now()
+  const silent = await P.statusPing({ host: '127.0.0.1', port: blackhole.address().port, timeoutMs: 1200 })
+  const wall = Date.now() - t0
+  blackhole.close()
+  console.log(`  ${silent.ok === false && wall < 3000 ? '✅' : '❌'} 黑洞连接 → ${wall}ms 就被硬超时掐掉（不是等上游 120 秒）`)
+
+  // ⑦ 🔴 真起一个 MC 服务端，把整条 STATUS 路跑通
+  {
+    const { createRequire } = await import('node:module')
+    const req = createRequire(createRequire(import.meta.url).resolve('mineflayer'))
+    let srv = null
+    try {
+      srv = req('minecraft-protocol').createServer({
+        'online-mode': false, port: 0, host: '127.0.0.1', version: '1.21.4',
+        motd: '§a探针服务端 §r| §bhello', maxPlayers: 7,
+      })
+      await new Promise((r) => srv.once('listening', r))
+      const port = srv.socketServer.address().port
+      const up = await P.statusPing({ host: '127.0.0.1', port, timeoutMs: 5000 })
+      console.log(`  ${up.ok === true && Number.isFinite(up.elapsedMs) ? '✅' : '❌'} 真 MC 服务端 STATUS ping 跑通（${up.ok ? `${up.elapsedMs}ms` : up.error}）`)
+      console.log(`  ${up.version === '1.21.4' && up.protocol === 769 ? '✅' : '❌'} 读到版本 ${up.version}（协议 ${up.protocol}）＝ mc_connect 会用的那个版本`)
+      console.log(`  ${up.players?.online === 0 && up.players?.max === 7 ? '✅' : '❌'} 读到人数 ${up.players?.online}/${up.players?.max}`)
+      console.log(`  ${up.motd === '探针服务端 | hello' ? '✅' : '❌'} 读到 MOTD（颜色码已去）：${JSON.stringify(up.motd)}`)
+      console.log(`  ${Number.isFinite(up.latencyMs) && up.latencyMs >= 0 ? '✅' : '❌'} 读到延迟 ${up.latencyMs}ms`)
+    } catch (e) {
+      console.log(`  ❌ 真 MC 服务端那段没跑起来：${e?.message ?? e}`)
+    } finally {
+      try { srv?.close() } catch { /* 没起来就算了 */ }
+    }
+  }
+
+  // ⑧ 工具面：注册了、参数齐、**不需要账户**（不传 exec 里的账户解析也能跑）
+  const pingDef = tools.get('mc_ping')
+  console.log(`  ${pingDef ? '✅' : '❌'} 注册了 mc_ping 工具`)
+  const pingParams = Object.keys(pingDef?.parameters?.properties ?? pingDef?.parameters ?? {})
+  const wantParams = ['address', 'port', 'timeoutMs', 'subserver']
+  console.log(`  ${wantParams.every((k) => pingParams.includes(k)) ? '✅' : '❌'} 参数齐（${pingParams.join(', ')}）`)
+  const pingOut = await tools.get('mc_ping').execute({ address: '127.0.0.1:1', timeoutMs: 2000 }, A)
+  console.log(`  ${pingOut?.ok === false && pingOut?.code === 'ECONNREFUSED' ? '✅' : '❌'} 工具路径也不抛异常、原样回 ok:false（${pingOut?.code}）`)
 }
 
 console.log('\n--- 客户端 bundle（client.js 静态检查）---')
