@@ -456,6 +456,41 @@ export class McBot extends EventEmitter {
   }
 
   /**
+   * 🔴🔴 **唯一的错误上报口**（2026-09-18 P0：连一个不存在的服务器 → 整个 DSH 崩）。
+   *
+   * 事故现场（用户实测）：
+   *   `Error: connect ECONNREFUSED 127.0.0.1:61631`
+   *   `Emitted 'error' event on McBot instance at: core.mjs:671`
+   *   `node:events:486  throw er; // Unhandled 'error' event`  ⇒ **进程直接死**
+   *
+   * 根因：`McBot extends EventEmitter`，而 **EventEmitter 的语义是"emit('error') 时若没有监听者就 throw"**。
+   *   原来那行 `b.on('error', (e) => this.emit('error', e))` 把 bot 的网络错误转发到 McBot，
+   *   而 McBot 通常**没有 'error' 监听者**（工具是 await 抛错返回、不订阅 error）
+   *   ⇒ 一个"服务器没开"的普通错误把整个宿主带走。
+   *   更早那处（认证阶段）虽然是 `try { this.emit('error', err) } catch {}`，
+   *   但 **try/catch 对 emit 自抛无效**（它就是抛出来的那个异常）—— 假保护。
+   *
+   * 现在的规矩：**任何错误都先进这里**，它保证
+   *   ① 记 `lastError`（工具层据此给出人话）；
+   *   ② 记一行日志（能被 `mc_diag` / 日志看到）；
+   *   ③ **只在真有监听者时才 emit**（数量用 `listenerCount` 判断）—— 没人听就到此为止，绝不 throw；
+   *   ④ 自己再兜一层 try/catch（监听者回调里抛错也不该带走进程）。
+   * @param {unknown} e - 原始错误（socket / 认证 / 被踢…）
+   * @returns {Error} 归一化后的错误（调用方想用就用）
+   */
+  #reportError (e) {
+    const err = e instanceof Error ? e : new Error(String(e?.message ?? e ?? '未知错误'))
+    if (err.message) this.lastError = err.message
+    try { this.log(`连接/运行错误：${err.message}`) } catch { /* 日志失败不致命 */ }
+    try {
+      if (this.listenerCount('error') > 0) this.emit('error', err)
+    } catch (inner) {
+      try { this.log(`error 监听者自身抛错（已吞掉，不影响进程）：${inner?.message ?? inner}`) } catch {}
+    }
+    return err
+  }
+
+  /**
    * 所有直接打给 mineflayer 的 await 都必须过这里。
    * 双重保险：① 监听本轮 turn 的 abort signal（用户按停止 → 立即结算）
    *          ② 本地 deadline（服务端不回 ack → 到点结算）
@@ -657,10 +692,11 @@ export class McBot extends EventEmitter {
           if (p && typeof p.catch === 'function') {
             p.catch((e) => {
               const err = friendlyAuthError(e)
-              this.lastError = err.message
               this.autoReconnect = false            // 认证失败重连多少次都一样，别刷屏
-              this.log(`连接失败（认证/入服阶段）：${err.message}`)
-              try { this.emit('error', err) } catch { /* 没有监听者也无所谓 */ }
+              // 🔴 走统一上报口：老写法是 `this.emit('error', err)` 包在 try/catch 里 ——
+              //    **emit 无监听者时自己就 throw，try/catch 拦不住同一次 emit 抛出的异常**
+              //    （2026-09-17 那次"未处理拒绝把 DSH 干掉"是同一族，这里再堵死一遍）。
+              this.#reportError(err)
             })
           }
         },
@@ -668,7 +704,7 @@ export class McBot extends EventEmitter {
       b._createdAt = Date.now()
 
       let dupe = false
-      b.on('error', (e) => { this.lastError = e.message; this.emit('error', e) })
+      b.on('error', (e) => { this.#reportError(e) })
       b.on('kicked', (r) => {
         const text = typeof r === 'string' ? r : JSON.stringify(r)
         this.lastError = `被踢: ${text.slice(0, 300)}`

@@ -2,6 +2,42 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.5] - 2026-09-18
+
+### 🔴🔴 修复（P0：连一个不存在的服务器会把**整个 DSH 进程搞崩**）
+
+- **现象**（用户实测）：对 AI 说连一个根本没开的服务器（`127.0.0.1:61631`），宿主进程直接死：
+
+  ```
+  Error: connect ECONNREFUSED 127.0.0.1:61631
+  Emitted 'error' event on McBot instance at: src/core.mjs:671
+  node:events:486   throw er; // Unhandled 'error' event
+  ```
+
+  ——**工具报错可以，但绝不能把宿主带走**。
+- **根因**：`McBot extends EventEmitter`，而 **EventEmitter 的语义是「`emit('error')` 时若没有监听者就 throw」**。
+  原来那行把 bot 的网络错误**原样转发**到 McBot 上：
+
+  ```js
+  b.on('error', (e) => { this.lastError = e.message; this.emit('error', e) })   // ❌
+  ```
+
+  而 McBot 通常**没有 `'error'` 监听者**（工具层是 `await` 抛错返回，不订阅 error）
+  ⇒ 一个"服务器没开"这种再普通不过的错误，就把整个进程带走了。
+  另一处（认证阶段）写的是 `try { this.emit('error', err) } catch {}` —— **假保护**：
+  抛出来的就是这次 `emit` 自己，`try/catch` 拦不住它。
+  （与 2026-09-17 那次"未处理 Promise 拒绝 → 宿主 fail-loud `exit(1)`"是同一族：**插件里的错误绝不能漏到宿主**。）
+- **修法**：把"上报错误"收敛成**唯一一个口子** `#reportError(e)`，它保证：
+  1. 记 `lastError`（工具层据此给用户一句人话）；
+  2. 记一行日志（`mc_diag` / 日志能看到）；
+  3. **只在真有监听者时才 `emit`**（`listenerCount('error') > 0`）—— 没人听就到此为止，**绝不 throw**；
+  4. 自己再兜一层 `try/catch`（监听者回调里抛错也不该带走进程）。
+  两处调用点（bot 的 `error` 转发、认证阶段 `connect()` 的 rejection）都改走它。
+- **回归测试**（自检里**真连**一个刚关掉的端口，且**故意不订阅 `'error'`** —— 真实工具路径就是这样）：
+  断言"以普通错误结束"、`lastError` 带得上 `ECONNREFUSED`、并且**走到后面的断言 = 进程没被带走**；
+  另加静态断言：代码里每一处 `this.emit('error')` 都必须带"有监听者才发"的保护
+  （注释里的事故引用不计）。
+
 ## [0.1.4] - 2026-09-18
 
 ### 默认行事准则（`.whale-craft/RULES.md`）第二版：新增「建筑须知」整节

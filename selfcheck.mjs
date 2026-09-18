@@ -1745,6 +1745,43 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     console.log(`  ${/const deliveredRelsFor = \(agent, rels\)/.test(srcIdx) ? '✅' : '❌'} 源码里有"回读会话日志判已投递"（deliveredRelsFor）`)
   }
 
+  /* ⑦d 🔴🔴 2026-09-18 **P0**：连一个不存在的服务器 → `Unhandled 'error' event` → **整个 DSH 进程死**。
+   *    事故原文：`Error: connect ECONNREFUSED 127.0.0.1:61631` / `Emitted 'error' event on McBot instance
+   *    at: src/core.mjs:671` / `node:events:486 throw er; // Unhandled 'error' event`。
+   *    根因：`McBot extends EventEmitter`，而 **emit('error') 没监听者时 EventEmitter 自己就 throw**
+   *    —— 老写法 `b.on('error', e => this.emit('error', e))` 把 bot 的网络错误转发到没人听的 McBot 上。
+   *    另一处 `try { this.emit('error', err) } catch {}` 是**假保护**（抛的就是这次 emit）。
+   *    这里做**真连接**验证（子进程里跑，连一个必然被拒的端口），断言进程不被带走。 */
+  {
+    const { readFileSync: rd } = await import('node:fs')
+    const coreSrc = rd(new URL('./src/core.mjs', import.meta.url), 'utf8')
+    console.log(`  ${/if \(this\.listenerCount\('error'\) > 0\) this\.emit\('error', err\)/.test(coreSrc) ? '✅' : '❌'} 🔴 上报错误前先看有没有监听者（EventEmitter 无监听者时 emit('error') 会直接 throw）`)
+    console.log(`  ${/#reportError \(e\)/.test(coreSrc) ? '✅' : '❌'} 有统一错误上报口 #reportError（lastError + 日志 + 受保护的 emit）`)
+    // 找"代码里"的裸 emit：排除注释（注释里会引用事故原文，那是记录不是代码）
+    const codeOnly = coreSrc.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
+    const bareEmits = (codeOnly.match(/this\.emit\('error'/g) ?? []).length
+    const guarded = (codeOnly.match(/if \(this\.listenerCount\('error'\) > 0\) this\.emit\('error', err\)/g) ?? []).length
+    console.log(`  ${bareEmits === guarded && bareEmits > 0 ? '✅' : '❌'} 🔴 代码里每一处 this.emit('error') 都带"有监听者才发"的保护（emit ${bareEmits} 处 / 受保护 ${guarded} 处）`)
+
+    // 真连接：连一个刚关掉的端口（必然 ECONNREFUSED），**故意不订阅 'error'**（真实工具路径就是这样）
+    const { createServer } = await import('node:net')
+    const probeSrv = createServer()
+    await new Promise((r) => probeSrv.listen(0, '127.0.0.1', r))
+    const deadPort = probeSrv.address().port
+    await new Promise((r) => probeSrv.close(r))
+    const { McBot } = await import('./src/core.mjs')
+    const probeBot = new McBot({ instanceId: 'selftest-refused' })
+    let refusedErr = null
+    try {
+      await probeBot.connect({ host: '127.0.0.1', port: deadPort, version: '1.20.4', auth: { mode: 'offline', name: 'ProbeBot' } })
+    } catch (e) { refusedErr = e }
+    await new Promise((r) => setTimeout(r, 600))     // 给 socket error 冒出来的时间（事故里它是延迟 emit 的）
+    console.log(`  ${refusedErr !== null ? '✅' : '❌'} 连不存在的服务器：以**普通错误**结束（工具能返回给模型）`)
+    console.log(`  ${/ECONNREFUSED|连接|refused|超时/i.test(String(refusedErr?.message ?? '') + String(probeBot.lastError ?? '')) ? '✅' : '❌'} 错误文本能说清（${String(probeBot.lastError ?? refusedErr?.message ?? '').slice(0, 48)}）`)
+    try { probeBot.stop?.('自检结束') } catch { /* 收尾失败无所谓 */ }
+    console.log('  ✅ 🔴 走到这里就说明**进程没被 Unhandled \'error\' 带走**（否则自检当场崩，后面的断言一条都不会跑）')
+  }
+
   /* ⑦b 记忆索引**是活的**：写一条记忆 → 新会话的提示行里必须带上它；删掉就不再出现。
    *    （以前这条测的是 systemPrompt 段的 `text()`；现在同一份文字走提示行，测法一样。） */
   {

@@ -272,7 +272,7 @@ dsh plugin --profile web add link:/path/to/whale-craft
 
 ```bash
 node tools/check-core.mjs     # 全树语法 + 动态 import + 私有字段一致性（改 core.mjs 必跑）
-node selfcheck.mjs            # 680 条离线断言（假 ctx，不需要 MC 服务器、不连网）
+node selfcheck.mjs            # 686 条离线断言（假 ctx，不需要 MC 服务器、不连网）
 # 起一个隔离 DSH 实例验证"整树加载"（需要一份 DSH checkout）：
 DSH_ROOT=/path/to/deepseek-harness node tools/isolate.mjs start
 ```
@@ -348,7 +348,7 @@ read the world and keep notes — and wake itself up when something worth notici
   The HTTP route that serves those files exists **only** in online mode.
 - **Passwords never reach the model** — credentials live in the host credential store; accounts are
   managed from the in-app **MC Settings** dialog.
-- **Offline regression suite** — 680 assertions, no Minecraft server required.
+- **Offline regression suite** — 686 assertions, no Minecraft server required.
 
 ### Install
 
@@ -391,7 +391,7 @@ HTTP responses, or the model context.
 ### Verify offline
 
 ```bash
-node tools/check-core.mjs && node selfcheck.mjs   # 680 assertions, no MC server needed
+node tools/check-core.mjs && node selfcheck.mjs   # 686 assertions, no MC server needed
 ```
 
 CI runs exactly this on Linux (Node 22 and 24) and Windows (Node 22), and packs the tarball on every push.
