@@ -449,8 +449,6 @@ select[data-wc-in]{appearance:none;padding-right:22px;
     const MC_PRESETS_FALLBACK = ['minecraft', 'whale_craft']
     let mcPresetIds = MC_PRESETS_FALLBACK.slice()
     let mcPresetIdsAsked = false
-    /** MC 预设的**显示名**（服务端从各自 preset.yml 读出来给前端）—— 用于读活动芯片上的文字 */
-    let mcPresetNames = ['MC模式']
 
     function loadMcPresetIds() {
       if (mcPresetIdsAsked) return
@@ -462,56 +460,9 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             const list = Array.isArray(j?.mcModePresets) ? j.mcModePresets.map(String).filter(Boolean) : []
             if (list.length) mcPresetIds = list
             else mcPresetIdsAsked = false
-            const names = Array.isArray(j?.mcModePresetNames) ? j.mcModePresetNames.map(String).filter(Boolean) : []
-            if (names.length) mcPresetNames = names
           })
           .catch(() => { mcPresetIdsAsked = false })   // 失败允许下次挂载再试
       } catch { mcPresetIdsAsked = false }
-    }
-
-    /**
-     * **新对话页**（还没连接工作区 ⇒ 还没有会话）的模式芯片**当前显示的文字**。
-     *
-     * 🔴 2026-09-18 真机 bug（"新会话 MC 模式没选工作区还是没有按钮"）：
-     *    没选工作区时**根本没有会话**（会话是"连接工作区"那一刻才建的），芯片只是把选择
-     *    **暂存**在自己内部、没有落到任何会话上（宿主原话："Connecting a workspace either creates
-     *    a blank session or reuses one, and either way the chip's pick predates it"）。
-     *    所以"读会话 projection 里的 preset"这条路在这个组合下**永远读不到** ⇒ 按钮不出现。
-     *    那份暂存状态我们拿不到（在芯片自己的 store 里），但**芯片把它显示出来了** ——
-     *    而我们的锚点 `[data-slot="conversation.hero.agentPreset"]` 正是那个芯片的壳，
-     *    所以直接读它的文字，跟服务端给的 MC 预设**显示名**比对。
-     *    只在新会话页、且会话数据读不到时用作兜底；读到会话时仍以会话为准。
-     */
-    const chipPresetIsMc = () => {
-      try {
-        const anchor = document.querySelector(HERO_CHIP_ANCHOR)
-        const text = (anchor?.textContent ?? '').trim()
-        if (!text) return null
-        return mcPresetNames.some((n) => n && text.includes(n)) ? true : null
-      } catch { return null }
-    }
-
-    /** 芯片文字（新会话页兜底门控）—— 只在需要时订阅它的变化 */
-    function useChipMcStrip(props, enabled) {
-      const sessionId = props?.sessionId ?? props?.session?.id
-      const [mc, setMc] = React.useState(null)
-      React.useEffect(() => {
-        if (!enabled || sessionId) { setMc(null); return undefined }
-        loadMcPresetIds()
-        let alive = true
-        const read = () => { if (alive) setMc(chipPresetIsMc()) }
-        read()
-        let observer = null
-        try {
-          const anchor = document.querySelector(HERO_CHIP_ANCHOR)
-          if (anchor && typeof MutationObserver === 'function') {
-            observer = new MutationObserver(read)
-            observer.observe(anchor, { childList: true, subtree: true, characterData: true })
-          }
-        } catch { /* 订阅失败就只读一次 */ }
-        return () => { alive = false; try { observer?.disconnect() } catch {} }
-      }, [enabled, sessionId])
-      return mc
     }
 
     /**
@@ -575,9 +526,6 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       }, [needServer, sessionId])
 
       const localShow = known && blank === wantBlank && mcPresetIds.includes(preset)
-      // 🔴 新对话页兜底：还没连接工作区 ⇒ 没有会话 ⇒ `known` 为假，但芯片上**已经显示**了你选的名字。
-      //    读它（见 useChipMcStrip / chipPresetIsMc）。
-      const chipMc = useChipMcStrip(props, wantBlank && !known)
 
       /**
        * 🔴 2026-09-16 用户："没有选中工作区，则拒绝发起 MC 模式会话和设置。"
@@ -592,8 +540,6 @@ select[data-wc-in]{appearance:none;padding-right:22px;
        */
       if (localShow) return true
       if (known) return false
-      // 🔴 新对话页（没连接工作区 ⇒ 没有会话）：以**芯片上显示的预设名**为准。
-      if (wantBlank && chipMc === true) return true
       return !wantBlank && serverMode === true
     }
 

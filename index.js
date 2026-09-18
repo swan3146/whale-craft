@@ -836,34 +836,9 @@ export function apply(ctx, config) {
 
     /* 前端**门控**要的那份名单（哪些 preset 算 MC 模式）：极小、只读、不需要 sessionId / 工作区。
      * 绝不能挂在 `settingsGate` 后面 —— 否则浏览器拿不到名单就静默退回兜底值，
-     * 按钮显示与否会和服务端口径不一致（2026-09-16 自查出来的自伤）。
-     *
-     * 🔴 2026-09-18 追加 `mcModePresetNames`：**显示名**。
-     *    为什么需要：**没选工作区时根本没有会话**（会话是"连接工作区"那一刻才建的），
-     *    而新对话页的模式芯片此时只是把选择**暂存**在自己内部、没有落到任何会话的 projection 上
-     *    （宿主原话："Connecting a workspace either creates a blank session or reuses one,
-     *     and either way the chip's pick predates it"）。所以"读会话 preset"这条路在
-     *    "新对话页 + 没选工作区"这个组合下**永远读不到** ⇒ 「MC设置」按钮不出现。
-     *    我们拿不到那份暂存状态（它在芯片自己的 store 里），但**芯片把它显示出来了** ——
-     *    于是前端改为读**芯片上的文字**并与这份显示名比对（见 client.js 的 chipPresetName）。 */
+     * 按钮显示与否会和服务端口径不一致（2026-09-16 自查出来的自伤）。 */
     if (path === '/api/mc/presets' && req.method === 'GET') {
-      const mcIds = pluginConfig.mcModePresets
-      const names = []
-      for (const id of mcIds) {
-        let nm = null
-        try {
-          const dir = mcPresetDir(agentPresetsSvc, id)
-          if (dir) {
-            const yml = join(dir, 'preset.yml')
-            if (existsSync(yml)) {
-              const m = /^\s*name:\s*(.+?)\s*$/m.exec(readFileSync(yml, 'utf8'))
-              if (m) nm = m[1].replace(/^['"]|['"]$/g, '').trim() || null
-            }
-          }
-        } catch { /* 读不到就用 id 兜底 */ }
-        names.push(nm ?? id)   // 没写 name 时宿主也退回 id
-      }
-      return ok({ mcModePresets: mcIds, mcModePresetNames: names })
+      return ok({ mcModePresets: pluginConfig.mcModePresets })
     }
 
     /**
