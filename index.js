@@ -1155,7 +1155,7 @@ export function apply(ctx, config) {
           const cwd = workspaceOf(agent)
           const root = cwd ? memoryRootFor(cwd) : null
           const cur = root ? readAgentsMd(root) : { path: null, source: null, text: '' }
-          const sent = (agent && noticesSent.get(agent)) ?? []
+          const sent = sentNoticeRels(agent)
           diag = {
             reason,
             workspace: cwd,
@@ -2457,15 +2457,15 @@ export function apply(ctx, config) {
    * 我们注册的 context 段会在组装时被**整个丢掉** —— 症状正是"设置页显示正常、AI 却什么都没收到"。
    *
    * 所以注入**只剩一条通道**：学宿主注入工作区 `AGENTS.md` 的做法，把内容当**插件提示行**
-   * 投进 `agent.inbox.nextStep`（见 `injectAgentsMdNotices`）—— 必达、在对话里看得见、
-   * 而且完全不过 systemPrompt 组装，任何 persona 都压不掉它。记忆索引（`.whale-craft/README.md`）
-   * 也走同一条路。
+   * 投进 `agent.inbox.nextStep`（见 `reconcileNotices`，在 `agent/pre-step` 里对账投递）——
+   * 必达、在对话里看得见、而且完全不过 systemPrompt 组装，任何 persona 都压不掉它。
+   * 记忆索引（`.whale-craft/README.md`）也走同一条路。
    */
 
   /* 🔴 这里原来有一段"给每个 agent 注册两个 systemPrompt 段（记忆索引 + 模式指导）"的代码，
    * 2026-09-16 用户要求**整段删掉**："系统提示词不用显式注入，设置好了会自动注入" ——
    * 插件自己往系统提示里塞东西既冗余，又会被 persona 的 complete/includeRuntimeContext 压掉
-   * （见上一段）。记忆索引与模式相关的话现在都走 `injectAgentsMdNotices()` 的插件提示行。 */
+   * （见上一段）。记忆索引与模式相关的话现在都走 `reconcileNotices()` 的插件提示行。 */
 
   /**
    * 行事准则文件缺了就补一份默认。
@@ -2515,11 +2515,57 @@ export function apply(ctx, config) {
     createUserMessage = typeof mod?.createUserMessage === 'function' ? mod.createUserMessage : null
   } catch { createUserMessage = null }
 
-  /** agent → 实际投出去的文件（给 /api/mc/mode 与设置页报**真实投递**，不是"我们打算投"） */
-  const noticesSent = new WeakMap()
+  /**
+   * 提示词投递台账（agent → 状态）。
+   *
+   * 🔴 2026-09-18 改挂载点（用户："应该切换到正确的挂载点……而是在对话开始后设置工具/注入提示词"）：
+   *    **投递时机从"会话开始/切模式那一刻"搬到"每个请求组装之前"**（`agent/pre-step`）。
+   *    台账因此按 **preset** 记账：`fp` 记"这批提示词是给哪个模式投的"，切模式就作废重投。
+   *
+   * 字段：`sessionId` · `fp`（mode/版本指纹）· `rel`（已投的文件名）· `items`（那一刻的正文，用于比对增量）
+   */
+  const noticeLedger = new WeakMap()
+  const ledgerOf = (agent) => {
+    let l = noticeLedger.get(agent)
+    if (!l) { l = { sessionId: null, fp: null, rel: [], items: new Map() }; noticeLedger.set(agent, l) }
+    if (l.sessionId !== (agent?.id ?? null)) { l.sessionId = agent?.id ?? null; l.fp = null; l.rel = []; l.items = new Map() }
+    return l
+  }
 
   /** 这条待投递消息是不是**我们**（whale_craft）投的插件提示行 */
   const isOurNotice = (m) => String(m?.source?.plugin ?? '') === 'whale_craft' && m?.source?.form === 'notice'
+
+  /** 提示行正文里"它出自哪个文件"（首行 `Instructions from: <rel>`），取不到就 null */
+  const noticeRelOf = (m) => {
+    try {
+      const text = (m?.content ?? []).map((c) => c?.text ?? '').join('')
+      const m2 = /^Instructions from:\s*(\S+)/m.exec(text)
+      return m2 ? m2[1] : null
+    } catch { return null }
+  }
+
+  /**
+   * 从**会话日志**里读"这个 preset 下我们已经投过哪些文件"。
+   *
+   * 为什么必须读日志：台账是**进程内**的（WeakMap），宿主重启 / 插件重载就没了，
+   * 而会话日志是持久的 —— 一个已经投过提示词的 MC 会话在重启后 resume，
+   * 只看台账就会**再投一遍**（重复注入）。`snapshotEvents()` 在真机上可用，
+   * 拿不到就退化成"只信台账"（不抛错，绝不让诊断路径把 turn 弄挂）。
+   */
+  const deliveredRelsFor = (agent, rels) => {
+    const out = new Set()
+    try {
+      const events = Array.isArray(agent?.session?.snapshotEvents?.()) ? agent.session.snapshotEvents() : []
+      for (const ev of events) {
+        if (ev?.type !== 'user/message') continue
+        const m = ev.data
+        if (!isOurNotice(m)) continue
+        const text = (m.content ?? []).map((c) => c?.text ?? '').join('')
+        for (const rel of rels) if (rel && text.includes(rel)) out.add(rel)
+      }
+    } catch { /* 读不到日志就只信台账 */ }
+    return out
+  }
 
   /**
    * 把一条插件提示行放进会话的"待投递"队列。
@@ -2533,25 +2579,20 @@ export function apply(ctx, config) {
   }
 
   /**
-   * **撤回**本插件投出去的提示行（切出 MC 模式时必须做）。
+   * **清掉还没投递的**本插件提示行（切出 MC 模式时用）。
    *
-   * 🔴 2026-09-17 真机事故（用户："开到 mc 模式再开回去标准，居然注入了 mc 模式提示词"）：
-   *    提示行是**队列式**投递的 —— 切到 MC 模式时把三条（行事准则 / 版本提示 / 记忆索引）放进
-   *    `inbox.nextStep`，**到下一条消息进来时才真正投递**。所以"切到 MC模式 → 一句话没发 → 切回标准模式"
-   *    的会话，那三条还躺在队列里等着，用户一开口就注进了一个**标准模式**会话。
-   *    真机复现 `session-55d48701`：04:51 切 minecraft（只入队）、06:34 切回 standard，之后第一轮
-   *    才投递 → 标准模式会话里出现了 MC 行事准则。
-   *
-   * 处理分两种：
-   *   ① **还在队列里** → 直接从 `inbox.nextStep` 删掉（用户遇到的就是这种，删了就干净）。
-   *   ② **已经进了对话历史** → 摘不掉；补一条**一行作废声明**，明确告诉模型那几条不再适用。
-   * 最后清掉 `noticesSent` 去重标记 → 再切回 MC 模式会重新投递。
+   * 🔴 2026-09-18 变简单了（挂载点搬到 `agent/pre-step` 之后）：
+   *    以前提示词是"会话开始/切到 MC 模式那一刻"就入队，而模式允许在**空白期**继续改，
+   *    于是"切 MC → 一句话没发 → 切回标准"会把 MC 提示词留在一个标准模式会话里
+   *    （真机 `session-be2e43d7`：seq 3 切 MC、seq 4 切回标准、seq 7 三条提示词还在队列里等着）。
+   *    现在**只在请求组装前现场判定并投递**（见 reconcileNotices）：不是 MC 模式就一条都不投，
+   *    所以那种串模式**从根上不可能发生**，也**不再需要**补一条"MC 行事准则作废"声明去圆场。
+   * 这里只负责把队列里可能残留的自家提示行摘干净（幂等；本模式重新进入时会照常重投）。
    * @param agent - 宿主 Agent
-   * @returns {{removed: number, delivered: boolean}} 撤回条数 / 是否"已经投递过"（需要作废声明）
+   * @returns {{removed: number, delivered: boolean}} 摘掉的条数 / 之前是否真的投递过
    */
   const withdrawAgentsMdNotices = (agent) => {
     const inbox = agent?.inbox
-    const recorded = noticesSent.get(agent)
     let removed = 0
     if (inbox && Array.isArray(inbox.nextStep)) {
       for (const m of [...inbox.nextStep]) {
@@ -2560,39 +2601,53 @@ export function apply(ctx, config) {
           if (typeof inbox.remove === 'function' && m?.id !== undefined && inbox.remove(m.id) === true) { removed++; continue }
           const i = inbox.nextStep.indexOf(m)
           if (i >= 0) { inbox.nextStep.splice(i, 1); removed++ }
-        } catch (e) { logLine(`撤回待投递提示行失败：${e?.message ?? e}`) }
+        } catch (e) { logLine(`清掉待投递提示行失败：${e?.message ?? e}`) }
       }
     }
-    const delivered = removed === 0 && Array.isArray(recorded) && recorded.length > 0
-    noticesSent.delete(agent)
-    if (delivered) {
-      // 已经进对话的摘不掉 —— 补一行"作废"，否则模型会继续按 MC 行事准则办事
-      try {
-        const ok = pushNotice(inbox ?? {}, createUserMessage({
-          content: [{ type: 'text', text: 'Instructions from: whale_craft@' + PLUGIN_VERSION + '\n\n'
-            + '本会话已**退出 MC 模式**（preset 已切走）：上面那条「Whale Craft 行事准则」、版本提示与记忆索引'
-            + '**自此刻起作废**，请按本会话当前的模式（普通模式）行事。' }],
-          source: { kind: 'plugin', plugin: 'whale_craft', form: 'notice', summary: '已退出 MC 模式：MC 行事准则作废' },
-        }))
-        if (!ok) logLine('退出 MC 模式：作废声明没能投出去（没有可用的 inbox）')
-      } catch (e) { logLine(`退出 MC 模式：作废声明投递失败：${e?.message ?? e}`) }
+    // 🔴 真事故（自检逮到）：清了队列就必须**同时把台账里的 rel 抹掉**。
+    //    否则"切回普通模式（清队列）→ 再切回 MC 模式"时，台账还以为投过了 ⇒ **永远不再投**，
+    //    典型症状就是"提示词莫名其妙没了"。队列里还没被 claim 的，本来就不算投过。
+    if (removed > 0) {
+      const l = ledgerOf(agent)
+      l.rel = []
+      l.items = new Map()
     }
+    // 队列本来就干净 ⇒ 说明那几条**已经进过对话**（载入时从日志认出来的）
+    const delivered = removed === 0 && Boolean(ledgerOf(agent).fp)
     if (removed || delivered) {
-      logLine(`已退出 MC 模式：撤回待投递提示行 ${removed} 条${delivered ? '，并补发 1 条"MC 行事准则作废"声明（那几条已经进过对话）' : ''}`)
+      logLine(`已退出 MC 模式：清掉待投递提示行 ${removed} 条${delivered ? '（之前投过的那几条仍在对话历史里）' : ''}`)
     }
     return { removed, delivered }
   }
 
-  const injectAgentsMdNotices = (agent) => {
-    if (!agent || noticesSent.has(agent)) return false
-    if (!agent.ctx || !isMcModeAgent(agent)) return false
+  /**
+   * **每个请求组装之前对账一次**：现在是 MC 模式 + 这个模式还没投过 → 投三条插件提示行。
+   *
+   * 🔴 2026-09-18 改挂载点（用户："应该切换到正确的挂载点"）。挂在这里而不是"会话开始/切模式那一刻"，
+   *    是因为**模式的最终值在第一次请求之前仍然可能变**（宿主允许空白期反复切 preset：
+   *    `agent-presets/src/index.ts:709-728`，真机 `session-be2e43d7` 就是 seq3 切 MC、seq4 切回标准），
+   *    而"发给 LLM 之前"这一刻才是模式已经定下来的时刻。
+   *    宿主自己的同类特性也挂在这条瀑布上（`context/agent-instructions` 在 `agent/pre-step` 里同步上下文）。
+   *
+   * 幂等靠两件事：① 台账按 **preset 指纹**记账（`rel` 已有就不重复投）；
+   * ② 队列里已经有同名提示行也不重复投（宿主可能还没把它们领走）。
+   * @param agent - 宿主 Agent
+   * @returns {{delivered: boolean, queued: number, reason?: string}}
+   */
+  const reconcileNotices = (agent) => {
+    if (!agent?.ctx) return { delivered: false, queued: 0, reason: 'no-agent' }
+    if (!isMcModeAgent(agent)) return { delivered: false, queued: 0, reason: 'not-mc-mode' }
     const cwd = workspaceOf(agent)
-    if (!cwd) return false
+    if (!cwd) return { delivered: false, queued: 0, reason: 'no-workspace' }
     const inbox = agent.inbox
-    if (!inbox || !Array.isArray(inbox.nextStep) || !createUserMessage) {
-      logLine('提示词投递：宿主没有 inbox.nextStep 或拿不到 createUserMessage → 这次投不出去')
-      return false
+    if (!inbox || !Array.isArray(inbox.nextStep)) return { delivered: false, queued: 0, reason: 'no-inbox' }
+    if (!createUserMessage) {
+      // 🔴 本条以前是**静默失败**：拿不到构造函数就 return false，日志之外没有任何提示
+      //    ⇒ 真机上表现成"工具都好使、提示词一条都没有"，还查不出原因。
+      logLine('提示词投递**做不到**：拿不到宿主的 createUserMessage（@deepseek-ai/dsh-llm 解析失败）—— 请把这条报给维护者')
+      return { delivered: false, queued: 0, reason: 'no-createUserMessage' }
     }
+
     // 顺序：**先工作区，再我们自己的**（用户指定）
     const items = []
     if (pluginConfig.get('injectWorkspaceAgentsMd') === true) {
@@ -2625,9 +2680,45 @@ export function apply(ctx, config) {
       const idx = memoryIndexText(memoryFor(cwd)).trim()
       if (idx) items.push({ rel: '.whale-craft/README.md', title: '提示词注入：.whale-craft/README.md', text: idx })
     }
-    if (!items.length) return false
-    let sent = 0
+    if (!items.length) return { delivered: false, queued: 0, reason: 'no-items' }
+
+    const ledger = ledgerOf(agent)
+    const preset = lastPresetSeen.get(agent) ?? String(agent?.ctx ? '' : '')
+    const fp = `${preset}|${PLUGIN_VERSION}`
+    if (ledger.fp !== fp) { ledger.fp = fp; ledger.rel = []; ledger.items = new Map() }
+
+    const delivered = deliveredRelsFor(agent, items.map((i) => i.rel))
+    // 队列里**已经排着的**同名提示行：不重复入队；只有当正文变了（RULES 被编辑 / 记忆索引更新 /
+    // 插件版本换了）才**就地替换**那一条 —— 否则模型会同时看到新旧两份，老的还排在前面。
+    const queuedByRel = new Map()
+    for (const m of inbox.nextStep.filter(isOurNotice)) {
+      const rel = noticeRelOf(m)
+      if (rel && !queuedByRel.has(rel)) queuedByRel.set(rel, m)
+    }
+    const rels = new Set([...ledger.rel, ...delivered])
+    const todo = []
     for (const it of items) {
+      if (rels.has(it.rel)) continue
+      const queued = queuedByRel.get(it.rel)
+      if (queued === undefined) { todo.push(it); continue }
+      const oldText = (queued.content ?? []).map((c) => c?.text ?? '').join('')
+      if (oldText === `Instructions from: ${it.rel}\n\n${it.text}`) continue
+      try {
+        if (typeof inbox.replace === 'function' && queued.id !== undefined
+          && inbox.replace(queued.id, createUserMessage({
+            content: [{ type: 'text', text: `Instructions from: ${it.rel}\n\n${it.text}` }],
+            source: { kind: 'plugin', plugin: 'whale_craft', form: 'notice', summary: it.title },
+          })) === true) {
+          logLine(`提示词内容已变，就地替换队列里的那一条：${it.rel}`)
+          continue
+        }
+      } catch (e) { logLine(`替换待投递提示行失败（${it.rel}）：${e?.message ?? e}`) }
+      todo.push(it)
+    }
+    if (!todo.length) return { delivered: false, queued: queuedByRel.size }
+
+    let sent = 0
+    for (const it of todo) {
       try {
         // 正文首行照 DSH 原生的形状写相对路径 → AI 也知道这段话出自哪个文件
         const msg = createUserMessage({
@@ -2635,14 +2726,15 @@ export function apply(ctx, config) {
           source: { kind: 'plugin', plugin: 'whale_craft', form: 'notice', summary: it.title },
         })
         if (!pushNotice(inbox, msg)) throw new Error('inbox 既没有 append 也没有 nextStep')
+        ledger.items.set(it.rel, it.text)
         sent++
       } catch (e) { logLine(`提示词投递失败（${it.rel}）：${e?.message ?? e}`) }
     }
     if (sent) {
-      noticesSent.set(agent, items.map((i) => i.rel))
-      logLine(`提示词已投递 ${sent} 条（插件提示行，非用户发言）：${items.map((i) => i.rel).join(' → ')}`)
+      ledger.rel = items.filter((i) => ledger.items.has(i.rel)).map((i) => i.rel)
+      logLine(`提示词已投递 ${sent} 条（请求组装前对账；插件提示行，非用户发言）：${items.map((i) => i.rel).join(' → ')}`)
     }
-    return sent > 0
+    return { delivered: sent > 0, queued: queuedByRel.size + sent }
   }
 
   /**
@@ -2677,11 +2769,33 @@ export function apply(ctx, config) {
   }
 
   /**
+   * 这个会话**已经投出去**的提示行文件名（诊断/UI 用）。
+   *
+   * 来源两处，缺一不可：① 进程内台账（`ledgerOf`，按 preset 记账）；
+   * ② **会话日志回读** —— 台账是进程内的，宿主重启/插件重载就没了，只信台账会漏报
+   *    （用户会看到"没投递"，而 AI 其实早就收到了）。
+   */
+  const sentNoticeRels = (agent) => {
+    if (!agent) return []
+    const out = new Set(ledgerOf(agent).rel)
+    for (const rel of deliveredRelsFor(agent, noticeRelCandidates())) out.add(rel)
+    return [...out]
+  }
+
+  /** 所有可能被投递的文件名（回读日志时用来匹配） */
+  const noticeRelCandidates = () => [
+    'AGENTS.md',
+    '.whale-craft/RULES.md',
+    '.whale-craft/README.md',
+    versionPromptSource(PLUGIN_VERSION),
+  ]
+
+  /**
    * **提示词注入状态**（给 UI / `mc_diag` 看）：每条各自"投出去了没有、为什么没有"。
    *
    * 2026-09-16 加：用户在真机上反复报"没有任何我们的提示词"，而这件事**极难从外面判断**
    * （是没进 MC 模式？开关关了？文件不在？投递失败？）。与其让人猜，不如把判据摆出来：
-   * `segments` 报**实际投递**（`noticesSent` 里真有的文件名），`notes` 是人话版原因。
+   * `segments` 报**实际投递**（台账 + 会话日志回读），`notes` 是人话版原因。
    */
   const promptInjectionStatus = (agent) => {
     const cwd = workspaceOf(agent)
@@ -2700,7 +2814,7 @@ export function apply(ctx, config) {
     //    ⚠️ 现在我们的提示词走**插件提示行**（inbox.nextStep），**不受它影响** —— 这条只作为
     //    "preset 还没被修好"的提示留着（它仍会压掉宿主自己的运行期上下文）。
     const personaSuppresses = Boolean(refreshMcPresetDiag()?.complete || mcPresetDiag?.runtimeContextSuppressed)
-    const sent = (agent && noticesSent.get(agent)) ?? []
+    const sent = sentNoticeRels(agent)
     return {
       mcMode,
       presetId,
@@ -2740,7 +2854,7 @@ export function apply(ctx, config) {
         ...(agent ? [] : ['拿不到当前会话（没有 agent 上下文）']),
         ...(agent && !cwd ? ['这个会话没有选中工作区 → 提示词没地方放，插件不会投递'] : []),
         ...(agent && cwd && !mcMode ? [`这个会话不是 MC 模式（preset=${presetId ?? '未知'} 不在 mcModePresets 里）→ 不投递`] : []),
-        ...(mcMode && !noticesSent.has(agent) ? ['还没到投递时机（提示词在会话开始/切到 MC 模式时投一次）'] : []),
+        ...(mcMode && sent.length === 0 ? ['还没到投递时机（提示词在**发起请求之前**现场判定并投递；这个会话还没发过消息）'] : []),
         ...(mcMode && !injectWc ? ['「注入本提示词」是关的'] : []),
         ...(mcMode && !injectWs ? ['「注入工作区 AGENTS.md」是关的'] : []),
         ...(mcMode && injectWs && !wsExists ? ['工作区根目录里没有 AGENTS.md 这个文件'] : []),
@@ -3221,13 +3335,10 @@ export function apply(ctx, config) {
     mcPolicyApplied.add(agent)
     if (agent.id) mcModeAgentIds.add(String(agent.id))
     ensureMemoryRoot(agent)        // ← 首次发起 MC 模式会话 = 建 `.whale-craft/`（README / RULES.md）的时机
-    // 🔴 把提示词**当消息投递**（学宿主注入 AGENTS.md 的做法）—— 必达、且在对话里看得见
-    try { injectAgentsMdNotices(agent) } catch (e) { logLine(`提示词投递失败：${e?.message ?? e}`) }
-
-    // 🔴 提示词只有这一条通道：`injectAgentsMdNotices` 把 RULES.md（+工作区 AGENTS.md）/ 版本提示 / 记忆索引当**插件提示行**投出去。
-    //    **不注册任何 systemPrompt 段**（用户 2026-09-16 要求：那既冗余、又会被 persona 的
-    //    complete/includeRuntimeContext 压掉）。这里只做"命令式"的部分：工具可见性 + guard。
-    logLine(`MC 模式生效（preset=${lastPresetSeen.get(agent) ?? '?'}，${agent.id}）`)
+    // 🔴 2026-09-18：**这里不再投提示词**。投递搬到"每个请求组装之前"（`agent/pre-step` → `reconcileNotices`），
+    //    因为模式在第一次请求之前还可能被改（宿主允许空白期反复切 preset）。
+    //    这条日志只是"模式已生效"的标记；真投出去时 `reconcileNotices` 自己会记一行。
+    logLine(`MC 模式生效（preset=${lastPresetSeen.get(agent) ?? '?'}，${agent.id}）提示词将在首次请求组装前投递`)
 
     // ② 工具可见性：**白名单**（用户 2026-09-16 真机投诉："这个 agent 怎么还能用 pwsh！不是只暴露我们指定的工具吗！"）
     //
@@ -3406,6 +3517,26 @@ export function apply(ctx, config) {
         touch(safeAgentById(sessionId))
       }))
     } catch { /* 老宿主没有这个事件 */ }
+
+    /* 🔴🔴 2026-09-18 **提示词的挂载点**（用户："应该切换到正确的挂载点……而是在对话开始后设置
+     *    工具/注入提示词"）。宿主给的时序是：`agent/created`（setup 完成 = preset 已 mount）
+     *    → `agent/session-start` → **首次请求组装**，而 `agent/pre-step` 正是"消息已经被领走、
+     *    系统提示词已经装好、这个 step 马上要发给模型"的那条**瀑布**
+     *    （`core/agent-loop/src/agent.ts:240-258`；宿主自己的 `agent-instructions` 也挂在这条上同步上下文）。
+     *
+     *    为什么必须是这里：**模式在第一次请求之前仍然可能改** —— 宿主只禁止"已经跑过一轮"之后切换
+     *    （`agent-presets/src/index.ts:709-728`，抛 `agent-preset/locked`），空白期可以反复切
+     *    （真机 `session-be2e43d7`：seq3 切 MC、seq4 切回 standard）。在 `agent/created` 入队就会
+     *    "按当时的模式投一份、之后模式变了而它已经排上队" —— 那正是"标准模式会话里冒出 MC 提示词"。
+     *    挂在这里 ⇒ 投出去的每一份都是"**发起请求那一刻**这个会话真正在用的模式"，串模式从根上不可能。
+     *
+     *    幂等与去重见 `reconcileNotices`（按 preset 记账 + 会话日志回读 + 队列同名检查）。
+     *    失败只记日志**不抛**（`agent/pre-step` 的监听器抛错会带崩这一轮）。 */
+    try {
+      handlers.push(ctx.on('agent/pre-step', ({ agent } = {}) => {
+        try { reconcileNotices(agent) } catch (e) { logLine(`提示词对账失败（不打断本轮）：${e?.message ?? e}`) }
+      }))
+    } catch { /* 老宿主没有这条瀑布 */ }
     return () => { for (const off of handlers) { try { off?.() } catch {} } }
   }, 'whale_craft: mc-mode policy')
 
