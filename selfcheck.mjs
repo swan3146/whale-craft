@@ -2853,7 +2853,12 @@ console.log('\n--- 客户端 bundle（client.js 静态检查）---')
     ['「提示词」页显示注入状态（会不会注入 + 为什么不会）', /data-wc-injectstatus/.test(code) && /injectStatus\?\.segments/.test(code) && /data-wc-note/.test(code)],
     ['服务端兜底只给标题条且带重试（不是一次性请求）', /const needServer = !known && !wantBlank/.test(code) && /\+\+tries < 20/.test(code) && /setTimeout\(tick, 3000\)/.test(code)],
     ['名单来自 /api/mc/presets 的 mcModePresets（带默认值兜底）', /mcModePresets/.test(code) && /MC_PRESETS_FALLBACK/.test(code)],
-    ['/api/mc/presets 不带闸门（门控名单不能被"没工作区"挡住）', /path === '\/api\/mc\/presets'[\s\S]{0,220}return ok\(\{ mcModePresets/.test(readFileSync(new URL('./index.js', import.meta.url), 'utf8'))],
+    ['/api/mc/presets 不带闸门（门控名单不能被"没工作区"挡住）', /path === '\/api\/mc\/presets'[\s\S]{0,4000}?return ok\(\{ mcModePresets/.test(readFileSync(new URL('./index.js', import.meta.url), 'utf8'))],
+    // 🔴 2026-09-18：新对话页 + 没选工作区时**根本没有会话**（会话是"连接工作区"那一刻才建的），
+    //    芯片的选择只是暂存在它自己内部 ⇒ 读会话 projection 永远读不到 ⇒ 按钮不出现。
+    //    所以把 MC 预设的**显示名**也发给前端，由前端读**芯片上的文字**兜底。
+    ['/api/mc/presets 连 MC 预设的显示名一起给（新对话页读芯片文字用）', /mcModePresetNames/.test(readFileSync(new URL('./index.js', import.meta.url), 'utf8'))],
+    ['前端有"读芯片文字"的新对话页兜底', /const chipPresetIsMc = \(\) =>/.test(code) && /function useChipMcStrip\(props, enabled\)/.test(code) && /if \(wantBlank && chipMc === true\) return true/.test(code)],
     ['判不了就不渲染（return null）', /if \(!show\) return null/.test(code)],
     ['调用 /api/mc/accounts', src.includes('/api/mc/accounts')],
     ['调用 /api/mc/authservers', src.includes('/api/mc/authservers')],
