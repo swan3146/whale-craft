@@ -1159,15 +1159,6 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   // ① 配置存储本身
   const { PluginConfig, pickPresetTarget, pickPresetSource, isCopiedPresetDescription } = await import('./src/config.mjs')
 
-  // 这一节要报"当前环境解析不解析得到宿主的 dsh-llm"（就是别人机器上那次事故的判据）
-  const hasHostCreateUserMessage = await (async () => {
-    try {
-      const { createRequire } = await import('node:module')
-      const req = createRequire(new URL('./index.js', import.meta.url))
-      return typeof req('@deepseek-ai/dsh-llm')?.createUserMessage === 'function'
-    } catch { return false }
-  })()
-
   /* 🔴 2026-09-16 用户定：**没有 MC 模式 preset 就自动建一个**。
    * 起因：preset 属于用户的 $DSH_HOME/.agent-presets/，插件不塞目录 → 新机器上没人建过
    * → mcModePresets 一个都匹配不上 → "装了插件也没有 MC模式"。
@@ -1342,10 +1333,16 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     console.log(`  ${/const noticeLedger = new WeakMap\(\)/.test(idx) && /const pushNotice = \(inbox, message\)/.test(idx) ? '✅' : '❌'} 提示词按会话工作区投递到 agent.inbox（每个会话一份，插件不再碰 systemPrompt）`)
   // 🔴🔴 2026-09-18：npm 装的 0.1.3 在**别的机器**上提示词一条都没注入 —— 根因是
   //    `@deepseek-ai/dsh-llm` 没进依赖声明，本机靠 junction 侥幸解析到，别人解析不到 ⇒
-  //    消息构造不出来。这条断言把"自建兜底"钉死，并**报出当前跑的是哪条路**。
-  console.log(`  ${/const fallbackUserMessage = \(input\) => \(\{/.test(idx) && /if \(!createUserMessage\) createUserMessage = fallbackUserMessage/.test(idx) ? '✅' : '❌'} 🔴 拿不到宿主 dsh-llm 时有**自建兜底**（不依赖任何宿主包也能投递提示词）`)
-  console.log(`  ${/role: 'user'/.test(idx) && /source: input\?\.source/.test(idx) && /crypto\.randomUUID/.test(idx) ? '✅' : '❌'} 兜底消息逐个对齐宿主 UserMessage 形状（role/content/source/id）`)
-  console.log(`  ℹ️ 本次跑的是：${hasHostCreateUserMessage ? '宿主 @deepseek-ai/dsh-llm 的 createUserMessage' : '插件自建兜底（环境里没有宿主包 —— 正是 npm 装到别人机器上的情形）'}`)
+  //    消息构造不出来。现在统一走 `src/user-message.mjs`（宿主实现优先 + 自带等价实现兜底）。
+  const umSrc = (await import('node:fs')).readFileSync(new URL('./src/user-message.mjs', import.meta.url), 'utf8')
+  const wdSrc = (await import('node:fs')).readFileSync(new URL('./src/watchdog.mjs', import.meta.url), 'utf8')
+  const { messageFactoryKind } = await import('./src/user-message.mjs')
+  console.log(`  ${/from '\.\/src\/user-message\.mjs'/.test(idx) ? '✅' : '❌'} 🔴 index.js 的消息构造走共用模块 src/user-message.mjs`)
+  console.log(`  ${/export const builtinUserMessage/.test(umSrc) && /export const userMessage/.test(umSrc) ? '✅' : '❌'} 🔴 共用模块里有**自带等价实现**（不依赖任何宿主包也能注入）`)
+  console.log(`  ${/role: 'user'/.test(umSrc) && /source: input\?\.source/.test(umSrc) && /crypto\.randomUUID/.test(umSrc) ? '✅' : '❌'} 兜底消息逐个对齐宿主 UserMessage 形状（role/content/source/id）`)
+  console.log(`  ${/createRequire\(import\.meta\.url\)/.test(umSrc) && /req\('@deepseek-ai\/dsh-llm'\)/.test(umSrc) ? '✅' : '❌'} 仍然优先用宿主实现（形状跟得上宿主版本）`)
+  console.log(`  ${/import \{ userMessage \} from '\.\/user-message\.mjs'/.test(wdSrc) && /userMessage\(\{/.test(wdSrc) ? '✅' : '❌'} 🔴 看门狗（同一次事故的第二处）也用同一个模块，不再退化成"用户来源"消息`)
+  console.log(`  ℹ️ 本次跑的是：${messageFactoryKind() === 'host' ? '宿主 @deepseek-ai/dsh-llm 的 createUserMessage' : '插件自带等价实现（环境里没有宿主包 —— 正是 npm 装到别人机器上的情形）'}`)
     // 🔴 2026-09-18 挂载点：投递必须发生在 **agent/pre-step**（请求组装前），不能退回"会话开始那一刻"
     console.log(`  ${/ctx\.on\('agent\/pre-step'/.test(idx) ? '✅' : '❌'} 🔴 投递挂在 agent/pre-step（宿主"消息已领走 + 系统提示已装好"的那条瀑布）`)
     console.log(`  ${!/applyMcModePolicy[\s\S]{0,900}?injectAgentsMdNotices/.test(idx) ? '✅' : '❌'} applyMcModePolicy 里**不再**投提示词（模式在首次请求前还可能变）`)

@@ -51,7 +51,7 @@
  * ============================================================================
  */
 
-import { createRequire } from 'node:module'
+import { userMessage } from './user-message.mjs'
 
 /** 默认配置。括号里是"为什么默认这样"。 */
 export const WATCH_DEFAULTS = {  /** 进服自动挂载（用户要求：进游戏自动打开） */
@@ -108,20 +108,16 @@ export const WATCH_DEFAULTS = {  /** 进服自动挂载（用户要求：进游�
 /** 深拷贝（配置是嵌套对象，不能共享引用） */
 const clone = (v) => JSON.parse(JSON.stringify(v))
 /**
- * 构造注入用的 message（走宿主同一条路：`@deepseek-ai/dsh-llm` 的 `createUserMessage`）。
+ * 构造注入用的 message（`src/user-message.mjs` 统一提供）。
  *
  * 关键在于 `source`：宿主要求 `ContextFormed`，用 `{kind:'plugin', plugin, form:'notice', summary}`
  * 会被渲染成**折叠的一行摘要**（"One-line account of what happened, shown without expanding
  * the row"），而**不是**用户发言 —— 这正是用户要的"提示词注入而非模拟用户发消息"。
  *
- * 解析不到（换宿主版本等）就置 null，注入时自动退到 sessionController.prompt 兜底。
+ * 🔴 2026-09-18：以前这里是「解析不到 `@deepseek-ai/dsh-llm` 就置 null → 退到
+ *    sessionController.prompt 兜底」，而那条兜底是**用户来源**消息（会在对话里冒充用户说话）。
+ *    现在统一走 `userMessage()`：宿主实现拿不到就用**自带等价实现**，永远轮不到那条兜底。
  */
-let createUserMessage = null
-try {
-  const req = createRequire(import.meta.url)
-  const mod = req('@deepseek-ai/dsh-llm')
-  createUserMessage = typeof mod?.createUserMessage === 'function' ? mod.createUserMessage : null
-} catch { createUserMessage = null }
 
 /** 事件类型 → 中文标签（写进给 AI 的消息里） */
 const LABEL = {
@@ -567,9 +563,9 @@ export class Watchdog {
     //   不是用户发言。summary 就是那一行。
     // ────────────────────────────────────────────────────────────────────────
     const agent = this.agent
-    if (agent && typeof agent.steer === 'function' && createUserMessage) {
+    if (agent && typeof agent.steer === 'function') {
       try {
-        const message = createUserMessage({
+        const message = userMessage({
           content: [{ type: 'text', text }],
           source: {
             kind: 'plugin',
@@ -587,11 +583,13 @@ export class Watchdog {
       }
     }
 
-    // 兜底：拿不到 agent 或拿不到 createUserMessage（少见）时才走 sessionController.prompt。
-    // 注意它必然是**用户来源**消息，且 @Remote 签名要第二个 signal 参数。
+    // 兜底：拿不到 agent（没有 steer）时才走 sessionController.prompt。
+    // 🔴 2026-09-18 起这条**不再因为"拿不到 createUserMessage"而触发** ——
+    //    消息构造已由 `src/user-message.mjs` 保证（宿主实现拿不到就用自带等价实现）。
+    //    注意它必然是**用户来源**消息，且 @Remote 签名要第二个 signal 参数。
     const sc = this.ctx.get('sessionController')
     if (!sc || typeof sc.prompt !== 'function') {
-      this.#record('lifecycle', `无法注入（没有 agent.steer/createUserMessage，也没有 sessionController.prompt）：${text.slice(0, 60)}…`)
+      this.#record('lifecycle', `无法注入（没有 agent.steer，也没有 sessionController.prompt）：${text.slice(0, 60)}…`)
       return
     }
     const label = running ? '运行中→steer' : '空闲→拍一轮'
