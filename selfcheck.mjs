@@ -1159,6 +1159,15 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   // ① 配置存储本身
   const { PluginConfig, pickPresetTarget, pickPresetSource, isCopiedPresetDescription } = await import('./src/config.mjs')
 
+  // 这一节要报"当前环境解析不解析得到宿主的 dsh-llm"（就是别人机器上那次事故的判据）
+  const hasHostCreateUserMessage = await (async () => {
+    try {
+      const { createRequire } = await import('node:module')
+      const req = createRequire(new URL('./index.js', import.meta.url))
+      return typeof req('@deepseek-ai/dsh-llm')?.createUserMessage === 'function'
+    } catch { return false }
+  })()
+
   /* 🔴 2026-09-16 用户定：**没有 MC 模式 preset 就自动建一个**。
    * 起因：preset 属于用户的 $DSH_HOME/.agent-presets/，插件不塞目录 → 新机器上没人建过
    * → mcModePresets 一个都匹配不上 → "装了插件也没有 MC模式"。
@@ -1331,6 +1340,12 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     console.log(`  ${/const workspaceOf = \(agent\) =>/.test(idx) && /agent\?\.session\?\.header\?\.cwd/.test(idx) ? '✅' : '❌'} 工作区取自 exec.agent.session.header.cwd（不再用"插件自己在哪"）`)
     console.log(`  ${/join\(cwd, '\.whale-craft'\)/.test(idx) ? '✅' : '❌'} 记忆根 = <会话工作区>/.whale-craft`)
     console.log(`  ${/const noticeLedger = new WeakMap\(\)/.test(idx) && /const pushNotice = \(inbox, message\)/.test(idx) ? '✅' : '❌'} 提示词按会话工作区投递到 agent.inbox（每个会话一份，插件不再碰 systemPrompt）`)
+  // 🔴🔴 2026-09-18：npm 装的 0.1.3 在**别的机器**上提示词一条都没注入 —— 根因是
+  //    `@deepseek-ai/dsh-llm` 没进依赖声明，本机靠 junction 侥幸解析到，别人解析不到 ⇒
+  //    消息构造不出来。这条断言把"自建兜底"钉死，并**报出当前跑的是哪条路**。
+  console.log(`  ${/const fallbackUserMessage = \(input\) => \(\{/.test(idx) && /if \(!createUserMessage\) createUserMessage = fallbackUserMessage/.test(idx) ? '✅' : '❌'} 🔴 拿不到宿主 dsh-llm 时有**自建兜底**（不依赖任何宿主包也能投递提示词）`)
+  console.log(`  ${/role: 'user'/.test(idx) && /source: input\?\.source/.test(idx) && /crypto\.randomUUID/.test(idx) ? '✅' : '❌'} 兜底消息逐个对齐宿主 UserMessage 形状（role/content/source/id）`)
+  console.log(`  ℹ️ 本次跑的是：${hasHostCreateUserMessage ? '宿主 @deepseek-ai/dsh-llm 的 createUserMessage' : '插件自建兜底（环境里没有宿主包 —— 正是 npm 装到别人机器上的情形）'}`)
     // 🔴 2026-09-18 挂载点：投递必须发生在 **agent/pre-step**（请求组装前），不能退回"会话开始那一刻"
     console.log(`  ${/ctx\.on\('agent\/pre-step'/.test(idx) ? '✅' : '❌'} 🔴 投递挂在 agent/pre-step（宿主"消息已领走 + 系统提示已装好"的那条瀑布）`)
     console.log(`  ${!/applyMcModePolicy[\s\S]{0,900}?injectAgentsMdNotices/.test(idx) ? '✅' : '❌'} applyMcModePolicy 里**不再**投提示词（模式在首次请求前还可能变）`)
@@ -2867,13 +2882,18 @@ console.log('\n--- 依赖面 + 打包完整性（mineflayer 是**依赖**不是"
     ['运行时 vec3 与 mineflayer 解析到**同一个文件**', sameVec3],
     ['解析到的 mineflayer 版本满足声明范围（`^4.37.1` 允许 4.39.0）', !!mfVersion && caretOk(deps.mineflayer, mfVersion)],
     ['sharp 放 optionalDependencies（原生模块装不上也不该让整个安装失败）', typeof opt.sharp === 'string' && deps.sharp === undefined],
-    ['宿主包走 peerDependencies（@deepseek-ai/dsh-tools / schemastery）', typeof peer['@deepseek-ai/dsh-tools'] === 'string' && typeof peer['@deepseek-ai/schemastery'] === 'string'],
-    ['peer 范围写 `*`（npm 上 dsh-tools 只有 0.0.1-rc.1，钉版本号必错）', peer['@deepseek-ai/dsh-tools'] === '*' && peer['@deepseek-ai/schemastery'] === '*'],
+    ['宿主包走 peerDependencies（@deepseek-ai/dsh-llm / dsh-tools / schemastery）', typeof peer['@deepseek-ai/dsh-llm'] === 'string' && typeof peer['@deepseek-ai/dsh-tools'] === 'string' && typeof peer['@deepseek-ai/schemastery'] === 'string'],
+    ['peer 范围写 `*`（npm 上 dsh-tools 只有 0.0.1-rc.1，钉版本号必错）', peer['@deepseek-ai/dsh-llm'] === '*' && peer['@deepseek-ai/dsh-tools'] === '*' && peer['@deepseek-ai/schemastery'] === '*'],
     // 🔴 2026-09-16 第八轮：单纯写成 peer 不够 —— npm/pnpm 会**自动去 npm 装一份** 0.0.1-rc.1，
     //    和宿主那份（本机是源码树的 0.1.5-rc.2）变成**两个 Tool 类**。声明成 optional peer 才不装。
-    ['宿主包是 **optional** peer（否则包管理器会装出第二份 Tool 类）', peerMeta['@deepseek-ai/dsh-tools']?.optional === true && peerMeta['@deepseek-ai/schemastery']?.optional === true],
+    ['宿主包是 **optional** peer（否则包管理器会装出第二份 Tool 类）', peerMeta['@deepseek-ai/dsh-llm']?.optional === true && peerMeta['@deepseek-ai/dsh-tools']?.optional === true && peerMeta['@deepseek-ai/schemastery']?.optional === true],
     // 但本地跑自检/CI 时没有宿主，得靠 devDependencies 顶上（devDeps 不会发给用户）
-    ['devDependencies 里有宿主包（干净环境/CI 里自检才跑得起来）', typeof devDeps['@deepseek-ai/dsh-tools'] === 'string' && typeof devDeps['@deepseek-ai/schemastery'] === 'string'],
+    ['devDependencies 里有宿主包（干净环境/CI 里自检才跑得起来）', typeof devDeps['@deepseek-ai/dsh-llm'] === 'string' && typeof devDeps['@deepseek-ai/dsh-tools'] === 'string' && typeof devDeps['@deepseek-ai/schemastery'] === 'string'],
+    // 🔴🔴 2026-09-18 真机事故（npm 装的 0.1.3 在**别的机器**上提示词一条都没注入）：
+    //    `@deepseek-ai/dsh-llm` 当时**根本没进依赖声明** —— 本机靠 junction 侥幸 require 得到，
+    //    别人的 npm 布局解析不到 ⇒ createUserMessage 为 null ⇒ 提示行一条都建不出来。
+    //    工具白名单/guard 只用 ctx，所以症状精确地是"工具都在、提示词全无"。
+    ['🔴 dsh-llm 在依赖里声明了（就是那次"提示词没注入"的根因）', typeof peer['@deepseek-ai/dsh-llm'] === 'string' && typeof devDeps['@deepseek-ai/dsh-llm'] === 'string'],
   ]
   for (const [label, passed] of checks) console.log(`  ${passed ? '✅' : '❌'} ${label}`)
   if (!mfVersion) console.log('  ⚠️ 依赖没解析到（先 npm install / pnpm install 再跑自检）')

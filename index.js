@@ -2508,12 +2508,43 @@ export function apply(ctx, config) {
    *    · `source` 写死 `{kind:'plugin', plugin:'whale_craft', form:'notice'}` → 插件提示行，不归到用户头上；
    *    · **不做 steer 兜底**（steer 空闲会"起一轮"＝没问就替用户说话）。
    */
+  /**
+   * 造一条"用户角色"的消息（宿主 `UserMessage` 的形状）。
+   *
+   * 🔴🔴 2026-09-18 真机事故（用户在**另一台设备**上 npm 装了 0.1.3）：**提示词一条都没注入**，
+   *    而工具白名单/guard 一切正常。根因在这里：`@deepseek-ai/dsh-llm` **没有写进依赖声明**，
+   *    本机是因为 `node_modules` 里有指向宿主源码树的 junction 才 `require` 得到；
+   *    别人 `npm i` 装出来的插件目录里没有这个包、向上也找不到 ⇒ `req()` 抛错 ⇒
+   *    `createUserMessage` 为 null ⇒ 提示行**一条都建不出来**。
+   *    而工具白名单（`tools.restrict`）+ guard 全靠 ctx，不碰任何宿主包 ——
+   *    于是症状精确地是"**工具都在、提示词全无**"。
+   *
+   * 三道防线：
+   *   ① 依赖声明里补 `@deepseek-ai/dsh-llm`（optional peer + devDependency），让 npm 布局也解析得到；
+   *   ② 这里**自建兜底**：字段与宿主 `createUserMessage` 逐个对齐（role / content / source / id），
+   *      不依赖任何宿主包，也绝不会因为多一份宿主包而出现"两个 UserMessage 类"的问题（它就是纯对象）；
+   *   ③ 解析失败**必须记日志**（不再静默）。
+   */
+  const newMessageId = () => {
+    try { return globalThis.crypto.randomUUID() } catch { /* 老 runtime 走下面 */ }
+    return 'msg-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
+  }
+  const fallbackUserMessage = (input) => ({
+    role: 'user',
+    content: input?.content ?? [],
+    source: input?.source ?? { kind: 'plugin' },
+    id: input?.id ?? newMessageId(),
+  })
   let createUserMessage = null
   try {
     const req = createRequire(import.meta.url)
     const mod = req('@deepseek-ai/dsh-llm')
     createUserMessage = typeof mod?.createUserMessage === 'function' ? mod.createUserMessage : null
-  } catch { createUserMessage = null }
+  } catch (e) {
+    createUserMessage = null
+    logLine(`拿不到 @deepseek-ai/dsh-llm 的 createUserMessage（${e?.code ?? e?.message ?? e}）→ 用插件自带的等价实现兜底（提示词照常注入）`)
+  }
+  if (!createUserMessage) createUserMessage = fallbackUserMessage
 
   /**
    * 提示词投递台账（agent → 状态）。
@@ -2641,12 +2672,8 @@ export function apply(ctx, config) {
     if (!cwd) return { delivered: false, queued: 0, reason: 'no-workspace' }
     const inbox = agent.inbox
     if (!inbox || !Array.isArray(inbox.nextStep)) return { delivered: false, queued: 0, reason: 'no-inbox' }
-    if (!createUserMessage) {
-      // 🔴 本条以前是**静默失败**：拿不到构造函数就 return false，日志之外没有任何提示
-      //    ⇒ 真机上表现成"工具都好使、提示词一条都没有"，还查不出原因。
-      logLine('提示词投递**做不到**：拿不到宿主的 createUserMessage（@deepseek-ai/dsh-llm 解析失败）—— 请把这条报给维护者')
-      return { delivered: false, queued: 0, reason: 'no-createUserMessage' }
-    }
+    // 注：`createUserMessage` 现在**永远有值**（宿主版拿不到就用自带兜底，见上面的说明），
+    //     所以这里不再有"静默失败"的死角。
 
     // 顺序：**先工作区，再我们自己的**（用户指定）
     const items = []
