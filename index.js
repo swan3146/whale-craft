@@ -2874,13 +2874,14 @@ export function apply(ctx, config) {
         'version-prompt': sent.some((r) => String(r).startsWith('whale_craft@')),
         'memory-index': sent.includes('.whale-craft/README.md'),
       },
+      // ⚠️ 这里只留**用户看不出来、又真的影响投递**的原因。
+      //    "还没到投递时机 / 开关是关的" 这种**不用提示**（用户 2026-09-18：多余）——
+      //    上面那行 `本会话注入：…` 已经用 ✓/✗ 摆出来了，而"还没发过消息"本来就是一目了然的状态。
+      //    （前端对 `notes.length === 0` 已经不渲染那一行了，所以全空也没关系。）
       notes: [
         ...(agent ? [] : ['拿不到当前会话（没有 agent 上下文）']),
         ...(agent && !cwd ? ['这个会话没有选中工作区 → 提示词没地方放，插件不会投递'] : []),
         ...(agent && cwd && !mcMode ? [`这个会话不是 MC 模式（preset=${presetId ?? '未知'} 不在 mcModePresets 里）→ 不投递`] : []),
-        ...(mcMode && sent.length === 0 ? ['还没到投递时机（提示词在**发起请求之前**现场判定并投递；这个会话还没发过消息）'] : []),
-        ...(mcMode && !injectWc ? ['「注入本提示词」是关的'] : []),
-        ...(mcMode && !injectWs ? ['「注入工作区 AGENTS.md」是关的'] : []),
         ...(mcMode && injectWs && !wsExists ? ['工作区根目录里没有 AGENTS.md 这个文件'] : []),
         ...(personaSuppresses ? ['⚠️ preset 的 persona 还带着 complete / includeRuntimeContext:false（会压掉宿主自己的运行期上下文；我们的提示走插件提示行不受影响。重启 DSH 后本插件会自动修这个 preset）'] : []),
       ],
