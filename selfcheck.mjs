@@ -2064,15 +2064,22 @@ console.log('\n--- 行事准则 RULES.md / 新开关 / 边界信息 ---')
   console.log(`  ${!/mc-servers\.md/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 默认准则不再指路 .agent-docs/mc-servers.md（那里曾有明文密码）`)
   console.log(`  ${!/authPass|authUrl|authUser/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 默认准则不含已删除的 mc_connect 凭据参数`)
   console.log(`  ${/MC设置/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 默认准则教它把用户引导到「MC设置」`)
-  // 🔴 2026-09-18 第四版（用户给的全文）：新增「建筑须知」整节 —— 这是这一版最实质的增补。
+  // 🔴 2026-09-18 第五版（用户给的全文）：上一版的「建筑须知」之上，新增「较长思考」整节。
   {
-    const secs = ['宗旨', '称呼', '记忆', '边界信息', '登录游戏', '看门狗', '聊天', '建筑须知', '硬规矩']
+    const secs = ['宗旨', '称呼', '记忆', '边界信息', '登录游戏', '看门狗', '聊天', '建筑须知', '较长思考', '硬规矩']
     const missing = secs.filter((s) => !DEFAULT_AGENTS_MD.includes(`## ${s}`))
-    console.log(`  ${missing.length === 0 ? '✅' : '❌'} 🔴 第四版的九个分节都在（缺：${missing.join('、') || '无'}）`)
+    console.log(`  ${missing.length === 0 ? '✅' : '❌'} 🔴 第五版的十个分节都在（缺：${missing.join('、') || '无'}）`)
     const house = ['环境', 'NBT', '楼梯', '复盘', '功能性']
     const lack = house.filter((k) => !DEFAULT_AGENTS_MD.includes(k))
     console.log(`  ${lack.length === 0 ? '✅' : '❌'} 🔴「建筑须知」讲到了关键点（环境协调 / 方块属性与 NBT / 多部分方块 / 细节 / 复盘；缺：${lack.join('、') || '无'}）`)
-    console.log(`  ${/第一时间回复/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 「聊天」有"第一时间回复用户"（用户这一版新加的）`)
+    const houseNew = ['先将建筑大体结构完成', '每阶段完成要给用户响应', '建造完成后，需要复盘']
+    const lack2 = houseNew.filter((k) => !DEFAULT_AGENTS_MD.includes(k))
+    console.log(`  ${lack2.length === 0 ? '✅' : '❌'} 🔴「建筑须知」补的三条也在（先大体结构 / 每阶段回话 / 完工复盘；缺：${lack2.join('、') || '无'}）`)
+    console.log(`  ${/第一时间回复/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 「聊天」有"第一时间回复用户"（第四版加的）`)
+    // 第五版新加的整节：长时间思考要偶尔冒个泡（否则用户以为你卡住了，事件提示词也没时机注入）
+    const think = ['较长思考', '简短地给用户汇报', '提示词有时机注入']
+    const lack3 = think.filter((k) => !DEFAULT_AGENTS_MD.includes(k))
+    console.log(`  ${lack3.length === 0 ? '✅' : '❌'} 🔴 新增「较长思考」讲到关键点（长思考要偶尔汇报 / 这样事件提示词才有注入时机；缺：${lack3.join('、') || '无'}）`)
   }
 
   const dir = mkdtempSync(join(tmpdir(), 'whale-md-'))
