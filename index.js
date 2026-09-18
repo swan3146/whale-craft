@@ -2547,13 +2547,14 @@ export function apply(ctx, config) {
    *    **投递时机从"会话开始/切模式那一刻"搬到"每个请求组装之前"**（`agent/pre-step`）。
    *    台账因此按 **preset** 记账：`fp` 记"这批提示词是给哪个模式投的"，切模式就作废重投。
    *
-   * 字段：`sessionId` · `fp`（mode/版本指纹）· `rel`（已投的文件名）· `items`（那一刻的正文，用于比对增量）
+   * 字段：`sessionId` · `fp`（mode/版本指纹）· `rel`（已投的文件名）· `items`（那一刻的正文）
+   *      · `since`（会话日志的下标：**上次切出模式那一刻**，之前的投递记录不再算数）
    */
   const noticeLedger = new WeakMap()
   const ledgerOf = (agent) => {
     let l = noticeLedger.get(agent)
-    if (!l) { l = { sessionId: null, fp: null, rel: [], items: new Map() }; noticeLedger.set(agent, l) }
-    if (l.sessionId !== (agent?.id ?? null)) { l.sessionId = agent?.id ?? null; l.fp = null; l.rel = []; l.items = new Map() }
+    if (!l) { l = { sessionId: null, fp: null, rel: [], items: new Map(), since: 0 }; noticeLedger.set(agent, l) }
+    if (l.sessionId !== (agent?.id ?? null)) { l.sessionId = agent?.id ?? null; l.fp = null; l.rel = []; l.items = new Map(); l.since = 0 }
     return l
   }
 
@@ -2576,12 +2577,21 @@ export function apply(ctx, config) {
    * 而会话日志是持久的 —— 一个已经投过提示词的 MC 会话在重启后 resume，
    * 只看台账就会**再投一遍**（重复注入）。`snapshotEvents()` 在真机上可用，
    * 拿不到就退化成"只信台账"（不抛错，绝不让诊断路径把 turn 弄挂）。
+   *
+   * ⚠️ 只看 `l.since`（**上次切出 MC 模式那一刻**）之后的事件：切出时提示词已经作废
+   *    （台账也清了），若不划这条线，"切出 → 再切回"会被日志里的旧记录误判成"已经投过"
+   *    ⇒ **再也不投**（自检逮到过这个 bug）。
    */
   const deliveredRelsFor = (agent, rels) => {
     const out = new Set()
     try {
-      const events = Array.isArray(agent?.session?.snapshotEvents?.()) ? agent.session.snapshotEvents() : []
-      for (const ev of events) {
+      const from = Number(ledgerOf(agent).since) || 0
+      let events = []
+      try {
+        const ev = agent?.session?.snapshotEvents?.()
+        events = Array.isArray(ev) ? ev : []
+      } catch { events = [] }
+      for (const ev of events.slice(from)) {
         if (ev?.type !== 'user/message') continue
         const m = ev.data
         if (!isOurNotice(m)) continue
@@ -2632,11 +2642,22 @@ export function apply(ctx, config) {
     // 🔴 真事故（自检逮到）：清了队列就必须**同时把台账里的 rel 抹掉**。
     //    否则"切回普通模式（清队列）→ 再切回 MC 模式"时，台账还以为投过了 ⇒ **永远不再投**，
     //    典型症状就是"提示词莫名其妙没了"。队列里还没被 claim 的，本来就不算投过。
-    if (removed > 0) {
+    // 🔴 切出模式 ⇒ 这批提示词**作废**：台账里的"已投"记录必须一起清掉，否则再切回来会被
+    //    误判成"已经投过" ⇒ **再也不投**。这里**不能**加 `if (removed > 0)` 的条件 ——
+    //    现在提示行是在本步消息里当场送出的，队列通常是空的（removed === 0），
+    //    当年那版靠"队列非空"来判断"这次真的要作废"是错的（自检逮到过）。
+    {
       const l = ledgerOf(agent)
       l.rel = []
       l.items = new Map()
     }
+    // 🔴 无论有没有从队列里摘到东西，都要**划一条线**：把"切出这一刻"的日志下标记下来，
+    //    之后 `deliveredRelsFor` 只认这条线之后的投递记录 —— 这样"切出 → 再切回"才会重投
+    //    （否则日志里的旧记录会让插件误判"已经投过"，表现为**再也不投**）。
+    try {
+      const ev = agent?.session?.snapshotEvents?.()
+      ledgerOf(agent).since = Array.isArray(ev) ? ev.length : 0
+    } catch { /* 拿不到日志下标就算了（退化：只信台账） */ }
     // 队列本来就干净 ⇒ 说明那几条**已经进过对话**（载入时从日志认出来的）
     const delivered = removed === 0 && Boolean(ledgerOf(agent).fp)
     if (removed || delivered) {
@@ -2660,12 +2681,14 @@ export function apply(ctx, config) {
    * @returns {{delivered: boolean, queued: number, reason?: string}}
    */
   const reconcileNotices = (agent) => {
-    if (!agent?.ctx) return { delivered: false, queued: 0, reason: 'no-agent' }
-    if (!isMcModeAgent(agent)) return { delivered: false, queued: 0, reason: 'not-mc-mode' }
+    // ⚠️ 每个提前返回都必须带 `todo` 字段：`enterWithNotices` 会读 `r.todo.length`，
+    //    漏一个就是 TypeError（这里被 catch 兜住 ⇒ 表现成"静默不注入"，正是最难查的那种）。
+    if (!agent?.ctx) return { delivered: false, todo: [], queued: 0, reason: 'no-agent' }
+    if (!isMcModeAgent(agent)) return { delivered: false, todo: [], queued: 0, reason: 'not-mc-mode' }
     const cwd = workspaceOf(agent)
-    if (!cwd) return { delivered: false, queued: 0, reason: 'no-workspace' }
+    if (!cwd) return { delivered: false, todo: [], queued: 0, reason: 'no-workspace' }
     const inbox = agent.inbox
-    if (!inbox || !Array.isArray(inbox.nextStep)) return { delivered: false, queued: 0, reason: 'no-inbox' }
+    if (!inbox || !Array.isArray(inbox.nextStep)) return { delivered: false, todo: [], queued: 0, reason: 'no-inbox' }
     // 注：消息构造由 `src/user-message.mjs` 保证 —— 宿主实现拿不到就用自带等价实现，
     //     所以这里**不再有"静默失败"的死角**。
 
@@ -2701,7 +2724,7 @@ export function apply(ctx, config) {
       const idx = memoryIndexText(memoryFor(cwd)).trim()
       if (idx) items.push({ rel: '.whale-craft/README.md', title: '提示词注入：.whale-craft/README.md', text: idx })
     }
-    if (!items.length) return { delivered: false, queued: 0, reason: 'no-items' }
+    if (!items.length) return { delivered: false, todo: [], queued: 0, reason: 'no-items' }
 
     const ledger = ledgerOf(agent)
     const preset = lastPresetSeen.get(agent) ?? String(agent?.ctx ? '' : '')
@@ -2709,53 +2732,81 @@ export function apply(ctx, config) {
     if (ledger.fp !== fp) { ledger.fp = fp; ledger.rel = []; ledger.items = new Map() }
 
     const delivered = deliveredRelsFor(agent, items.map((i) => i.rel))
-    // 队列里**已经排着的**同名提示行：不重复入队；只有当正文变了（RULES 被编辑 / 记忆索引更新 /
-    // 插件版本换了）才**就地替换**那一条 —— 否则模型会同时看到新旧两份，老的还排在前面。
-    const queuedByRel = new Map()
-    for (const m of inbox.nextStep.filter(isOurNotice)) {
-      const rel = noticeRelOf(m)
-      if (rel && !queuedByRel.has(rel)) queuedByRel.set(rel, m)
-    }
+    // 队列里**已经排着的**同名提示行：算"已经安排了"，不重复投（宿主下一个 step 会领走它）。
+    const queuedRels = new Set(inbox.nextStep.filter(isOurNotice).map(noticeRelOf).filter(Boolean))
     const rels = new Set([...ledger.rel, ...delivered])
-    const todo = []
-    for (const it of items) {
-      if (rels.has(it.rel)) continue
-      const queued = queuedByRel.get(it.rel)
-      if (queued === undefined) { todo.push(it); continue }
-      const oldText = (queued.content ?? []).map((c) => c?.text ?? '').join('')
-      if (oldText === `Instructions from: ${it.rel}\n\n${it.text}`) continue
-      try {
-        if (typeof inbox.replace === 'function' && queued.id !== undefined
-          && inbox.replace(queued.id, userMessage({
-            content: [{ type: 'text', text: `Instructions from: ${it.rel}\n\n${it.text}` }],
-            source: { kind: 'plugin', plugin: 'whale_craft', form: 'notice', summary: it.title },
-          })) === true) {
-          logLine(`提示词内容已变，就地替换队列里的那一条：${it.rel}`)
-          continue
-        }
-      } catch (e) { logLine(`替换待投递提示行失败（${it.rel}）：${e?.message ?? e}`) }
-      todo.push(it)
+    const todo = items.filter((it) => !rels.has(it.rel) && !queuedRels.has(it.rel))
+    if (!todo.length) {
+      return { delivered: false, todo: [], queued: queuedRels.size }
     }
-    if (!todo.length) return { delivered: false, queued: queuedByRel.size }
+    // 只负责"算出该投什么"；**真正入队/改写本步消息**由 pre-step 监听器做（那里才有 decision）。
+    // 注：版本提示的短哈希由 `versionPromptTitle()` 自己带进折叠标题，这里不需要再算。
+    return { delivered: true, todo, queued: queuedRels.size }
+  }
 
-    let sent = 0
-    for (const it of todo) {
-      try {
-        // 正文首行照 DSH 原生的形状写相对路径 → AI 也知道这段话出自哪个文件
-        const msg = userMessage({
-          content: [{ type: 'text', text: `Instructions from: ${it.rel}\n\n${it.text}` }],
-          source: { kind: 'plugin', plugin: 'whale_craft', form: 'notice', summary: it.title },
-        })
-        if (!pushNotice(inbox, msg)) throw new Error('inbox 既没有 append 也没有 nextStep')
-        ledger.items.set(it.rel, it.text)
-        sent++
-      } catch (e) { logLine(`提示词投递失败（${it.rel}）：${e?.message ?? e}`) }
+  /**
+   * 🔴🔴 2026-09-18 **第二次改挂载点**（用户："两个全都是 LLM 运行了一半才后知后觉地注入，
+   *    根本不是用户发送第一条信息后注入"）。
+   *
+   * 上一次我只把投递挂到 `agent/pre-step`，但**塞进了 `inbox.nextStep`** —— 而宿主的顺序是：
+   *    `preStep()` 里**先 `inbox.claim()`**（把这一步的消息领走）**再**跑 `agent/pre-step` 瀑布
+   *    （`core/agent-loop/src/agent.ts:244` → `:249`）。
+   * 所以那一步塞进队列的提示行**这一步用不上**，要等**下一步**才被领走 ——真机实测：
+   *
+   *     seq= 7-9  next-step +3        ← 我在 pre-step 塞进队列
+   *     seq=10    step/start  step=1  ← 这一步的消息**已经领完了**
+   *     seq=12    user/message 用户那句
+   *     seq=25    next-step -3        ← 到第 2 步才被领走
+   *     seq=27-29 user/message ×3     ← 提示行晚了整整一步
+   *
+   * 这正是宿主 `agent-instructions` 的写法要解决的问题：**改写 `decision.messages`**
+   *   （`context/agent-instructions/src/index.ts:313-338`：拿 `next()` 的结果 → 先把队列里
+   *    那几条 `inbox.remove()` → 再 `{...decision, messages: toSpliced(...)}` 返回）。
+   * 宿主紧接着在 `agent.ts:373-377` 把 `decision.messages` **逐条落成会话日志的 `user/message`**
+   * 并作为请求里的那批消息 —— 既是**正规通道**（`stepAt`/重放都对得上），又能**当场**生效。
+   *
+   * 位置：**排在本步消息的最前面**。本步消息 = 用户那句 + 运行时上下文快照；
+   * 把规矩放在最前，模型第一眼就看到（而不是先看到用户那句话再补规矩）。
+   *
+   * cordis：`agent/pre-step` 是 waterfall，**必须交棒**（`next()`）—— 见下面那段注释与自检。
+   */
+  const noticeMessagesFor = (todo) => todo.map((it) => userMessage({
+    content: [{ type: 'text', text: `Instructions from: ${it.rel}\n\n${it.text}` }],
+    source: { kind: 'plugin', plugin: 'whale_craft', form: 'notice', summary: it.title },
+  }))
+
+  /** 记一笔台账（投出去的那些文件名 + 正文，供诊断与"内容变了就地更新"） */
+  const markNoticesSent = (agent, todo) => {
+    const ledger = ledgerOf(agent)
+    for (const it of todo) ledger.items.set(it.rel, it.text)
+    ledger.rel = [...new Set([...ledger.rel, ...todo.map((i) => i.rel)])]
+    logLine(`提示词已投递 ${todo.length} 条（**本步消息里**，与用户那句同批送出；插件提示行，非用户发言）：${todo.map((i) => i.rel).join(' → ')}`)
+  }
+
+  /**
+   * 把提示行塞进**本步**的 `decision.messages` 最前面；没有要投的就原样返回。
+   * 幂等：投过就记账，下一个 step 不会再投。
+   * @param agent - 宿主 Agent（用来判模式与工作区）
+   * @param decision - 交棒拿回来的 `PreStepDecision`
+   * @returns 改写后的 decision（不改就别返回新对象）
+   */
+  const enterWithNotices = (agent, decision) => {
+    try {
+      if (!decision || decision.kind !== 'enter') return decision
+      const r = reconcileNotices(agent)
+      if (!r.todo.length) return decision
+      // 队列里若有残留的自家提示行，先摘掉：它们马上要作为**本步消息**送出去了，
+      // 留着会让下一步再送一遍（重复注入）。
+      try { withdrawAgentsMdNotices(agent) } catch { /* 摘不掉也不影响本步 */ }
+      markNoticesSent(agent, r.todo)
+      const msgs = (decision.messages ?? []).filter((m) => !isOurNotice(m))
+      const out = { ...decision, messages: [...noticeMessagesFor(r.todo), ...msgs] }
+      return out
+    } catch (e) {
+      // 绝不带崩这一轮：改写失败就用内层原样结果。
+      logLine(`提示词注入失败（不打断本轮，按原样继续）：${e?.message ?? e}｜${String(e?.stack ?? '').split('\n')[1] ?? ''}`)
+      return decision
     }
-    if (sent) {
-      ledger.rel = items.filter((i) => ledger.items.has(i.rel)).map((i) => i.rel)
-      logLine(`提示词已投递 ${sent} 条（请求组装前对账；插件提示行，非用户发言）：${items.map((i) => i.rel).join(' → ')}`)
-    }
-    return { delivered: sent > 0, queued: queuedByRel.size + sent }
   }
 
   /**
@@ -3563,10 +3614,9 @@ export function apply(ctx, config) {
      *    **后果是 P0 级**：`turn/start` 之后、`step/start` 之前就抛，**任意会话、任意模式、每一轮**都失败，
      *    装了插件就没法对话（真机 `whale_craft@0.1.4`，标准模式与 MC 模式一视同仁）。
      *
-     *    正确写法（宿主自己的 `agent-instructions` 就是这么写的）：接第二个形参 `next` 并交棒。
-     *    我们的投递只往 inbox 里塞消息、**不需要改本步载荷**，所以「先交棒拿回内层 decision、
-     *    再把内层的结果原样返回」即可（`next` 不接受参数，载荷沿用的是原 args）。
-     *    且**无论对账成功与否都必须交棒** —— 用 `finally` 兜住：抛错也不能否决整条链。
+     *    正确写法（宿主自己的 `agent-instructions` 就是这么写的）：接第二个形参 `next` 并交棒，
+     *    然后**用交棒拿回的结果做改写**（见下面 `enterWithNotices`）。
+     *    且**无论对账成功与否都必须交棒**：抛错也不能否决整条链。
      * 教训：挂到 waterfall 之前，先读那个 dispatch 模式的契约，别只看事件签名。 */
     try {
       handlers.push(ctx.on('agent/pre-step', ({ agent } = {}, next) => {
@@ -3576,15 +3626,11 @@ export function apply(ctx, config) {
           return undefined
         }
         const inner = next()
-        // 交棒**必须发生**，而且不受对账结果影响：用 finally 把对账挂在交棒结果上，
-        // 内层无论 resolve 还是 reject 都保证跑过对账，且返回值就是内层结果（不改载荷）。
-        if (inner && typeof inner.finally === 'function') {
-          return inner.finally(() => {
-            try { reconcileNotices(agent) } catch (e) { logLine(`提示词对账失败（不打断本轮）：${e?.message ?? e}`) }
-          })
+        // 交棒一定发生；拿回内层 decision 后把提示行塞进**本步消息的最前面**（与用户那句同批送出）。
+        if (inner && typeof inner.then === 'function') {
+          return inner.then((decision) => enterWithNotices(agent, decision))
         }
-        try { reconcileNotices(agent) } catch (e) { logLine(`提示词对账失败（不打断本轮）：${e?.message ?? e}`) }
-        return inner
+        return enterWithNotices(agent, inner)
       }))
     } catch { /* 老宿主没有这条瀑布 */ }
     return () => { for (const off of handlers) { try { off?.() } catch {} } }
