@@ -1342,6 +1342,45 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   console.log(`  ${/role: 'user'/.test(umSrc) && /source: input\?\.source/.test(umSrc) && /crypto\.randomUUID/.test(umSrc) ? '✅' : '❌'} 兜底消息逐个对齐宿主 UserMessage 形状（role/content/source/id）`)
   console.log(`  ${/createRequire\(import\.meta\.url\)/.test(umSrc) && /req\('@deepseek-ai\/dsh-llm'\)/.test(umSrc) ? '✅' : '❌'} 仍然优先用宿主实现（形状跟得上宿主版本）`)
   console.log(`  ${/import \{ userMessage \} from '\.\/user-message\.mjs'/.test(wdSrc) && /userMessage\(\{/.test(wdSrc) ? '✅' : '❌'} 🔴 看门狗（同一次事故的第二处）也用同一个模块，不再退化成"用户来源"消息`)
+
+  /* 🔴🔴 2026-09-18 **P0 事故**：0.1.4 把提示词投递挂到 `agent/pre-step`（cordis waterfall），
+   *    但监听器只声明了一个形参、也没 `return next()` ⇒ **不交棒** = 否决整条链（含宿主内置行为），
+   *    waterfall 返回 undefined ⇒ 宿主 `decision.kind` 抛
+   *    `Cannot read properties of undefined (reading 'kind')` ⇒ **任意会话、任意模式、每一轮都失败**，
+   *    装了插件就没法对话（真机标准模式与 MC 模式一视同仁）。
+   *    下面这组断言就是为它立的：**横切**检查所有 waterfall 监听器都必须接 `next` 并交棒。 */
+  const HOST_WATERFALL_EVENTS = [
+    'agent/pre-step', 'agent/request', 'agent/request-error', 'approval/request',
+    'fs/edit-intent', 'fs/write-intent', 'llm/stream', 'session-telemetry/record',
+    'system-prompt/assemble', 'tools/execute', 'tools/post-execute', 'tools/pre-execute',
+    'tools/ptc-dispatch-log', 'user-questions/request',
+  ]
+  {
+    // 把源码里每个 `ctx.on('<事件>', <回调>)` 抠出来（回调到对应右括号为止，容忍嵌套括号）
+    const registered = []
+    for (const m of idx.matchAll(/ctx\.on\(\s*'([^']+)'\s*,/g)) {
+      const name = m[1]
+      let i = m.index + m[0].length
+      let depth = 0
+      const start = i
+      for (; i < idx.length; i++) {
+        const ch = idx[i]
+        if (ch === '(' || ch === '{' || ch === '[') depth++
+        else if (ch === ')' || ch === '}' || ch === ']') { if (depth === 0) break; depth-- }
+      }
+      registered.push({ name, body: idx.slice(start, i) })
+    }
+    const wf = registered.filter((r) => HOST_WATERFALL_EVENTS.includes(r.name))
+    console.log(`  ${registered.length > 0 ? '✅' : '❌'} 源码里注册了 ${registered.length} 个事件监听器（其中 waterfall 事件 ${wf.length} 个）`)
+    const bad = wf.filter((r) => !/\([^)]*,\s*next\s*\)/.test(r.body) || !/\bnext\s*\(/.test(r.body))
+    console.log(`  ${bad.length === 0 ? '✅' : '❌'} 🔴🔴 每个 waterfall 监听器都接 next 且调用它（不交棒＝否决整条链 ⇒ 宿主 decision.kind 崩）${bad.length ? '：违规 ' + bad.map((b) => b.name).join(', ') : `（${wf.map((r) => r.name).join(', ') || '无'}）`}`)
+    console.log(`  ${/if \(typeof next !== 'function'\)/.test(idx) && /const inner = next\(\)/.test(idx) ? '✅' : '❌'} pre-step 监听器：交棒拿回内层结果、原样返回（不改载荷），且对 next 缺失有兜底`)
+    console.log(`  ${/\.finally\(\(\) => \{[\s\S]{0,200}reconcileNotices/.test(idx) ? '✅' : '❌'} 🔴 对账挂在交棒结果上（内层 resolve/reject 都保证**先交棒**，对账抛了也不否决整条链）`)
+    // 反向证明：这些断言真的能拦住事故写法
+    const buggy = `ctx.on('agent/pre-step', ({ agent } = {}) => { try { reconcileNotices(agent) } catch {} })`
+    const buggyBad = !/\([^)]*,\s*next\s*\)/.test(buggy) || !/\bnext\s*\(/.test(buggy)
+    console.log(`  ${buggyBad ? '✅' : '❌'} 负向验证：把 0.1.4 的事故写法喂给同一判据 → 判为违规（否则这套检查是假绿）`)
+  }
   console.log(`  ℹ️ 本次跑的是：${messageFactoryKind() === 'host' ? '宿主 @deepseek-ai/dsh-llm 的 createUserMessage' : '插件自带等价实现（环境里没有宿主包 —— 正是 npm 装到别人机器上的情形）'}`)
     // 🔴 2026-09-18 挂载点：投递必须发生在 **agent/pre-step**（请求组装前），不能退回"会话开始那一刻"
     console.log(`  ${/ctx\.on\('agent\/pre-step'/.test(idx) ? '✅' : '❌'} 🔴 投递挂在 agent/pre-step（宿主"消息已领走 + 系统提示已装好"的那条瀑布）`)
@@ -1469,11 +1508,28 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     for (const m of claimed) (agent.session.events ??= []).push({ type: 'user/message', seq: (agent.session.events?.length ?? 0), data: m })
     return claimed
   }
+  /**
+   * 🔴 2026-09-18 P0 事故后的替身升级：`agent/pre-step` 是 cordis 的 **waterfall** 事件，
+   * 监听器**必须 `next()` 交棒**；不交棒 ＝ 否决整条链（含宿主内置行为），waterfall 返回 `undefined`，
+   * 宿主下一行 `decision.kind` 直接 TypeError ⇒ 任意会话、任意模式、每一轮都失败。
+   * 所以替身**照抄宿主契约**：`next` 被调用过就返回内层 decision，没被调用就当场抛错
+   * （旧写法在这里会立刻红，而不是"看起来通过"）。
+   */
   const firePreStep = (agent, turn = 1, step = 1) => {
     const claimed = claimedInbox(agent)
     const payload = { agent, messages: claimed, turn, step, signal: new AbortController().signal }
-    const next = async () => ({ kind: 'enter', messages: claimed })
-    for (const h of eventHandlers.filter((x) => x.ev === 'agent/pre-step')) h.fn(payload, next)
+    const inner = { kind: 'enter', messages: claimed }
+    let handedOff = false
+    const next = () => { handedOff = true; return inner }
+    let returned
+    for (const h of preStepHandlers()) returned = h.fn(payload, next)
+    if (!handedOff) {
+      throw new Error('契约违规：agent/pre-step 监听器没有调用 next() —— cordis waterfall 会返回 undefined，'
+        + '宿主下一行 decision.kind 直接 TypeError（0.1.4 的 P0 事故就是这个）')
+    }
+    if (returned === undefined) {
+      throw new Error(`契约违规：agent/pre-step 监听器返回了 undefined（应当是内层 decision）`)
+    }
     // 本 step 真正进模型的消息 = 领走的 + 监听器刚投进来的
     return [...claimed, ...agent.inbox.nextStep]
   }

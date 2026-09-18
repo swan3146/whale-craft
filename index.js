@@ -3539,10 +3539,39 @@ export function apply(ctx, config) {
      *    挂在这里 ⇒ 投出去的每一份都是"**发起请求那一刻**这个会话真正在用的模式"，串模式从根上不可能。
      *
      *    幂等与去重见 `reconcileNotices`（按 preset 记账 + 会话日志回读 + 队列同名检查）。
-     *    失败只记日志**不抛**（`agent/pre-step` 的监听器抛错会带崩这一轮）。 */
+     *
+     * 🔴🔴 **`agent/pre-step` 是 cordis 的 waterfall 事件，监听器必须 `next()` 交棒。**
+     *    0.1.4 首发版本这里写成 `({ agent } = {}) => { reconcileNotices(agent) }` —— 只声明了一个形参、
+     *    也没有 `return`，于是 **没有调用 `next()`**。cordis 的语义是
+     *    （`@deepseek-ai/cordis` 的 `waterfall()`）："a listener that does not call `next()` **vetoes
+     *    the rest of the chain, including the built-in behavior**"，并且 waterfall 的返回值就是那个
+     *    监听器的返回值 ⇒ 恒定 `undefined` ⇒ 宿主 `agent-loop` 下一行 `decision.kind` 直接
+     *    `TypeError: Cannot read properties of undefined (reading 'kind')`。
+     *    **后果是 P0 级**：`turn/start` 之后、`step/start` 之前就抛，**任意会话、任意模式、每一轮**都失败，
+     *    装了插件就没法对话（真机 `whale_craft@0.1.4`，标准模式与 MC 模式一视同仁）。
+     *
+     *    正确写法（宿主自己的 `agent-instructions` 就是这么写的）：接第二个形参 `next` 并交棒。
+     *    我们的投递只往 inbox 里塞消息、**不需要改本步载荷**，所以「先交棒拿回内层 decision、
+     *    再把内层的结果原样返回」即可（`next` 不接受参数，载荷沿用的是原 args）。
+     *    且**无论对账成功与否都必须交棒** —— 用 `finally` 兜住：抛错也不能否决整条链。
+     * 教训：挂到 waterfall 之前，先读那个 dispatch 模式的契约，别只看事件签名。 */
     try {
-      handlers.push(ctx.on('agent/pre-step', ({ agent } = {}) => {
+      handlers.push(ctx.on('agent/pre-step', ({ agent } = {}, next) => {
+        if (typeof next !== 'function') {
+          // 万一宿主把这条改成普通 emit（不该发生）：别抛，记一行就走，绝不能带崩这一轮。
+          try { reconcileNotices(agent) } catch (e) { logLine(`提示词对账失败（不打断本轮）：${e?.message ?? e}`) }
+          return undefined
+        }
+        const inner = next()
+        // 交棒**必须发生**，而且不受对账结果影响：用 finally 把对账挂在交棒结果上，
+        // 内层无论 resolve 还是 reject 都保证跑过对账，且返回值就是内层结果（不改载荷）。
+        if (inner && typeof inner.finally === 'function') {
+          return inner.finally(() => {
+            try { reconcileNotices(agent) } catch (e) { logLine(`提示词对账失败（不打断本轮）：${e?.message ?? e}`) }
+          })
+        }
         try { reconcileNotices(agent) } catch (e) { logLine(`提示词对账失败（不打断本轮）：${e?.message ?? e}`) }
+        return inner
       }))
     } catch { /* 老宿主没有这条瀑布 */ }
     return () => { for (const off of handlers) { try { off?.() } catch {} } }

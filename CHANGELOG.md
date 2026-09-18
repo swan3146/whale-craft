@@ -2,6 +2,48 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.5] - 2026-09-18
+
+### 🔴 修复（P0：装了这个版本，**所有模式的所有会话每一轮都失败**）
+
+- **现象**：随便发一句话，界面显示 `本轮运行失败 Cannot read properties of undefined (reading 'kind')`；
+  标准模式、MC 模式一视同仁，等于**装了插件就没法对话**。会话日志里 `turn/start` 之后直接 `turn/end{kind:"error"}`，
+  **连 `step/start` 都没有**。
+- **根因（0.1.4 引入）**：0.1.4 把提示词注入挂到了 `agent/pre-step`，而这条事件是 **cordis 的 waterfall**，
+  监听器**必须调用 `next()` 交棒**。0.1.4 的写法只声明了一个形参、函数体也没有 `return next()`：
+
+  ```js
+  // ❌ 0.1.4（事故写法）
+  ctx.on('agent/pre-step', ({ agent } = {}) => { reconcileNotices(agent) })
+  ```
+
+  cordis 的契约是明确的（`@deepseek-ai/cordis` 的 `waterfall()` 注释原话）：
+  **"a listener that does not call `next()` vetoes the rest of the chain, including the built-in behavior"**
+  —— 不交棒 ⇒ 否决后面所有监听器**和宿主内置行为**，且 waterfall 的返回值就是那个监听器的返回值（`undefined`）。
+  宿主拿到 `undefined` 后紧接着读 `decision.kind` ⇒ `TypeError` ⇒ 整轮失败。
+- **修法**：接第二个形参并交棒，且**交棒不受对账结果影响**（对账挂在 `next()` 返回值的 `finally` 上，
+  内层无论成功失败都保证先交过棒；`next` 不接受参数、载荷沿用原 args，所以原样返回内层结果即可）：
+
+  ```js
+  // ✅ 0.1.5
+  ctx.on('agent/pre-step', ({ agent } = {}, next) => {
+    const inner = next()
+    ...
+    return inner.finally(() => { try { reconcileNotices(agent) } catch { ... } })
+  })
+  ```
+- **为什么自检没拦住**（补上了）：原来的 654 项自检全部在插件自己的进程里直接调函数，**绕开了宿主的编排**，
+  所以"契约违规"测不出来。现在补了三层：
+  1. **替身按宿主契约行事** —— `agent/pre-step` 的替身在监听器没交棒时**当场抛错**，
+     任何一项用到它的断言都会红（旧写法必挂）；
+  2. **横切静态检查** —— 扫描源码里所有 `ctx.on('<事件>', …)`，凡是**宿主已登记的 waterfall 事件**
+     （`agent/pre-step`、`agent/request`、`tools/execute`、`system-prompt/assemble` 等 14 个）
+     都必须接 `next` 并调用它；**并带负向验证**（把事故写法喂给同一判据，必须判违规）；
+  3. **真 cordis 集成探针** —— 用宿主实际装的那份 cordis 起一个真 `Context`，注册插件的监听器，
+     走一遍 `waterfall()`，断言内层被执行、返回值不是 `undefined` 且带 `kind`。
+- 教训：**挂到 waterfall 之前先读那个 dispatch 模式的契约**，别只看事件签名；"抛错"和"不交棒"一样致命。
+
+
 ## [0.1.4] - 2026-09-18
 
 ### 修复（提示词注入的**挂载点**搬到了正确的地方）
