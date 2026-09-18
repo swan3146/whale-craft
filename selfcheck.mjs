@@ -2811,7 +2811,13 @@ console.log('\n--- 客户端 bundle（client.js 静态检查）---')
     ['注入锚点用宿主的稳定壳 data-slot=conversation.hero.agentPreset', /HERO_CHIP_ANCHOR = '\[data-slot="conversation\.hero\.agentPreset"\]'/.test(code)],
     ['按钮插在模式芯片**右边**（afterend）', /insertAdjacentElement\('afterend', btn\)/.test(code)],
     ['放置是幂等的（不会自己触发自己）', /btn\.previousElementSibling === anchor\) return/.test(code)],
-    ['观察目标只限作曲器卡片', /querySelector\('\[data-composer-card\]'\)/.test(code) && /observer\.observe\(target, \{ childList: true, subtree: true \}\)/.test(code)],
+    // 🔴 2026-09-18 真机 bug：原来只观察 `[data-composer-card]`，而那个标记在**输入框自己**身上
+    //    （`InputBar.tsx:429`），hero 行是它的**兄弟** ⇒ hero 行重渲染把按钮抹掉、观察者看不见
+    //    ⇒ 再也补不回来（症状：工作区已选时首帧就在，所以"看着正常"；没选工作区时锚点晚出现 ⇒ 没按钮）。
+    //    现在观察**两者共同的父容器**（锚点父元素 → 退路 `[data-composer-seat]`）。
+    ['观察目标是锚点所在父容器（hero 行与输入框的共同祖先）', /anchor\?\.parentElement\) return anchor\.parentElement/.test(code) && /querySelector\('\[data-composer-seat\]'\)/.test(code)],
+    ['锚点晚出现时有上限重试（首帧拿不到也能补上）', /tries >= 10/.test(code) && /setTimeout\(tick, 300\)/.test(code)],
+    ['观察真的挂上了', /observer\.observe\(target, \{ childList: true, subtree: true \}\)/.test(code)],
     ['组件卸载就摘掉按钮', /btn\.remove\(\)/.test(code)],
     ['注入由门控驱动（只有 show 为真才挂）', /if \(!show\) return undefined/.test(code) && /return mountHeroChipButton\(/.test(code)],
     // 🔴 2026-09-16 二轮事故：门控**不许依赖一次性网络请求**。

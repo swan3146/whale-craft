@@ -660,7 +660,12 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       btn.textContent = 'MC设置'
       btn.addEventListener('click', onClick)
 
-      /** 幂等放置：已经在锚点后面就什么都不做（否则会自己触发自己） */
+      /**
+       * 幂等放置：已经在锚点后面就什么都不做（否则会自己触发自己）。
+       * 🔴 只认**真 anchor 的直接父元素**作为落点：`mountHeroChipButton` 契约里
+       *    anchor 是 `display:contents` 的插槽壳（`HERO_CHIP_ANCHOR`），只用它比对身份。
+       *    任何"往上找兄弟行"式的猜测都被 2026-09-16 的事故否掉了 —— 不重蹈。
+       */
       const place = () => {
         const anchor = document.querySelector(HERO_CHIP_ANCHOR)
         const row = anchor === null ? null : anchor.parentElement
@@ -671,13 +676,28 @@ select[data-wc-in]{appearance:none;padding-right:22px;
 
       place()
 
-      // React 重渲染可能把注入的节点冲掉 → 补回。观察目标**只限作曲器卡片**，
-      // 且锚点不存在（普通对话）时这里什么也不会发生。
+      /* React 重渲染会把注入的节点冲掉 → 必须补回。观察范围是这里的关键：
+       * 🔴 2026-09-18 真机 bug（"新会话 MC 模式没选工作区时没有按钮"）：原来只观察
+       *    `[data-composer-card]`，而那个标记挂在**输入框自己**身上（`InputBar.tsx:429`），
+       *    hero 行（含我们的锚点）是**它的兄弟**（`ConversationRoot.tsx:347-351`）——
+       *    于是 hero 行一重渲染（切模式 / 切工作区正是这种情况），按钮被抹掉而**观察者看不见**，
+       *    再也补不回来。症状取决于首帧锚点在不在：工作区已选时首帧就在（所以"看着正常"），
+       *    没选工作区时锚点晚出现 ⇒ 一直没按钮。
+       *    现在改成观察**两者共同的父容器**（`[data-composer-seat]`，退路是锚点当前所在的父元素），
+       *    并且在锚点还没出现时先观察那个容器，等它出现再放。
+       */
       let observed = null
       let queued = false
-      const card = () => document.querySelector('[data-composer-card]')
+      const watchTarget = () => {
+        const anchor = document.querySelector(HERO_CHIP_ANCHOR)
+        // ① 锚点已在 DOM 里 → 观察它所在的父容器（hero 行的容器 = composerStack）
+        if (anchor?.parentElement) return anchor.parentElement
+        // ② 锚点还没出现（新会话页首帧、工作区栏还在变）→ 退到作曲器底座，
+        //    它一定存在且包含将来会出现的那一行。
+        return document.querySelector('[data-composer-seat]') ?? document.querySelector('[data-composer-card]')
+      }
       const track = () => {
-        const target = card()
+        const target = watchTarget()
         if (target === null || target === observed) return
         observer.disconnect()
         observer.observe(target, { childList: true, subtree: true })
@@ -689,11 +709,20 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         Promise.resolve().then(() => { queued = false; place(); track() })
       })
       track()
-      // 卡片可能比本组件晚挂上（React 提交顺序不保证）→ 补一次
-      const retry = setTimeout(() => { place(); track() }, 300)
+      // 首帧锚点可能比本组件晚挂上（React 提交顺序不保证）→ 多补几次；有上限，别常驻空转。
+      let tries = 0
+      let retry = null
+      const tick = () => {
+        place()
+        track()
+        if (document.querySelector(HERO_CHIP_ANCHOR) !== null) return   // 已就位，收工
+        if (++tries >= 10) return
+        retry = setTimeout(tick, 300)
+      }
+      retry = setTimeout(tick, 120)
 
       return () => {
-        clearTimeout(retry)
+        if (retry) clearTimeout(retry)
         observer.disconnect()
         btn.remove()
       }
