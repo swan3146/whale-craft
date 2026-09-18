@@ -276,7 +276,8 @@ export class Watchdog {
 
     this.#bind()
     this.#startJob()
-    this.tickTimer = setInterval(() => this.#tick(), 1000)
+    // 🔴 同理：定时器回调里抛错是 uncaughtException，会把整个宿主带走（宿主只防未处理拒绝）。
+    this.tickTimer = setInterval(() => { try { this.#tick() } catch (e) { this.#record('lifecycle', `看门狗 tick 出错（已吞，不影响进程）：${e?.message ?? e}`) } }, 1000)
     this.tickTimer.unref?.()
     this.#record('lifecycle', `看门狗已挂载（${this.config.wakeOn.heartbeat ? `心跳 ${this.config.heartbeatSec}s` : '无心跳'}）`)
     return this.status()

@@ -546,7 +546,9 @@ export class McBot extends EventEmitter {
       lastPlayers: new Set(Object.keys(this.bot?.players ?? {})),
       lastInv: this.#invSignature(),
     }
-    this.observerTimer = setInterval(() => this.#observeTick(), 1000)
+    // 🔴 回调自己兜住异常：`setInterval` 回调里抛错 = **uncaughtException** = 整个宿主进程死
+    //    （宿主只对 `unhandledRejection` 做 fail-loud，这条通道它不防）。观察 tick 出错最多是少看一眼世界。
+    this.observerTimer = setInterval(() => { try { this.#observeTick() } catch (e) { this.#reportError(e) } }, 1000)
     this.observerTimer.unref?.()
   }
 
