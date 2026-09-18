@@ -31,8 +31,10 @@
 
 > 🔴 **必须选工作区**：每个会话都要在**工作区**里跑 —— `.whale-craft/`（记忆 + 提示词）就建在那儿。
 > 插件只在两个时刻去备好它：**首次进入 MC 模式会话**、或**点开「MC设置」**（不会在你没玩 MC 的普通会话里乱建目录）。
-> **没有选中工作区的会话会被拒绝**：不进入 MC 模式（没有按钮、没有隔离、没有专属提示词），
-> 「MC设置」的接口也一律拒绝并说明原因。
+> **没有选中工作区时**：服务端**不把该会话当 MC 模式**（不套工具隔离、不注入专属提示词、不建 `.whale-craft/`），
+> 「MC设置」的接口也会拒绝并说明原因。界面上的表现是：**新对话页还没连接工作区时（此时还没有会话）
+> 不显示「MC设置」按钮**；一旦有了会话，按钮只按"是不是 MC 模式"显示，工作区是在**点它的那一刻**才检查的
+> （没选就提示你先选）。
 
 ---
 
@@ -270,7 +272,7 @@ dsh plugin --profile web add link:/path/to/whale-craft
 
 ```bash
 node tools/check-core.mjs     # 全树语法 + 动态 import + 私有字段一致性（改 core.mjs 必跑）
-node selfcheck.mjs            # 625 条离线断言（假 ctx，不需要 MC 服务器、不连网）
+node selfcheck.mjs            # 680 条离线断言（假 ctx，不需要 MC 服务器、不连网）
 # 起一个隔离 DSH 实例验证"整树加载"（需要一份 DSH checkout）：
 DSH_ROOT=/path/to/deepseek-harness node tools/isolate.mjs start
 ```
@@ -284,10 +286,16 @@ DSH_ROOT=/path/to/deepseek-harness node tools/isolate.mjs start
 CI 跑的就是这两条（`.github/workflows/ci.yml`）：**ubuntu（Node 22 / 24）+ windows（Node 22）**；
 另有一个「打包产物」job，`npm pack` 之后核对 tarball 里该有的文件都在、且没混进 `node_modules` / 日志 / 账户。
 
-发布走 tag（`.github/workflows/release.yml`）：`git tag v0.1.1 && git push --tags` →
-先跑上面两条 + 校验 tag 与 `package.json` 版本一致，再 `npm pack` 并把 tarball 挂到 GitHub Release；
-仓库里配了 `NPM_TOKEN` secret 的话顺带发 npm（没配就只发 Release，不会失败）。
-`npm publish` 前还会自动跑一遍这两条（`prepublishOnly`）—— **坏树发不出去**。
+发布走 tag（`.github/workflows/release.yml`）：`git tag v0.1.4 && git push origin v0.1.4` →
+先跑上面两条 + 校验 tag 与 `package.json` 版本一致，再 `npm pack` 并把 zip 挂到 GitHub Release
+（正文取 `CHANGELOG.md` 里本版本那一节），最后**发 npm**（用仓库 secret `NPM_TOKEN`）。
+`npm publish` 前还会自动跑一遍上面两条（`prepublishOnly`）—— **坏树发不出去**。
+
+- 🔴 **npm 那步是"先探再发"**：仓库里配了 `NPM_TOKEN` 才发；**没配就明确跳过**（只发 Release，工作流照样绿）。
+  加 secret 的位置：仓库 **Settings → Secrets and variables → Actions → New repository secret**，
+  名字必须是 `NPM_TOKEN`，值是 npm 的 Automation token。
+- 也可以**在本机手动发**（不依赖任何 secret）：`npm login` 后跑 `npm run publish:npm`
+  —— 前置校验、失败即停、默认要确认，细则见 `RELEASING.md`。
 
 ---
 
@@ -340,7 +348,7 @@ read the world and keep notes — and wake itself up when something worth notici
   The HTTP route that serves those files exists **only** in online mode.
 - **Passwords never reach the model** — credentials live in the host credential store; accounts are
   managed from the in-app **MC Settings** dialog.
-- **Offline regression suite** — 625 assertions, no Minecraft server required.
+- **Offline regression suite** — 680 assertions, no Minecraft server required.
 
 ### Install
 
@@ -383,10 +391,11 @@ HTTP responses, or the model context.
 ### Verify offline
 
 ```bash
-node tools/check-core.mjs && node selfcheck.mjs   # 625 assertions, no MC server needed
+node tools/check-core.mjs && node selfcheck.mjs   # 680 assertions, no MC server needed
 ```
 
 CI runs exactly this on Linux (Node 22 and 24) and Windows (Node 22), and packs the tarball on every push.
-Push a `v*` tag to get a GitHub Release with the tarball (and an npm publish too, if you configure `NPM_TOKEN`).
+Push a `v*` tag to get a GitHub Release with the zip, plus an **npm publish** when the repository has an
+`NPM_TOKEN` secret (without it, the npm step is skipped with a notice — the workflow still succeeds).
 
 MIT licensed. Third-party notices in `THIRD_PARTY_NOTICES.md`.

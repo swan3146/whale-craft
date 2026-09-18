@@ -5,11 +5,13 @@
 | 渠道 | 谁来做 | 产物 |
 | --- | --- | --- |
 | **GitHub Release** | CI（打 tag 自动） | `whale_craft-<版本>.zip` + 手写更新日志 |
-| **npm** | **你**（本机终端手动） | npm 上的 `whale_craft@<版本>` |
+| **npm** | **两种都行**：CI（仓库配了 `NPM_TOKEN` 就自动发）· 或**你**在本机手动发 | npm 上的 `whale_craft@<版本>` |
 
-> 🔴 **CI 永远不碰 npm**：`release.yml` 里那段 `npm publish` 已经删掉（以前 token 一失效就红叉，
-> 而发布其实早就成功了）。npm 想发就在本机跑下面的脚本。
-> 如果你看到的还是旧工作流，先做一次 [§0 落地工作流修复](#0-落地工作流修复一次性)。
+> 🔴 **2026-09-18 起 npm 步骤加回工作流了**（用户要求），但**是"先探再发"**：
+> 仓库 Settings → Secrets and variables → Actions 里有 `NPM_TOKEN` 才发；
+> **没配就明确跳过并打一条 notice**，工作流照样绿 —— 不会再出现 2026-09-17 那种
+> "token 失效 → 整条红叉、而发布其实早就成功"的情况。
+> 想完全不依赖 secret，就走下面 §2 在本机手动发。
 
 ---
 
@@ -43,28 +45,31 @@ GITHUB_TOKEN=<你带 workflow scope 的 token> node scripts/land-workflow-fix.mj
 
 ---
 
-## 1. 发 GitHub Release（CI 自动）
+## 1. 发 GitHub Release（CI 自动；配了 `NPM_TOKEN` 就**顺带发 npm**）
 
 ```bash
 # 1) 改版本号 + 写更新日志（必做：工作流会拿 CHANGELOG 当正文）
-#    package.json 的 version  →  比如 0.1.2
-#    CHANGELOG.md 加一节      →  ## [0.1.2] - YYYY-MM-DD
-git commit -am "0.1.2：…"
+#    package.json 的 version  →  比如 0.1.4
+#    CHANGELOG.md 加一节      →  ## [0.1.4] - YYYY-MM-DD
+git commit -am "0.1.4：…"
 git push
 
 # 2) 打 tag 并推（触发 release.yml）
-git tag -a v0.1.2 -m "whale_craft 0.1.2"
-git push origin v0.1.2
+git tag -a v0.1.4 -m "whale_craft 0.1.4"
+git push origin v0.1.4
 ```
 
 工作流会：跑 `check-core` + `selfcheck` → 校验 tag 与 `package.json` 版本一致 →
-`npm pack` 后打 **zip** → 用 `CHANGELOG.md` 里 `## [0.1.2]` 那一节当 Release 正文 → 把 zip 挂上去。
+`npm pack` 后打 **zip** → 用 `CHANGELOG.md` 里 `## [0.1.4]` 那一节当 Release 正文 → 把 zip 挂上去
+→ **探 `NPM_TOKEN`**：有就 `npm publish --access public`（已存在同版本则跳过），没有就打一条
+notice 跳过。
 
-**没有 npm 步骤**，不会再出现"发布成功但红叉"。
+> ⚠️ 改这个工作流文件本身：`git push` 可能被 GitHub 以 "without workflow scope" 拒
+> （是**推送通道**的问题，不是 token 的问题）—— 用 §0 那条 Contents API 的路子，或直接网页编辑。
 
 ---
 
-## 2. 发 npm（本机手动）
+## 2. 发 npm（本机手动；不依赖任何 CI secret）
 
 ```bash
 npm login                 # 或设 NODE_AUTH_TOKEN / 在 ~/.npmrc 里放 token（别提交进仓库）
