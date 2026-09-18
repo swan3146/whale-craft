@@ -2027,6 +2027,16 @@ console.log('\n--- 行事准则 RULES.md / 新开关 / 边界信息 ---')
   console.log(`  ${!/mc-servers\.md/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 默认准则不再指路 .agent-docs/mc-servers.md（那里曾有明文密码）`)
   console.log(`  ${!/authPass|authUrl|authUser/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 默认准则不含已删除的 mc_connect 凭据参数`)
   console.log(`  ${/MC设置/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 默认准则教它把用户引导到「MC设置」`)
+  // 🔴 2026-09-18 第四版（用户给的全文）：新增「建筑须知」整节 —— 这是这一版最实质的增补。
+  {
+    const secs = ['宗旨', '称呼', '记忆', '边界信息', '登录游戏', '看门狗', '聊天', '建筑须知', '硬规矩']
+    const missing = secs.filter((s) => !DEFAULT_AGENTS_MD.includes(`## ${s}`))
+    console.log(`  ${missing.length === 0 ? '✅' : '❌'} 🔴 第四版的九个分节都在（缺：${missing.join('、') || '无'}）`)
+    const house = ['环境', 'NBT', '楼梯', '复盘', '功能性']
+    const lack = house.filter((k) => !DEFAULT_AGENTS_MD.includes(k))
+    console.log(`  ${lack.length === 0 ? '✅' : '❌'} 🔴「建筑须知」讲到了关键点（环境协调 / 方块属性与 NBT / 多部分方块 / 细节 / 复盘；缺：${lack.join('、') || '无'}）`)
+    console.log(`  ${/第一时间回复/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 「聊天」有"第一时间回复用户"（用户这一版新加的）`)
+  }
 
   const dir = mkdtempSync(join(tmpdir(), 'whale-md-'))
   console.log(`  ${readAgentsMd(dir).source === 'default' ? '✅' : '❌'} 没有自定义文件时用默认`)
