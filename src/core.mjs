@@ -938,10 +938,26 @@ export class McBot extends EventEmitter {
     const res = await fetch(`${base}/authserver/authenticate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: authUser, password: authPass, requestUser: true }),
+      // 🔴 `agent` 是 **Yggdrasil 官方协议里 authenticate 的必填字段**（authlib-injector / 官方
+      //    Minecraft 客户端都会发）。我们以前没发，多数皮肤站容忍，但 **LittleSkin 的新实现
+      //    `Yggdrasil Connect` 不容忍**：缺 agent 直接回 **400**（不是 401/403），
+      //    症状就是"LittleSkin 账号一直显示 400 认证失败，而认证服务器那种老实现没事"。
+      //    2026-09-19 实测对照（同一地址、只差这一个字段）：
+      //      LittleSkin 缺 agent → 400 ｜ 带 agent（假账号）→ 403（正常走完校验）
+      //      认证服务器       缺 agent → 403 ｜ 带 agent         → 401
+      body: JSON.stringify({
+        agent: { name: 'Minecraft', version: 1 },
+        username: authUser,
+        password: authPass,
+        requestUser: true,
+      }),
     })
     if (!res.ok) {
       const e = new Error(`认证失败 HTTP ${res.status}`)
+      if (res.status === 400) {
+        // 400 基本只有两种来路：请求体不合规（最常见就是认证服要求某个字段）、或账号格式被拒。
+        e.hint = '认证服拒绝了这次请求（400）。若这个皮肤站换过实现，可能是它要求的请求字段变了——把这条报给插件维护者'
+      }
       if (res.status === 401 || res.status === 403) {
         e.needUserAction = true
         e.hint = '账号或密码可能已经变了——请让用户在「MC设置」里重新登录这个账户'

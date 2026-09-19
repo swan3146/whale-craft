@@ -2287,6 +2287,22 @@ console.log('\n--- 认证请求 URL（真机 bug 回归）---')
     console.log(`  ${body.includes('user-x') && body.includes('pass-y') ? '✅' : '❌'} 凭据进了请求体（不是只拼 URL）`)
   }
 
+  // body 里必须有 `agent`（Yggdrasil 必填）——2026-09-19 真机：LittleSkin 换成新实现
+  // (`Yggdrasil Connect 0.0.8`) 后**缺 agent 直接回 400**，而认证服务器那种老实现容忍缺省。
+  // 实测对照（真发一次）：LittleSkin 缺→400 / 带→403；认证服务器 缺→403 / 带→401。
+  {
+    const bot = new McBot({ instanceId: 'selftest-auth' })
+    captured.length = 0
+    try { await bot.connect({ host: 'mc.example', auth: yggAuth('https://auth.example/yggdrasil', 'user-x', 'pass-y') }) } catch {}
+    let parsed = null
+    try { parsed = JSON.parse(String(captured[0]?.body ?? '{}')) } catch { parsed = null }
+    const okAgent = parsed?.agent?.name === 'Minecraft' && parsed?.agent?.version === 1
+    const okRest = parsed?.username === 'user-x' && parsed?.password === 'pass-y' && parsed?.requestUser === true
+    console.log(`  ${okAgent && okRest ? '✅' : '❌'} 🔴 authenticate 请求体带 agent（Yggdrasil 必填；缺了 LittleSkin 会回 400）：agent=${JSON.stringify(parsed?.agent)}`)
+    const coreSrc = (await import('node:fs')).readFileSync(new URL('./src/core.mjs', import.meta.url), 'utf8')
+    console.log(`  ${/Yggdrasil Connect/.test(coreSrc) && /缺 agent 直接回 \*\*400\*\*/.test(coreSrc) ? '✅' : '❌'} 代码里留了这条事故的说明（免得后人又把 agent 删掉）`)
+  }
+
   // 空 authUrl 必须在**发请求之前**就被拦下（不能退化成相对路径）
   {
     const bot = new McBot({ instanceId: 'selftest-auth' })
