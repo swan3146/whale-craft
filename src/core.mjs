@@ -435,13 +435,21 @@ export class McBot extends EventEmitter {
     this.stopped = false
     this.lastTimeout = null
     this.abortSignal = null       // 本轮 turn 的 abort signal（工具层注入）
+    this._packetSupport = new Map()  // `版本/包名 → 该版本协议里有没有这个包`（见 #supportsPacket）
     this.observerTimer = null     // 世界观察器（语义事件）
     this._obs = null
     this._selfMovingAt = 0        // 我们自己发起移动的时刻（排除"被传送"误判）
     this.stats = { connects: 0, deaths: 0, chats: 0, lastEventAt: 0, timeouts: 0 }
   }
 
-  get online () { return Boolean(this.bot?.entity) }
+  /**
+   * 在线 = **有身体** 且 **连接还活着**。
+   *
+   * 🔴 2026-09-19「幽灵在线」（别人反馈，本地复现）：被踢之后 mineflayer 的 `bot.entity` **还在**，
+   *    只看 entity 就会把死连接报成"在线" ⇒ 工具对着死 socket 干等（世界时间冻结、`/list` 零回应）、
+   *    用户以为还在游戏里。socket 已结束（`_client.ended`）就不算在线。
+   */
+  get online () { return Boolean(this.bot?.entity) && this.bot?._client?.ended !== true }
   /** 当前位置（纯对象，绝不返回 Vec3） */
   get position () {
     const p = this.bot?.entity?.position
@@ -974,12 +982,51 @@ export class McBot extends EventEmitter {
     return session
   }
 
-  /** 26.2 必须：20Hz 上报按键位（位名是 shift 不是 sneak） */
+  /**
+   * 这个版本的协议数据里有没有这个 **serverbound** 包？
+   *
+   * 🔴 为什么必须有这道检查：protodef **对未知包名不报错**，而是写出「id=0x00 + 空 body」——
+   *    服务端会把它当成自己注册表里 id 0x00 的那个包去解，于是报出一个**与我们真正发的包毫无关系**
+   *    的错误名（2026-09-19：1.21.1 上误发 player_input → 服务端报 accept_teleportation 解不开 → 踢人）。
+   *    所以**任何版本相关的包都必须先查后发**。
+   * @param {string} version mineflayer 报的版本字符串（如 `1.21.1` / `26.2`）
+   * @param {string} name    包名（不带 `packet_` 前缀）
+   */
+  #supportsPacket (version, name) {
+    const key = `${version ?? '?'}/${name}`
+    if (this._packetSupport.has(key)) return this._packetSupport.get(key)
+    let ok = false
+    try {
+      const data = requireFromMineflayer('minecraft-data')(version)
+      ok = Boolean(data?.protocol?.play?.toServer?.types?.[`packet_${name}`])
+    } catch { ok = false }                 // 数据里没这个版本 / 解析不了 → 当作不支持
+    this._packetSupport.set(key, ok)
+    return ok
+  }
+
+  /** 26.2 必须：20Hz 上报按键位（位名是 shift 不是 sneak）。
+   *
+   * 🔴 **只在"这个版本真有 `player_input` 包"时才发**（2026-09-19 事故，别人反馈 + 本地真 1.21.1 复现）：
+   *    `minecraft-protocol` 的 protodef **遇到未知包名不报错**，它会写出 `[len=2][0][0x00]`
+   *    —— 也就是「包 id = 0x00、body 为空」。服务端把 id 0x00 当成它自己的
+   *    `accept_teleportation`（1.21.x 里确认传送就是 0x00），去读 teleportId 时没有字节 ⇒
+   *      `io.netty.handler.codec.DecoderException: Failed to decode packet 'serverbound/minecraft:accept_teleportation'`
+   *    ⇒ **立刻踢人**。现象极具迷惑性：进服完全成功、1 秒后掉线，错误却指向"确认传送"。
+   *    实测：**1.21 / 1.21.1（协议 767）没有 `player_input`**；1.21.3+（含 26.2）才有。
+   *    （所以那次只报 1.21.1 掉线、26.2 一切正常 —— 不是版本兼容性玄学，是包不存在。）
+   */
   startInputPackets () {
     if (!this.cfg.inputPacket || this.inputTimer) return
+    const version = this.bot?.version
+    if (!this.#supportsPacket(version, 'player_input')) {
+      this.log(`按键上报兼容层不启用：${version ?? '未知版本'} 的协议里没有 player_input 包（1.21/1.21.1 没有，1.21.3+ 才有）`)
+      return
+    }
     this.inputTimer = setInterval(() => {
       const b = this.bot
       if (!b?._client || b._client.ended) return
+      // 重连可能换了版本：每次都按当前版本再确认一遍（结果有缓存，不贵）
+      if (!this.#supportsPacket(b.version, 'player_input')) { this.stopInputPackets(); return }
       const cs = b.controlState ?? {}
       try {
         b._client.write('player_input', {
@@ -1187,7 +1234,17 @@ export class McBot extends EventEmitter {
     // 连的哪个服（用户 2026-09-16："状态条别只写'在游戏中'，要显示服务器地址"）。
     // 只回地址/端口/子服，**不含账号与凭据**；前端负责"太长就截断"。
     const connection = this.connectionView()
-    if (!b?.entity) return { online: false, sub: this.sub, connection, lastError: this.lastError }
+    // 🔴 「幽灵在线」（2026-09-19）：断线/被踢后 `bot.entity` 会残留，光看它就把死连接报成在线。
+    //    连接已结束就按离线报，并明确标出 ghost，免得 AI 与用户都以为还在游戏里。
+    const ended = b?._client?.ended === true
+    if (!b?.entity || ended) {
+      return {
+        online: false, sub: this.sub, connection, lastError: this.lastError,
+        ...(ended && b?.entity
+          ? { ghost: true, hint: '连接已经结束了（bot.entity 是 mineflayer 的残留）——要回到游戏里请重新 mc_connect' }
+          : {}),
+      }
+    }
     const p = b.entity.position
     return {
       online: true, sub: this.sub, connection,
@@ -1931,7 +1988,12 @@ export class McBot extends EventEmitter {
   }
 
   requireBot () {
-    if (!this.bot?.entity) throw new Error(`机器人不在线${this.lastError ? '：' + this.lastError : ''}`)
+    // ⚠️ 用 `online`（= 有身体 **且** 连接没结束）：只看 `bot.entity` 会把"被踢后的残留"当在线，
+    //    于是所有世界工具对着死连接干等（2026-09-19 幽灵在线）。
+    if (!this.online) {
+      const ghost = this.bot?._client?.ended === true && this.bot?.entity
+      throw new Error(`机器人不在线${ghost ? '（连接已结束，bot.entity 是残留，需要 mc_connect 重连）' : ''}${this.lastError ? '：' + this.lastError : ''}`)
+    }
     return this.bot
   }
 }

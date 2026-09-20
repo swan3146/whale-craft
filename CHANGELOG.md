@@ -2,6 +2,45 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 未发布（待发版）
+
+### 🔴 修复（连 **1.21/1.21.1** 进服成功、1 秒后被踢：`Failed to decode packet 'accept_teleportation'`）
+
+- **现象**（其他用户反馈，已本地用**官方 1.21.1 服务端**完整复现）：进服完全成功（服务端日志
+  `logged in with entity id …` + `joined the game`），紧接着就掉线，服务端报
+
+  ```
+  Internal Exception: io.netty.handler.codec.DecoderException:
+      Failed to decode packet 'serverbound/minecraft:accept_teleportation'
+  ```
+
+  换端口 / 换地址（localhost、回环、局域网 IP）/ 换版本字符串都一样；而**连 26.2 却完全正常**。
+- **根因**：我们的**按键上报兼容层**（为 26.2 加的、每 50ms 发一次 `player_input`）是**无条件**发的，
+  但 **1.21/1.21.1（协议 767）根本没有 `player_input` 这个包**（1.21.3+ 才有）。
+  而 `minecraft-protocol` 的 protodef **遇到未知包名不报错**——实测它写出的字节是
+
+  ```
+  write('player_input')            → 02 00 00        ← id=0x00、body 为空
+  write('definitely_not_a_packet') → 02 00 00        ← 和一个瞎编的包名一模一样
+  write('teleport_confirm')        → 03 00 00 07     ← 正常包：id=0x00 + VarInt(7)
+  ```
+
+  服务端于是把 id `0x00` 当成它自己注册表里的 **`accept_teleportation`**（1.21.x 里确认传送就是 0x00），
+  去读 `teleportId` 时**没有字节可读** ⇒ 抛 `DecoderException` ⇒ 立刻踢人。
+  所以错误名与"我们真正发的包"毫无关系，极具误导性。
+- **修法**：给 core 加一道"**发之前先查这个版本的协议数据里有没有这个包**"的护栏（`#supportsPacket`，
+  带缓存），`player_input` 只在该版本真有它时才发；顺带在每次 tick 也复查一遍（重连可能换版本）。
+  查不到的版本会记一行日志说明，而不是硬发。
+- **顺带修掉「幽灵在线」**：被踢之后 mineflayer 的 `bot.entity` 会残留，而 `online` 只看 `entity`，
+  于是死连接被报成"在线"（工具对着死 socket 干等、世界时间冻结、`/list` 零响应）。
+  现在 `online` 要求**连接没结束**，`status()` 会明确回 `ghost: true` + 一句"要回游戏里请重新 mc_connect"，
+  `requireBot()` 也直接说"连接已结束（bot.entity 是残留）"。
+- **回归测试**（自检 + 真机）：
+  · 自检断言：1.21.1 上**一个包都不发**、26.2 上**照常发**、源码里必须留着这道护栏，
+    以及"幽灵在线"的三条（`online` 变 false / `status()` 标 ghost / `requireBot()` 明确报错）。
+  · 真机复现与验收（本地官方 1.21.1 服务端）：**修前 1 秒被踢**（错误与反馈逐字一致）；
+    **修后稳坐 8 秒不掉线**，`player_input` 发出 0 次、服务端日志再无 `DecoderException`。
+
 ## [0.1.6] - 2026-09-19
 
 > 这一版在 0.1.5 之上只加了一个修复。0.1.5 的全部内容（P0 崩溃修复 / `mc_lan` 只留广播 /

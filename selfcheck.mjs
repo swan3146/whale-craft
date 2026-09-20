@@ -2303,6 +2303,53 @@ console.log('\n--- 认证请求 URL（真机 bug 回归）---')
     console.log(`  ${/Yggdrasil Connect/.test(coreSrc) && /缺 agent 直接回 \*\*400\*\*/.test(coreSrc) ? '✅' : '❌'} 代码里留了这条事故的说明（免得后人又把 agent 删掉）`)
   }
 
+  // ── 协议护栏：版本里没有的包**绝不能发**（2026-09-19 事故）──
+  // 别人反馈：连 1.21.1 进服成功、1 秒后被踢，服务端报
+  //   `Failed to decode packet 'serverbound/minecraft:accept_teleportation'`。
+  // 根因：1.21/1.21.1（协议 767）**没有 player_input 包**，而我们的按键兼容层无条件发它；
+  //   protodef 对**未知包名不报错**，写出的是「id=0x00 + 空 body」（实测字节 `02 00 00`），
+  //   服务端把 id 0x00 当成 accept_teleportation，去读 teleportId 时没字节 → 踢人。
+  // 修法：发之前先查这个版本的协议数据（`#supportsPacket`）。本地用**真官方 1.21.1 服务端**
+  //   复现过：修前 1 秒被踢、修后稳坐 8 秒不掉线，且 player_input 一次都没发。
+  {
+    const { McBot } = await import('./src/core.mjs')
+    const fakeBot = (version) => {
+      const writes = []
+      const client = { ended: false, write: (n) => { writes.push(n) } }
+      const bot = new McBot({ instanceId: 'selftest-proto' })
+      bot.bot = { version, _client: client, entity: {}, controlState: {} }
+      return { bot, writes }
+    }
+    // ①1.21.1 没有这个包 → 一个都不许发
+    const a = fakeBot('1.21.1')
+    a.bot.startInputPackets()
+    await new Promise((r) => setTimeout(r, 200))
+    a.bot.stopInputPackets()
+    console.log(`  ${a.writes.length === 0 ? '✅' : '❌'} 🔴 1.21.1（协议 767，没有 player_input）→ 一个包都不发（实际 ${a.writes.length} 个）`)
+    // ②26.2 有 → 必须照发（别把 26.2 的修复弄坏）
+    const b = fakeBot('26.2')
+    b.bot.startInputPackets()
+    await new Promise((r) => setTimeout(r, 200))
+    b.bot.stopInputPackets()
+    console.log(`  ${b.writes.includes('player_input') && b.writes.length >= 2 ? '✅' : '❌'} 26.2（有这个包）→ 正常发（${b.writes.length} 次 / 200ms）`)
+    // ③源码里必须留着"先查后发"
+    const coreSrc2 = (await import('node:fs')).readFileSync(new URL('./src/core.mjs', import.meta.url), 'utf8')
+    const guarded = /#supportsPacket \(version, name\)/.test(coreSrc2) && /if \(!this\.#supportsPacket\(version, 'player_input'\)\)/.test(coreSrc2)
+    console.log(`  ${guarded ? '✅' : '❌'} 🔴 源码里带"发之前先查该版本有没有这个包"的护栏（删掉就会复发）`)
+
+    // ── 幽灵在线：socket 结束就不算在线 ──
+    const g = new McBot({ instanceId: 'selftest-ghost' })
+    g.bot = { entity: {}, _client: { ended: false } }
+    const liveOk = g.online === true
+    g.bot._client.ended = true
+    const deadOffline = g.online === false
+    let threw = null
+    try { g.requireBot() } catch (e) { threw = e.message }
+    const st = g.status()
+    console.log(`  ${liveOk && deadOffline ? '✅' : '❌'} 🔴 幽灵在线：socket 结束后 online 变 false（改前会因为 bot.entity 残留而报"在线"）`)
+    console.log(`  ${st?.ghost === true && st?.online === false && /连接已经结束/.test(String(st?.hint)) ? '✅' : '❌'} status() 明确标 ghost + 告诉 AI 要重连`)
+    console.log(`  ${/连接已结束/.test(String(threw)) ? '✅' : '❌'} requireBot() 明确报"连接已结束"而不是对着死连接干等（${String(threw).slice(0, 30)}…）`)
+  }
   // 空 authUrl 必须在**发请求之前**就被拦下（不能退化成相对路径）
   {
     const bot = new McBot({ instanceId: 'selftest-auth' })
