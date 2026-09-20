@@ -724,9 +724,14 @@ export class McBot extends EventEmitter {
         this.log(this.lastError)
       })
       b.on('end', (r) => {
+        const why = this.lastError ?? '连接结束'
+        // 🔴 2026-09-19：断线必须**主动播报**（AI 与前端都要马上知道），不能等下一次工具调用才发现。
+        //    以前这里只写日志：于是"被踢之后 mc_status 还说在线、看门狗还挂着、AI 以为还在游戏里"。
+        const willReconnect = Boolean(this.autoReconnect && this.bot === b && !this.stopped)
         this.log('连接结束', r ?? '')
         this.stopInputPackets()
-        if (this.autoReconnect && this.bot === b && !this.stopped) this.#scheduleReconnect(sub)
+        this.emit('offline', { sub, reason: why, willReconnect, at: Date.now() })
+        if (willReconnect) this.#scheduleReconnect(sub)
       })
       b.on('death', () => { this.stats.deaths++; this.emit('death', { position: this.position }) })
       b.on('health', () => {
@@ -1240,8 +1245,14 @@ export class McBot extends EventEmitter {
     if (!b?.entity || ended) {
       return {
         online: false, sub: this.sub, connection, lastError: this.lastError,
+        ...(this.reconnecting ? { reconnecting: true } : {}),
         ...(ended && b?.entity
-          ? { ghost: true, hint: '连接已经结束了（bot.entity 是 mineflayer 的残留）——要回到游戏里请重新 mc_connect' }
+          ? {
+              ghost: true,
+              hint: this.reconnecting
+                ? '连接已经断了（bot.entity 是 mineflayer 的残留），插件正在自动重连——重连成功会自动告诉你'
+                : '连接已经结束了（bot.entity 是 mineflayer 的残留）——要回到游戏里请重新 mc_connect',
+            }
           : {}),
       }
     }

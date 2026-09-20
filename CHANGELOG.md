@@ -4,6 +4,32 @@
 
 ## 未发布（待发版）
 
+### 🔴 修复（断线后状态不同步：`mc_status` / 顶部状态条 / AI 都以为还连着）
+
+- **现象**（用户）："连接断开了状态没有同步。`mc_status` 和顶部状态条都不知道连接断开了，AI 也以为连接还在。"
+- **三处根因**（都在，缺一不可）：
+  1. **core 从来不播报"断线"**：`b.on('end')` 里只写一行日志，不 `emit` 任何东西 ⇒ 上层根本没机会知道；
+  2. **会话不转发**：`McSession` 只把 `spawn/death/reconnect/chat/system/damage` 转进事件队列，
+     没有断线这一类 ⇒ `mc_events` 里看不到、AI 也不会被叫醒；
+  3. **看门狗没有这条唤醒项**，断线后它**照旧挂着**（`watch.armed` 还说"在监听"），
+     前端 `active` 也因此继续为真 —— 三处一起撒谎。
+- **修法**：
+  · core 在连接结束时 `emit('offline', { reason, willReconnect, sub })`（原因取 `lastError`，并判断还要不要自动重连）；
+  · 会话把它转进事件队列（`mc_events` 看得见）；
+  · 看门狗新增唤醒项 **`wakeOn.disconnect`（默认开）**：
+    **会重连** → 叫醒 AI 说"连接断了（原因）——正在自动重连，先别再操作角色"，
+    **不会重连** → 直接关掉看门狗（关闭通知本来就会告诉 AI"你已不在 MC 里、要用 mc_connect 重新进服"）；
+  · 前端：`/api/mc/status` 的 `active` 把"正在自动重连"也算上（否则刚断线状态条整个消失，用户以为插件把状态忘了），
+    状态条新增显示 **"重连中…"**（配 `data-mc-reconnecting`），不再假装"在游戏中"；
+  · 顺手：断线时不再发心跳唤醒（否则会说"我还在游戏里"，那是撒谎）。
+- **真实场景验收**（本地官方 1.21.1 服务端，连上进服后**把服务端进程杀掉**）：
+  `offline` 事件 `{reason:"read ECONNRESET", willReconnect:true}` → `status()` 回
+  `online:false / ghost:true / reconnecting:true` → 看门狗留档有 offline，并把
+  「【MC 看门狗｜disconnect】连接断了（read ECONNRESET）——插件正在自动重连…」**真投给了 AI**。
+- **自检**：新增 10 条断言（唤醒矩阵有 disconnect / 会重连则排队唤醒 / 不会重连则自动关闭 /
+  断线进留档 / **真 socket 断开时 core 确实发出 offline** / 会话转队列 / `modeView` 与
+  `/api/mc/status` 带 `reconnecting` / 状态条显示"重连中…"）。
+
 ### 🔴 修复（连 **1.21/1.21.1** 进服成功、1 秒后被踢：`Failed to decode packet 'accept_teleportation'`）
 
 - **现象**（其他用户反馈，已本地用**官方 1.21.1 服务端**完整复现）：进服完全成功（服务端日志

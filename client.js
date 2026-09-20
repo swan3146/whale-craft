@@ -400,18 +400,26 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const shown = address.length > 26 ? address.slice(0, 25) + '…' : address
       const timeouts = Number(state.timeouts ?? 0)
       const stale = timeouts > 0
+      // 🔴 断线但正在自动重连（2026-09-19）：状态条要**说出**这件事，
+      //    不能因为 online=false 就整个消失（用户会以为插件把状态忘了、AI 也以为还在游戏里）。
+      const reconnecting = !online && state.reconnecting === true
+      const label = online ? '在游戏中' : (reconnecting ? '重连中…' : '未上线')
+      const tip = online
+        ? `${address ? address + '：' : ''}在游戏中${stale ? `（有 ${timeouts} 次操作超时，可能已失步）` : ''}`
+        : (reconnecting
+          ? `连接断了${address ? '（' + address + '）' : ''}，插件正在自动重连…`
+          : (address ? `已连接 ${address} 但角色不在线` : '已连接但角色不在线'))
 
       return React.createElement(
         'div',
         {
           'data-mc-status': '',
           ...(busy ? { 'data-mc-busy': '' } : {}),
-          title: online
-            ? `${address ? address + '：' : ''}在游戏中${stale ? `（有 ${timeouts} 次操作超时，可能已失步）` : ''}`
-            : (address ? `已连接 ${address} 但角色不在线` : '已连接但角色不在线'),
+          ...(reconnecting ? { 'data-mc-reconnecting': '' } : {}),
+          title: tip,
         },
         React.createElement('span', { 'data-mc-dot': '', ...(online && !stale ? {} : { 'data-mc-warn': '' }) }),
-        React.createElement('span', { 'data-mc-text': '' }, online ? '在游戏中' : '未上线'),
+        React.createElement('span', { 'data-mc-text': '' }, label),
         address ? React.createElement('span', { 'data-mc-sub': '', title: address }, shown) : null,
         React.createElement('button', {
           type: 'button', 'data-mc-btn': '', 'data-mc-danger': '',

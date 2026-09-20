@@ -70,6 +70,7 @@ export const WATCH_DEFAULTS = {  /** 进服自动挂载（用户要求：进游�
     itemPickup: false,    // 捡到物品 —— 噪音最大，默认只记事件
     playerJoin: false,    // 有人上线
     playerLeave: false,   // 有人下线
+    disconnect: true,     // 断线/被踢 —— 必须知道（用户 2026-09-19：断了 AI 却以为还在游戏里）
     heartbeat: false,     // 心跳（防睡死；开了要配 heartbeatSec）
   },
 
@@ -377,6 +378,33 @@ export class Watchdog {
     const bot = this.sess.bot
     const on = (evt, fn) => { bot.on(evt, fn); this._listeners.push([evt, fn]) }
 
+    /**
+     * 🔴 断线（2026-09-19 用户："连接断开了状态没有同步，AI 也以为连接还在"）。
+     *
+     * 以前 core **根本不发**这个事件，于是：
+     *   · 看门狗还挂着 → `watch.armed` 说"在监听"，AI 以为还在游戏里；
+     *   · 前端状态条照旧显示"在游戏中"（配合 `online` 只看 bot.entity 的旧判定）；
+     *   · 直到 AI 下一次调工具才撞上"不在线"。
+     * 现在分两种：
+     *   · **会重连** → 叫醒 AI 说清"断了、正在自动重连"，看门狗继续挂着（重连成功后照常工作）；
+     *   · **不重连了**（主动下线 / 重连没戏）→ 关掉看门狗，它的关闭通知本来就会告诉 AI
+     *     "你已经不在 Minecraft 里了，要用 mc_connect 重新进服"。
+     * 想安静点就把 `wakeOn.disconnect` 关掉（mc_config 改），但仍然会记档到事件队列里。
+     */
+    on('offline', (e) => {
+      const reason = String(e?.reason ?? '连接结束')
+      if (e?.willReconnect) {
+        if (!this.config.wakeOn.disconnect) return
+        this.#fire(['disconnect'], {
+          kind: 'offline',
+          text: `连接断了（${reason}）——插件正在自动重连，先别再操作角色，等重连结果`,
+        })
+        return
+      }
+      // 不会重连了：关掉看门狗（notify 默认开 → AI 会收到"你已不在 MC 里"的提示）
+      try { this.disarm(`连接断开：${reason}`) } catch { /* 关不掉也不能让它把流程带走 */ }
+    })
+
     on('chat', ({ who, text }) => {
       const called = this.calledBy(text)
       const near = this.#isNearby(who)
@@ -464,8 +492,8 @@ export class Watchdog {
       this.pendingSince = 0
     }
 
-    // 心跳
-    if (this.config.wakeOn.heartbeat && this.config.heartbeatSec > 0) {
+    // 心跳（⚠️ 只在**真在线**时发：断了还喊"我还在游戏里"就是撒谎，2026-09-19 顺手堵掉）
+    if (this.config.wakeOn.heartbeat && this.config.heartbeatSec > 0 && this.sess.bot.online) {
       const since = now - (this.lastWakeAt || this.startedAt)
       if (since >= this.config.heartbeatSec * 1000) {
         this.#inject(`【心跳｜已挂机 ${Math.round(since / 1000)}s】我还在 ${this.sess.bot.sub ?? '游戏'} 里，`

@@ -319,6 +319,61 @@ console.log('\n--- 看门狗 v2 ---')
   console.log(`  ${called.includes('用户') && notCalled.length === 0 ? '✅' : '❌'} 动态叫法生效：命中 ${JSON.stringify(called)}，未命中 ${JSON.stringify(notCalled)}`)
   console.log(`  ${probe.config.wakeOn.damage && !probe.config.wakeOn.itemPickup ? '✅' : '❌'} 改叫法不影响唤醒矩阵默认值`)
 
+  // ── 断线状态同步（2026-09-19 用户："连接断开了状态没有同步，AI 也以为连接还在"）──
+  // 以前 core **根本不发**"断线"事件：看门狗还挂着、状态条照旧写"在游戏中"（配合旧的
+  // online 只看 bot.entity）、AI 要等下次调工具才撞上"不在线"。这里把三处一起钉住。
+  {
+    const { Watchdog, WATCH_DEFAULTS } = await import('./src/watchdog.mjs')
+    const { McBot } = await import('./src/core.mjs')
+    const { EventEmitter } = await import('node:events')
+    const { readFileSync } = await import('node:fs')
+
+    console.log(`  ${WATCH_DEFAULTS.wakeOn.disconnect === true ? '✅' : '❌'} 🔴 唤醒矩阵新增 disconnect（断线默认叫醒 AI）`)
+
+    // 会重连 → 排一次唤醒；不会重连 → 直接关掉看门狗（它的关闭通知就会告诉 AI 去 mc_connect）
+    const wdA = new Watchdog({ ctx: fakeCtx, sess: { bot: new EventEmitter(), events: [], config: {} }, agent: A.agent, onFire: () => {} })
+    wdA.arm()
+    wdA.sess.bot.emit('offline', { reason: '被踢: 测试', willReconnect: true, sub: '' })
+    const queued = wdA.pending?.[0]
+    console.log(`  ${queued?.reasons?.includes('disconnect') && /正在自动重连/.test(String(queued?.text)) ? '✅' : '❌'} 🔴 断线（会重连）→ 排队唤醒 AI：「${String(queued?.text ?? '').slice(0, 34)}…」`)
+    console.log(`  ${wdA.armed === true ? '✅' : '❌'} 会重连时看门狗继续挂着（重连成功后照常监听）`)
+    console.log(`  ${wdA.log.some((e) => e.kind === 'offline') ? '✅' : '❌'} 断线进了看门狗事件留档（mc_watch log 看得到）`)
+
+    const wdB = new Watchdog({ ctx: fakeCtx, sess: { bot: new EventEmitter(), events: [], config: {} }, agent: A.agent, onFire: () => {} })
+    wdB.arm()
+    wdB.sess.bot.emit('offline', { reason: '连接结束', willReconnect: false, sub: '' })
+    console.log(`  ${wdB.armed === false ? '✅' : '❌'} 🔴 不会重连时看门狗自动关闭（关闭通知会告诉 AI"你已不在 MC 里、要 mc_connect"）`)
+    try { wdA.disarm('自检结束', { notify: false }) } catch {}
+    try { wdB.disarm('自检结束', { notify: false }) } catch {}
+
+    // 真 socket 断开 → core 必须发出 offline（不是只在日志里写一行）
+    {
+      const { createServer } = await import('node:net')
+      const { mkdtempSync } = await import('node:fs')
+      const { tmpdir } = await import('node:os')
+      const { join } = await import('node:path')
+      const tmpDir = mkdtempSync(join(tmpdir(), 'whale-offline-'))
+      const srv = createServer((sock) => { sock.destroy() })      // 接受即掐断
+      await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+      const port = srv.address().port
+      const bot = new McBot({ instanceId: 'selftest-offline', connectTimeoutMs: 1500, lockDir: tmpDir, logFile: join(tmpDir, 'x.log') })
+      const seen = []
+      bot.on('offline', (e) => seen.push(e))
+      let threw = null
+      try { await bot.connect({ host: '127.0.0.1', port, version: '1.21.1', auth: { mode: 'offline', name: 'DeepSeek' } }) } catch (e) { threw = e.message }
+      srv.close()
+      console.log(`  ${seen.length >= 1 && seen[0].willReconnect === false ? '✅' : '❌'} 🔴 真 socket 断开 → core 发出 offline 事件（${seen.length} 次）`)
+      console.log(`  ${String(threw ?? '').length > 0 ? '✅' : '❌'} 连不上时 connect() 以普通错误结束（不静默、不挂住）：${String(threw ?? '').slice(0, 26)}…`)
+    }
+
+    // 三处链路都得在（删掉任何一处就等于又把状态丢了）
+    const idxSrc = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+    console.log(`  ${/bot\.on\('offline'/.test(idxSrc) && /连接断开：/.test(idxSrc) ? '✅' : '❌'} 会话把 offline 转进事件队列（mc_events 能看到）`)
+    console.log(`  ${/reconnecting: Boolean\(this\.bot\.reconnecting\)/.test(idxSrc) && /Boolean\(sess\.bot\.reconnecting\)/.test(idxSrc) ? '✅' : '❌'} 🔴 modeView 与 /api/mc/status 都带上"正在重连"（否则刚断线状态条整个消失）`)
+    const cliSrc = readFileSync(new URL('./client.js', import.meta.url), 'utf8')
+    console.log(`  ${/重连中/.test(cliSrc) && /data-mc-reconnecting/.test(cliSrc) ? '✅' : '❌'} 🔴 状态条会显示"重连中…"（不再假装在游戏中）`)
+  }
+
   // 非法配置项要清晰报错
   try {
     await tools.get('mc_config').execute({ patch: { 不存在的项: 1 } }, A)

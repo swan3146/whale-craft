@@ -174,6 +174,9 @@ class McSession {
     this.bot.on('spawn', (e) => self.#pushEvent('lifecycle', `已上线 ${e.sub} @ ${JSON.stringify(e.position)}`))
     this.bot.on('death', (e) => self.#pushEvent('lifecycle', `我死了 @ ${JSON.stringify(e.position)}`))
     this.bot.on('reconnect', (e) => self.#pushEvent('lifecycle', `已重连 ${e.sub}`))
+    // 🔴 断线也要进事件队列（2026-09-19）：`mc_events` 里看得见，AI 才不会以为"一直在线"。
+    this.bot.on('offline', (e) => self.#pushEvent('lifecycle',
+      `连接断开：${e?.reason ?? '连接结束'}${e?.willReconnect ? '（正在自动重连）' : '（不会自动重连）'}`))
     this.bot.on('chat', ({ who, text }) => self.#pushEvent('chat', `<${who}> ${text}`, { who }))
     this.bot.on('system', ({ text }) => self.#pushEvent('system', text))
     this.bot.on('damage', (e) => self.#pushEvent('damage', `血量降到 ${e.health} @ ${JSON.stringify(e.position)}`))
@@ -212,6 +215,8 @@ class McSession {
     return {
       mode: this.mode,
       online: this.bot.online,
+      // 断了但正在自动重连：前端要能显示"重连中"，AI 也别以为还能操作角色
+      reconnecting: Boolean(this.bot.reconnecting),
       sub: this.bot.sub,
       connection: this.bot.connectionView(),
       pendingEvents: this.events.length,
@@ -1110,7 +1115,9 @@ export function apply(ctx, config) {
       // 🔴 active = **真在游戏里**（机器人在线 或 看门狗挂着），不是"这个会话碰过 mc_* 工具"。
       //    只要调过一次 mc_status 就会建 McSession；若按"存在即 active"，
       //    状态条会在所有用过的会话上永久显示"未上线"（用户要的是"只在真进游戏时显示"）。
-      const active = Boolean(sess.bot.online) || Boolean(sess.watchdog?.armed)
+      // 🔴 2026-09-19 补：**正在自动重连**时也要算 active —— 否则刚断线状态条就整个消失，
+      //    用户看不到"断了、正在重连"，还以为插件把状态忘了。
+      const active = Boolean(sess.bot.online) || Boolean(sess.bot.reconnecting) || Boolean(sess.watchdog?.armed)
       if (!active) return sendJson(res, 200, { ok: true, active: false })
       return sendJson(res, 200, {
         ok: true, active: true, sessionId,
