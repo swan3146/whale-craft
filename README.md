@@ -131,7 +131,7 @@ dsh plugin --profile web add link:/path/to/whale-craft
 
 ---
 
-## 工具（28 个，三层命名空间）
+## 工具（29 个，三层命名空间）
 
 | 层 | 数量 | 工具 |
 | --- | --- | --- |
@@ -153,6 +153,13 @@ dsh plugin --profile web add link:/path/to/whale-craft
   超时自己兜（默认 5 秒、上限 30 秒），连不上时把原因说成人话
   （`ECONNREFUSED`=端口没人听 · `ENOTFOUND`=域名拼错 · 超时=防火墙或服务端 `enable-status=false`）。
   与 `mc_lan` 正好互补：**不知道地址**听公告，**知道地址**用它探一次，再用 `mc_connect` 真进服；
+- `mc_events` 与看门狗**分工明确**：**"该不该醒"由看门狗判断**（有人叫它 / 受击 / 死亡 / 断线…会主动唤醒），
+  **"发生过什么"由 `mc_events` 提供**（聊天、系统消息、受伤、上线/死亡/重连/断线；⚠️ 被传送 / 捡物 /
+  其他玩家上下线只在看门狗留档里，用 `mc_watch {action:"log"}` 看）。
+  `waitSec` 只是兜底：**看门狗要唤醒时会打断这个等待**（返回 `interrupted:true`），
+  否则一次长等待会把唤醒文案压到等待结束才投递；
+- **断线会主动播报**：掉线会通知 AI（并进事件队列），自动重连期间顶部状态条显示**「重连中…」**、
+  `mc_status` 回 `reconnecting`，重连成功也会说一声——**不会出现"断了却还显示在游戏中"**；
 - 记忆是**语义层**不是文件别名：`topic`/`server` 自动定位路径、`append` 带 `key` 覆盖同 key 那条、
   跨文件 `search`、删除、把任意文件（含图片）`put` 进记忆再当**图片附件**读回来。
 
@@ -278,7 +285,7 @@ dsh plugin --profile web add link:/path/to/whale-craft
 
 ```bash
 node tools/check-core.mjs     # 全树语法 + 动态 import + 私有字段一致性（改 core.mjs 必跑）
-node selfcheck.mjs            # 686 条离线断言（假 ctx，不需要 MC 服务器、不连网）
+node selfcheck.mjs            # 726 条离线断言（假 ctx，不需要 MC 服务器、不连网）
 # 起一个隔离 DSH 实例验证"整树加载"（需要一份 DSH checkout）：
 DSH_ROOT=/path/to/deepseek-harness node tools/isolate.mjs start
 ```
@@ -292,7 +299,7 @@ DSH_ROOT=/path/to/deepseek-harness node tools/isolate.mjs start
 CI 跑的就是这两条（`.github/workflows/ci.yml`）：**ubuntu（Node 22 / 24）+ windows（Node 22）**；
 另有一个「打包产物」job，`npm pack` 之后核对 tarball 里该有的文件都在、且没混进 `node_modules` / 日志 / 账户。
 
-发布走 tag（`.github/workflows/release.yml`）：`git tag v0.1.4 && git push origin v0.1.4` →
+发布走 tag（`.github/workflows/release.yml`）：`git tag v0.1.7 && git push origin v0.1.7` →
 先跑上面两条 + 校验 tag 与 `package.json` 版本一致，再 `npm pack` 并把 zip 挂到 GitHub Release
 （正文取 `CHANGELOG.md` 里本版本那一节），最后**发 npm**（用仓库 secret `NPM_TOKEN`）。
 `npm publish` 前还会自动跑一遍上面两条（`prepublishOnly`）—— **坏树发不出去**。
@@ -302,6 +309,9 @@ CI 跑的就是这两条（`.github/workflows/ci.yml`）：**ubuntu（Node 22 / 
   名字必须是 `NPM_TOKEN`，值是 npm 的 Automation token。
 - 也可以**在本机手动发**（不依赖任何 secret）：`npm login` 后跑 `npm run publish:npm`
   —— 前置校验、失败即停、默认要确认，细则见 `RELEASING.md`。
+- **每个版本改了什么**见 [`CHANGELOG.md`](CHANGELOG.md)（`0.1.7`：修 1.21/1.21.1 进服掉线、
+  断线状态不同步、`mc_events` 的等待堵住唤醒；`0.1.6`：修皮肤站登录 400；`0.1.5`：修"连不存在的服
+  把整个 DSH 搞崩"、`mc_lan` 只留局域网公告、新增 `mc_ping`、默认行事准则第五版）。
 
 ---
 
@@ -344,6 +354,11 @@ read the world and keep notes — and wake itself up when something worth notici
 - **A single-channel watchdog** — events reach the model through one tool (`mc_watch`) only: it wakes
   the agent when idle and injects a note mid-generation when busy. It never fakes a user message.
   Player chat is recognised whether the server sends it signed, unsigned, or in the system slot.
+  A blocking `mc_events {waitSec}` wait is **interrupted** when the watchdog wants to wake the agent,
+  so a long wait can never delay a wake-up.
+- **Honest connection state** — a dropped connection is announced (to the agent and to the UI: the
+  status chip shows *reconnecting…*), and the watcher disarms when there is nothing left to watch.
+  No more "in game" while the socket is already dead.
 - **Long-term memory** — a plain document tree under `<workspace>/.whale-craft/`, indexed by the agent
   and injected as a plugin notice when the session starts.
 - **A per-release built-in prompt** — a hard-coded, non-editable note that ships with each version
@@ -354,7 +369,7 @@ read the world and keep notes — and wake itself up when something worth notici
   The HTTP route that serves those files exists **only** in online mode.
 - **Passwords never reach the model** — credentials live in the host credential store; accounts are
   managed from the in-app **MC Settings** dialog.
-- **Offline regression suite** — 686 assertions, no Minecraft server required.
+- **Offline regression suite** — 726 assertions, no Minecraft server required.
 
 ### Install
 
