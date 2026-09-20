@@ -39,6 +39,7 @@ import { userMessage, messageFactoryKind, pluginLoadNote } from './src/user-mess
 import { ImageEngine, imageEngineAvailable, imageEngineError } from './src/image.mjs'
 import { listenLanBroadcast } from './src/lan.mjs'
 import { statusPing, parseAddress } from './src/ping.mjs'
+import { waitForEvents } from './src/wait.mjs'
 
 export const name = 'whale_craft'
 export const inject = ['webServer', 'tools']
@@ -160,7 +161,21 @@ class McSession {
     this.maxEvents = 200
     this.watchdog = null            // 看门狗（Watchdog 实例，进服自动挂载）
     this.selectedAccount = null     // 本会话选定的账户 innerID（mc_accounts{action:"use"}）
+    // 「正在等待」被打断的标记（看门狗要唤醒 AI 时置位）——见 src/wait.mjs 的文件头说明：
+    // 宿主把 steer 放在下一个 step 边界投递，而 step 边界要等当前工具返回 ⇒
+    // 一个 mc_events{waitSec} 就能把唤醒拖到最后。这个标记让等待提前收工。
+    this.waitInterruptedAt = 0
+    this.waitInterruptReason = null
     this._wired = false
+  }
+
+  /**
+   * 打断本会话正在进行的 `mc_events {waitSec}` 等待（看门狗注入前调用）。
+   * 只置一个标记：等待循环每 250ms 看一眼，见到就立刻返回（工具一返回，step 结束，唤醒文案当场投出去）。
+   */
+  interruptWait(reason = null) {
+    this.waitInterruptedAt = Date.now()
+    this.waitInterruptReason = reason ? String(reason) : null
   }
 
   /* ── 事件绑定（懒绑：首次使用时才 wire，避免未连接的 bot 产生无意义事件）── */
@@ -1763,13 +1778,17 @@ export function apply(ctx, config) {
 
   ctx.tools.register(asTool({
     name: 'mc_events',
-    description: '读取/消费当前会话的 MC 事件队列（看门狗记录的一切：聊天、受伤、死亡、被传送、捡物、上下线）。'
-      + '默认消费掉；peek=true 只看不清。给 waitSec 则先阻塞等待最多这么久（替代旧的 mc_wait）。',
+    description: '读取/消费当前会话的 MC 事件队列（**看门狗记下来的**：聊天、系统消息、受伤、上线/死亡/重连/断线）。'
+      + '默认消费掉；`peek=true` 只看不清。\n'
+      + '⚠️ **被传送 / 捡物 / 其他玩家上下线不在这里**（那些只在看门狗的留档里，用 `mc_watch {action:"log"}` 看）。\n'
+      + '⚠️ `waitSec` 是**兜底**，别用它长时间空等：有人叫你（mention）/ 受击 / 死亡 / 断线时，'
+      + '**看门狗会主动叫醒你**，而且**会打断这个等待**（返回里 `interrupted:true` 就是在告诉你"有人找你了，'
+      + '唤醒内容马上会作为提示注入进来"）。真需要盯着某一类事件时才给 waitSec（建议 ≤30）。',
     parameters: {
       limit: { type: 'number', description: '最多取几条（默认 20）' },
       kind: { type: 'string', description: '只看某类：chat / system / damage / lifecycle' },
       peek: { type: 'boolean', description: 'true=只看不消费' },
-      waitSec: { type: 'number', description: '先等最多几秒（默认 0=不等，上限 120）' },
+      waitSec: { type: 'number', description: '先等最多几秒（默认 0=不等，上限 120）。⚠️ 会被看门狗唤醒打断，别长等' },
     },
     output: text(),
     timeoutMs: 130_000,
@@ -1778,24 +1797,35 @@ export function apply(ctx, config) {
       const limit = Math.min(Math.max(Number(args.limit ?? 20), 1), 100)
       const kind = args.kind ? String(args.kind) : null
 
-      // 可选阻塞等待（吸收原 mc_wait）
+      // 可选阻塞等待（吸收原 mc_wait）。⚠️ 等待逻辑在 src/wait.mjs：**看门狗唤醒会打断它**
+      //    —— 否则 steer 注入要等这个工具跑完（2026-09-19 真机：用户空等特别久）。
       const waitSec = Math.min(Math.max(Number(args.waitSec ?? 0), 0), 120)
       let waitedMs = 0
+      let interrupted = false
+      let interruptReason = null
       if (waitSec > 0) {
-        const from = sess.events.length
-        const t0 = Date.now()
-        while (Date.now() - t0 < waitSec * 1000) {
-          if (exec?.signal?.aborted) break              // 用户按停止 → 别空等
-          if (sess.events.slice(from).some((e) => !kind || e.kind === kind)) break
-          await new Promise((r) => setTimeout(r, 250))
-        }
-        waitedMs = Date.now() - t0
+        const r = await waitForEvents({
+          sess, from: sess.events.length, kind, waitSec, signal: exec?.signal ?? null,
+        })
+        waitedMs = r.waitedMs
+        interrupted = r.interrupted
+        interruptReason = r.reason
       }
 
       const list = args.peek
         ? sess.events.filter((e) => !kind || e.kind === kind).slice(-limit)
         : sess.drainEvents(limit, kind)
-      return { waitedMs, count: list.length, events: list }
+      return {
+        waitedMs, count: list.length, events: list,
+        ...(interrupted
+          ? {
+              interrupted: true,
+              interruptReason,
+              hint: '等待被打断：看门狗命中唤醒条件（有人叫你 / 受击 / 死亡 / 断线…），'
+                + '唤醒内容马上会作为提示注入——**先别急着再 wait**，等那条提示进来（或直接看上面的 events）。',
+            }
+          : {}),
+      }
     },
   }))
 

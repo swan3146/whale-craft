@@ -374,6 +374,72 @@ console.log('\n--- 看门狗 v2 ---')
     console.log(`  ${/重连中/.test(cliSrc) && /data-mc-reconnecting/.test(cliSrc) ? '✅' : '❌'} 🔴 状态条会显示"重连中…"（不再假装在游戏中）`)
   }
 
+  // ── 等待会不会"堵住唤醒"（2026-09-19 用户实测：等到消息、提及了也没唤醒，空等特别久）──
+  // 机制：宿主把 steer 放在**下一个 step 边界**投递，而 step 边界要等当前工具返回 ⇒
+  //      `mc_events {waitSec:120}` 会把唤醒文案压在等待后面。修法：唤醒前先打断等待。
+  {
+    const { waitForEvents } = await import('./src/wait.mjs')
+    const { Watchdog } = await import('./src/watchdog.mjs')
+    const { EventEmitter } = await import('node:events')
+    const { readFileSync } = await import('node:fs')
+
+    // ① 等到事件 → 立刻回
+    {
+      const sess = { events: [] }
+      const p = waitForEvents({ sess, from: 0, kind: 'chat', waitSec: 5, pollMs: 25 })
+      setTimeout(() => sess.events.push({ kind: 'chat', text: 'hi' }), 120)
+      const t0 = Date.now(); const r = await p; const dt = Date.now() - t0
+      console.log(`  ${r.interrupted === false && r.reason === '有事件' && dt < 1000 ? '✅' : '❌'} 等到事件立刻回（${dt}ms，不等满 5s）`)
+    }
+    // ② 被唤醒打断 → 立刻回（这条就是修的东西）
+    {
+      const sess = { events: [], waitInterruptedAt: 0, waitInterruptReason: null }
+      const p = waitForEvents({ sess, from: 0, waitSec: 30, pollMs: 25 })
+      setTimeout(() => { sess.waitInterruptedAt = Date.now(); sess.waitInterruptReason = 'mention' }, 120)
+      const t0 = Date.now(); const r = await p; const dt = Date.now() - t0
+      console.log(`  ${r.interrupted === true && r.reason === 'mention' && dt < 1000 ? '✅' : '❌'} 🔴 被唤醒打断 → 立刻回（${dt}ms，而不是干等 30 秒）：reason=${r.reason}`)
+    }
+    // ③ 用户按停止 → 立刻回
+    {
+      const sess = { events: [] }
+      const ac = new AbortController()
+      const p = waitForEvents({ sess, from: 0, waitSec: 30, pollMs: 25, signal: ac.signal })
+      setTimeout(() => ac.abort(), 100)
+      const t0 = Date.now(); const r = await p; const dt = Date.now() - t0
+      console.log(`  ${r.interrupted === false && r.reason === '用户停止' && dt < 1000 ? '✅' : '❌'} 用户停止 → 立刻回（${dt}ms，不空等）`)
+    }
+    // ④ 没人找它 → 到点才回
+    {
+      const sess = { events: [] }
+      const t0 = Date.now()
+      const r = await waitForEvents({ sess, from: 0, waitSec: 0.5, pollMs: 50 })
+      const dt = Date.now() - t0
+      console.log(`  ${!r.interrupted && dt >= 400 && dt < 1300 ? '✅' : '❌'} 没人找它就等到点（${dt}ms ≈ 500ms）`)
+    }
+    // ⑤ 看门狗注入前**真的**会打断（stub 会话记录调用）
+    {
+      let interruptedWith = null
+      const stub = { bot: new EventEmitter(), events: [], config: {}, interruptWait: (r) => { interruptedWith = r } }
+      const wd = new Watchdog({
+        ctx: fakeCtx, sess: stub,
+        agent: { id: 'w', status: 'running', steer: () => {} },
+        onFire: () => {},
+      })
+      wd.arm()
+      wd.updateConfig({ observeWindowMs: 100 })
+      stub.bot.emit('chat', { who: 'someone', text: 'deepseek 在吗' })     // 命中叫法
+      await new Promise((r) => setTimeout(r, 1400))                        // 观察窗口 + tick(1s)
+      console.log(`  ${interruptedWith ? '✅' : '❌'} 🔴 看门狗注入前会打断等待（interruptWait("${interruptedWith ?? ''}")）`)
+      try { wd.disarm('自检结束', { notify: false }) } catch {}
+    }
+    // ⑥ 接线不能丢（在 mc_events 的工具侧 + 看门狗的注入口）
+    const idxSrc2 = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+    const wdSrc2 = readFileSync(new URL('./src/watchdog.mjs', import.meta.url), 'utf8')
+    console.log(`  ${/await waitForEvents\(/.test(idxSrc2) && /interrupted: true/.test(idxSrc2) ? '✅' : '❌'} mc_events 用抽出来的等待逻辑，并把"被打断"告诉 AI`)
+    console.log(`  ${/this\.sess\?\.interruptWait\?\./.test(wdSrc2) ? '✅' : '❌'} 🔴 看门狗在**所有**注入前都打断等待（一个口子覆盖唤醒/关闭通知/补提醒/心跳）`)
+    console.log(`  ${/被传送 \/ 捡物 \/ 其他玩家上下线不在这里/.test(idxSrc2) ? '✅' : '❌'} 工具描述不再谎称"含被传送/捡物/上下线"（那些只在 mc_watch log 里）`)
+  }
+
   // 非法配置项要清晰报错
   try {
     await tools.get('mc_config').execute({ patch: { 不存在的项: 1 } }, A)
