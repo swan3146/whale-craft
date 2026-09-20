@@ -430,6 +430,8 @@ export class McBot extends EventEmitter {
     this.autoReconnect = true
     this.reconnectDelay = 5000
     this.reconnecting = false
+    /** 断线期（从掉线一直置到**真重连成功**）：前端据此显示"重连中…"，见 end 处理里的说明 */
+    this.reconnectPending = false
     this.chat = []            // { at, kind, who, text }
     this.inputTimer = null
     this.stopped = false
@@ -730,6 +732,10 @@ export class McBot extends EventEmitter {
         const willReconnect = Boolean(this.autoReconnect && this.bot === b && !this.stopped)
         this.log('连接结束', r ?? '')
         this.stopInputPackets()
+        // 「断线期」标记：一直置到**真重连成功**为止。
+        // why：`reconnecting` 只在"两次尝试之间的等待窗口"为真，一旦开始尝试连接（最长 45s）它就变 false——
+        //      只看它的话，状态条在那 45 秒里会从"重连中…"退回"未上线"，看着像插件放弃了。
+        if (willReconnect) this.reconnectPending = true
         this.emit('offline', { sub, reason: why, willReconnect, at: Date.now() })
         if (willReconnect) this.#scheduleReconnect(sub)
       })
@@ -767,6 +773,7 @@ export class McBot extends EventEmitter {
       this.connectedAt = Date.now()
       this.stats.connects++
       this.autoReconnect = true
+      this.reconnectPending = false      // 进来了就算"断线期"结束（手动 mc_connect 也算）
       this.startInputPackets()
       this.startObserver()
       this.writeLock()
@@ -791,6 +798,8 @@ export class McBot extends EventEmitter {
       try {
         await this.connect(sub)
         this.reconnectDelay = 5000
+        // 真回来了才算"断线期"结束（前端/状态据此从"重连中…"切回"在游戏中"）
+        this.reconnectPending = false
         this.emit('reconnect', { sub })
       } catch (e) {
         this.log('重连失败：' + e.message)
@@ -1243,13 +1252,14 @@ export class McBot extends EventEmitter {
     //    连接已结束就按离线报，并明确标出 ghost，免得 AI 与用户都以为还在游戏里。
     const ended = b?._client?.ended === true
     if (!b?.entity || ended) {
+      const reconnecting = Boolean(this.reconnecting || this.reconnectPending)
       return {
         online: false, sub: this.sub, connection, lastError: this.lastError,
-        ...(this.reconnecting ? { reconnecting: true } : {}),
+        ...(reconnecting ? { reconnecting: true } : {}),
         ...(ended && b?.entity
           ? {
               ghost: true,
-              hint: this.reconnecting
+              hint: reconnecting
                 ? '连接已经断了（bot.entity 是 mineflayer 的残留），插件正在自动重连——重连成功会自动告诉你'
                 : '连接已经结束了（bot.entity 是 mineflayer 的残留）——要回到游戏里请重新 mc_connect',
             }

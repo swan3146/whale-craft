@@ -369,9 +369,12 @@ console.log('\n--- 看门狗 v2 ---')
     // 三处链路都得在（删掉任何一处就等于又把状态丢了）
     const idxSrc = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
     console.log(`  ${/bot\.on\('offline'/.test(idxSrc) && /连接断开：/.test(idxSrc) ? '✅' : '❌'} 会话把 offline 转进事件队列（mc_events 能看到）`)
-    console.log(`  ${/reconnecting: Boolean\(this\.bot\.reconnecting\)/.test(idxSrc) && /Boolean\(sess\.bot\.reconnecting\)/.test(idxSrc) ? '✅' : '❌'} 🔴 modeView 与 /api/mc/status 都带上"正在重连"（否则刚断线状态条整个消失）`)
+    console.log(`  ${/reconnecting: Boolean\(this\.bot\.reconnecting \|\| this\.bot\.reconnectPending\)/.test(idxSrc) && /Boolean\(sess\.bot\.reconnecting \|\| sess\.bot\.reconnectPending\)/.test(idxSrc) ? '✅' : '❌'} 🔴 modeView 与 /api/mc/status 都带上"正在重连"（含"正在尝试连接"那段，否则状态条会中途退回"未上线"）`)
     const cliSrc = readFileSync(new URL('./client.js', import.meta.url), 'utf8')
     console.log(`  ${/重连中/.test(cliSrc) && /data-mc-reconnecting/.test(cliSrc) ? '✅' : '❌'} 🔴 状态条会显示"重连中…"（不再假装在游戏中）`)
+    // 「断线期」标记的生命周期：掉线时置位、**真重连成功**才清（只看 reconnecting 会在尝试连接的 45s 里退回"未上线"）
+    const coreSrc3 = readFileSync(new URL('./src/core.mjs', import.meta.url), 'utf8')
+    console.log(`  ${/if \(willReconnect\) this\.reconnectPending = true/.test(coreSrc3) && /this\.reconnectPending = false/.test(coreSrc3) ? '✅' : '❌'} 🔴 断线期标记：掉线置位 →（重连成功 / 手动进服）才清`)
   }
 
   // ── 等待会不会"堵住唤醒"（2026-09-19 用户实测：等到消息、提及了也没唤醒，空等特别久）──

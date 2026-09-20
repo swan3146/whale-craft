@@ -230,8 +230,8 @@ class McSession {
     return {
       mode: this.mode,
       online: this.bot.online,
-      // 断了但正在自动重连：前端要能显示"重连中"，AI 也别以为还能操作角色
-      reconnecting: Boolean(this.bot.reconnecting),
+      // 断了但还要重连（含"正在尝试连接"那段，最长 45s）：前端要能显示"重连中"，AI 也别以为还能操作角色
+      reconnecting: Boolean(this.bot.reconnecting || this.bot.reconnectPending),
       sub: this.bot.sub,
       connection: this.bot.connectionView(),
       pendingEvents: this.events.length,
@@ -1132,7 +1132,10 @@ export function apply(ctx, config) {
       //    状态条会在所有用过的会话上永久显示"未上线"（用户要的是"只在真进游戏时显示"）。
       // 🔴 2026-09-19 补：**正在自动重连**时也要算 active —— 否则刚断线状态条就整个消失，
       //    用户看不到"断了、正在重连"，还以为插件把状态忘了。
-      const active = Boolean(sess.bot.online) || Boolean(sess.bot.reconnecting) || Boolean(sess.watchdog?.armed)
+      //    （用 reconnecting || reconnectPending：后者覆盖"正在尝试连接"那段，最长 45s）
+      const active = Boolean(sess.bot.online)
+        || Boolean(sess.bot.reconnecting || sess.bot.reconnectPending)
+        || Boolean(sess.watchdog?.armed)
       if (!active) return sendJson(res, 200, { ok: true, active: false })
       return sendJson(res, 200, {
         ok: true, active: true, sessionId,
