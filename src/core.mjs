@@ -31,6 +31,37 @@ const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 const HERE = dirname(fileURLToPath(import.meta.url))
 
 /**
+ * 写 VarInt（Minecraft 协议变量长度整数）。
+ * AuthMe 对话框提交需要手动构造 raw packet。
+ */
+function writeVarInt (value) {
+  const bufs = []
+  let temp = value
+  while (true) {
+    let byte = temp & 0x7F
+    temp >>>= 7
+    if (temp !== 0) byte |= 0x80
+    bufs.push(byte)
+    if (temp === 0) break
+  }
+  return Buffer.from(bufs)
+}
+
+/**
+ * 尝试加载 prismarine-nbt（从 mineflayer 的依赖树里解析）。
+ * 用于 AuthMe 对话框登录：解析 show_dialog 的 NBT 并构造 custom_click_action 回复。
+ */
+let prismarineNBT = null
+try {
+  const requireFromMf = createRequire(createRequire(import.meta.url).resolve('mineflayer'))
+  prismarineNBT = requireFromMf('prismarine-nbt')
+} catch {
+  try {
+    prismarineNBT = (await import('prismarine-nbt')).default ?? (await import('prismarine-nbt'))
+  } catch {}
+}
+
+/**
  * 从 mineflayer **自己的**依赖树里解析包（同一份 node_modules）。
  * 用途：创造模式取物要 new 一个 prismarine-item 的 Item 实例塞进槽位。
  * ⚠️ 用"解析到的 mineflayer 实际路径"当锚点，**不写死目录** —— 这样插件装在哪儿都成立。
@@ -143,6 +174,8 @@ export const DEFAULTS = {
   moveBudgetMs: 40_000,
   chatHistory: 300,
   inputPacket: process.env.MC_INPUT_PACKET !== '0',
+  /** AuthMe 密码（离线服 + AuthMe preJoin 对话框登录时使用） */
+  authmePassword: process.env.MC_AUTHME_PASSWORD ?? '',
   /**
    * 日志落盘位置。🔴 **默认不写插件包目录**（装进 `node_modules/` 后那可能是只读的、
    * 升级时也会被覆盖）：默认写 `$DSH_HOME/whale_craft/logs/`，可用 `MC_LOG` 覆盖。
@@ -715,6 +748,53 @@ export class McBot extends EventEmitter {
       })
       b._createdAt = Date.now()
 
+      // ──── AuthMe 6.x 对话框登录（26.2 Paper + Dialog API） ────
+      // AuthMe preJoin 对话框在 configuration 阶段下发，必须用 custom_click_action 回复密码，
+      // 否则 loginCancelKicks=true 时会被踢。preJoin.enable=true 时此流程不可跳过。
+      const authmePwd = this.cfg.authmePassword
+      if (authmePwd && prismarineNBT) {
+        const submitAuthMeDialog = (data) => {
+          try {
+            // dialog 可能是 registryEntryHolder，真正的 NBT 在 .data 上
+            let dialog = data?.dialog ?? data
+            if (dialog?.data) dialog = dialog.data
+
+            let simple = {}
+            try { simple = prismarineNBT.simplify(dialog) || {} } catch { simple = {} }
+
+            // 从对话框里解析出提交按钮的 action id 和输入框的 key
+            const submitId =
+              (Array.isArray(simple.actions) ? simple.actions : [])
+                .map((a) => a?.action?.id)
+                .find((id) => typeof id === 'string' && id.endsWith('/submit')) ||
+              'authme:prejoin-login/submit'
+            const inputKey =
+              (Array.isArray(simple.inputs) && simple.inputs[0]?.key) || 'password'
+
+            const payloadNbt = prismarineNBT.comp({ [inputKey]: prismarineNBT.string(authmePwd) })
+            const fullNbt = prismarineNBT.writeUncompressed(payloadNbt, 'big')
+            // 匿名 NBT：保留根 compound 类型字节(0x0a)，去掉根名(00 00)
+            const anonNbt = Buffer.concat([fullNbt.subarray(0, 1), fullNbt.subarray(3)])
+
+            const idBuf = Buffer.from(submitId, 'utf8')
+            // configuration 阶段 packet id = 0x08，play 阶段 = 0x44
+            const packetId = b._client?.state === 'play' ? 0x44 : 0x08
+            const body = Buffer.concat([
+              writeVarInt(packetId),
+              writeVarInt(idBuf.length), idBuf,
+              writeVarInt(anonNbt.length), anonNbt,
+            ])
+            b._client.writeRaw(body)
+            this.log('AuthMe 对话框已提交（submitId=' + submitId + '）')
+          } catch (e) {
+            this.log('AuthMe 对话框提交失败：' + (e?.message ?? e))
+          }
+        }
+        b._client.on('packet', (data, meta) => {
+          if (meta.name === 'show_dialog') submitAuthMeDialog(data)
+        })
+      }
+
       let dupe = false
       b.on('error', (e) => { this.#reportError(e) })
       b.on('kicked', (r) => {
@@ -748,7 +828,16 @@ export class McBot extends EventEmitter {
       try {
         await new Promise((resolve, reject) => {
           const t = setTimeout(() => reject(new Error(`连接 ${sub} 超时`)), this.cfg.connectTimeoutMs)
-          b.once('spawn', () => { clearTimeout(t); resolve() })
+          b.once('spawn', () => {
+            clearTimeout(t)
+            // ──── AuthMe post-join /login 命令 ────
+            // preJoin 对话框登录成功后，服务器可能还需要 post-join /login 命令。
+            // 如果对话框已经登录成功，这条命令会多余但不会出错（AuthMe 会忽略已登录玩家）。
+            if (authmePwd) {
+              try { b.chat(`/login ${authmePwd}`) } catch {}
+            }
+            resolve()
+          })
           b.once('kicked', (r) => { clearTimeout(t); reject(new Error(`被踢: ${String(r).slice(0, 200)}`)) })
         })
       } catch (e) {

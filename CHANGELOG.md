@@ -2,6 +2,38 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布] - fork 分支 `feat/authme-26.2-dsh-0.1.7`
+
+> ⚠️ 这是 **fork 分支**，不是上游发布的版本。完整说明见 [FORK-NOTES.md](./FORK-NOTES.md)。
+> 基线：上游 `aac3130`（whale_craft 0.1.7）。
+
+### ✨ 新增
+
+- **AuthMe 6.x 对话框登录**（Minecraft 26.2 / AuthMe 6.x / 协议 775）：
+  AuthMe 在 configuration 阶段下发 `show_dialog`，必须用 `custom_click_action` 原始包回密码，
+  否则 `loginCancelKicks=true` 时会被踢下线。mineflayer 不支持这一步，因此手写协议：
+  自备 `writeVarInt()`、从 mineflayer 依赖树加载 `prismarine-nbt` 解析并构造 NBT，
+  按阶段选包 id（configuration `0x08` / play `0x44`）后用 `client.writeRaw()` 发出。
+- **`authmePassword` 配置项**：默认读环境变量 **`MC_AUTHME_PASSWORD`**，
+  **不落任何配置文件**；未设置时整段逻辑自动跳过，行为与上游一致。
+- `spawn` 之后补发一条 `/login <密码>`，兼容仍走 post-join 的服务器。
+
+### 🔴 修复
+
+- **DSH 0.1.7 插件激活顺序**：`inject` 不再硬依赖 `webServer`（只留 `['tools']`），
+  两处路由注册（`/api/mc`、`/api/whale-craft`）改为
+  `ctx.inject(['webServer'], (scope) => scope.effect(…))` 懒注入。
+
+### 🧹 杂项
+
+- `package-lock.json` 的版本号从 `0.1.4` 同步到 `0.1.7`，与 `package.json` 保持一致。
+
+### 🧩 适配
+
+- **DSH `0.1.7-alpha.1`**；上游基线 `aac3130`（whale_craft 0.1.7）；
+  EtheriumMC 26.2 / Paper 26.2（Folia）+ AuthMe 6.x；Node.js `>= 22`。
+- 无新增依赖。
+
 ## [0.1.7] - 2026-09-20
 
 > 这一版在 0.1.6 之上修了三个**真机问题**（都是用户/其他使用者实测报上来的），并订正了几处"状态在撒谎"。

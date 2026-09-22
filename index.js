@@ -42,7 +42,7 @@ import { statusPing, parseAddress } from './src/ping.mjs'
 import { waitForEvents } from './src/wait.mjs'
 
 export const name = 'whale_craft'
-export const inject = ['webServer', 'tools']
+export const inject = ['tools']
 
 /** 插件版本（`mc_capabilities` 会报给 Master；读不到就 unknown） */
 const PLUGIN_VERSION = (() => {
@@ -1261,7 +1261,9 @@ export function apply(ctx, config) {
       }
     },
   }
-  ctx.effect(() => ctx.webServer.register(apiRoute), 'whale_craft: /api/mc 路由')
+  ctx.inject(['webServer'], (scope) => {
+    scope.effect(() => scope.webServer.register(apiRoute), 'whale_craft: /api/mc 路由')
+  })
 
   /**
    * 发布区服务路由（用户 2026-09-17 定稿）：`/api/whale-craft/express/<工作区 uuid>/<剩余路径>`。
@@ -1305,7 +1307,9 @@ export function apply(ctx, config) {
       }
     },
   }
-  ctx.effect(() => ctx.webServer.register(shareRoute), 'whale_craft: /api/whale-craft 路由（发布区）')
+  ctx.inject(['webServer'], (scope) => {
+    scope.effect(() => scope.webServer.register(shareRoute), 'whale_craft: /api/whale-craft 路由（发布区）')
+  })
 
   // 启动自检标记：确认"插件到底加载了没"（同时写 whale-craft.log 与宿主日志）
   const startup = `插件已加载｜pid=${process.pid}｜每会话独立实例｜工具注册中…`
