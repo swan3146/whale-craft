@@ -1,40 +1,162 @@
-> ## 🍴 这是 fork：[`swan3146/whale-craft`](https://github.com/swan3146/whale-craft)
->
-> 上游是 [yzi1b/whale-craft](https://github.com/yzi1b/whale-craft)。本分支在上游 **`0.1.7`**（commit `aac3130`）
-> 之上，适配 **DSH `0.1.7-alpha.1`（v4 会话格式）** 与 **Minecraft 26.2 / AuthMe 6.x**，版本号 **`0.1.8`**。
-> 相对上游改了 **12 个文件（+643 / -38）**，完整说明见 **[FORK-NOTES.md](./FORK-NOTES.md)**。
->
-> ### 本 fork 加了什么
->
-> 1. ✨ **AuthMe 6.x 对话框登录**（MC 26.2）
->    AuthMe 在 **configuration 阶段**下发 Dialog（`show_dialog`），要求回一个 `custom_click_action` 原始包；
->    `preJoin` 开启时不可跳过，`loginCancelKicks` 开启时没回就被踢。mineflayer 不处理这个包，所以本 fork 手写协议把它回过去。
->    **密码只从环境变量 `MC_AUTHME_PASSWORD` 读，不落任何配置文件**；不设这个变量时整段逻辑自动跳过，行为与上游一致。
-> 2. 🔴 **提示行投递在 DSH v4 会话格式下让整轮失败**
->    `本轮运行失败 format v4 message requires a producer-owned source kind`。
->    根因是投递消息的 `source.kind` 用了 V3 的包装值 `'plugin'`，而 v4 的准入检查点名拒绝它。已改为 `plugin:whale_craft`。
-> 3. 🔴 **看门狗挂后台 job 失败，降级成"无 job 模式"**
->    根因是 `jobs` 的 `owner`/`caller` 要的是**会话 id 字符串**，插件传了 agent 对象。
->    顺带修掉一个更危险的隐患：宿主对"无主 job"不设防，原来点一次「强制停止」会误杀宿主级后台任务。
-> 4. 🔴 **webServer 懒注入**：DSH 0.1.7 的插件激活顺序会让 `webServer` 还没就绪就被引用。
->
-> ### 装这个 fork
->
-> 不用 clone，直接拿本 fork **Releases** 页里的 `whale_craft-0.1.8.tgz`：
->
-> ```bash
-> dsh plugin --profile <你的 profile> add /path/to/whale_craft-0.1.8.tgz
-> # 只有「离线服 + AuthMe」才需要设这个（正版验证服不用）：
-> export MC_AUTHME_PASSWORD='你的密码'
-> ```
->
-> ⚠️ npm 上的 `whale_craft` 属于原作者（`lyricraft <yzi1b@outlook.com>`），所以本 fork **没有发到 npm**，只作为 Release 附件提供。
->
-> ---
->
-> 下面是**上游的 README 原文**（未改动），插件本身的功能说明以它为准。
+# whale-craft · 登录插件适配（fork）
+
+> 🍴 这是 [yzi1b/whale-craft](https://github.com/yzi1b/whale-craft) 的 fork。
+> 在**上游 `0.1.7`** 的基础上，适配 **Minecraft 26.2 + AuthMe 6.x 对话框登录**，
+> 并修掉 **DSH `0.1.7-alpha.1`（v4 会话格式）** 下的 3 个真机问题。
+
+| | |
+|---|---|
+| 上游仓库 | [yzi1b/whale-craft](https://github.com/yzi1b/whale-craft) |
+| **上游版本** | **`0.1.7`**（commit `aac3130`，2026-09-20） |
+| **本 fork 版本** | **`0.1.8`** |
+| 本 fork 分支 | `feat/authme-26.2-dsh-0.1.7` |
+| 相对上游改动 | **12 个文件，+767 / -38**（无新增依赖） |
+| 逐条改动说明 | [FORK-NOTES.md](./FORK-NOTES.md) |
+| 更新日志 | [CHANGELOG.md](./CHANGELOG.md) |
 
 ---
+
+## 一、上游 `0.1.7` 有哪些问题
+
+下面 4 条都是**在真机上实测踩到的**（DSH `0.1.7-alpha.1` + EtheriumMC 26.2 / Paper + AuthMe 6.x）。
+
+### 🔴 1. 提示词投递让整轮失败（DSH 0.1.7 / v4 会话格式）
+
+**报错**
+
+```
+本轮运行失败 format v4 message requires a producer-owned source kind
+```
+
+**症状很有迷惑性**：工具**全都能用** —— 走路、挖建、说话、看图都正常，
+只有"往对话里注入提示行"这条通道炸，看着像"插件没装提示词"，其实每次投递都让整轮失败。
+
+**根因**：投递消息的 `source.kind` 写死成 V3 的包装值 `'plugin'`，
+而 DSH v4 的准入检查**点名拒绝**它
+（`@deepseek-ai/dsh-session-format-v3-to-v4/lib/index.js`：
+`… || value["kind"] === "plugin"` → `throw new SessionFormatError(...)`）。
+
+**影响**：MC 模式下**每轮都会失败**。
+
+### 🔴 2. 看门狗挂后台 job 失败，静默降级成"无 job 模式"
+
+**报错**
+
+```
+挂 job 失败（降级为无 job 模式）：session "[object Object]" has no live agent (background job owner must be live)
+```
+
+**症状**：看门狗还能唤醒模型，但 `job_list` 里**看不到它**，界面上也**停不掉**。
+
+**根因**：`jobs` 这一族的 `owner` / `caller` 要的是**会话 id 字符串**，插件传的是 **agent 对象**。
+宿主 `resolveOwner(session)` 拿它去 `agents.get(session)` 查表，而那张表**按会话 id 字符串索引**，
+且 `enter()` 里断言 `agent.id === agent.session.id` ⇒ 传对象必然查不到，
+错误信息里对象被 `String()` 成了 `[object Object]`。
+
+**⚠️ 这里还藏着一个更危险的隐患**：宿主对 `owner === undefined` 的"无主 job"**完全不设防**。
+旧代码传对象时恰好一个自己的 job 都匹配不到，却把无主 job 全列出来再 `kill` 掉 ——
+也就是**点一次「强制停止」会顺手清掉跟该会话毫无关系的宿主后台任务**。
+
+### 🔴 3. `webServer` 还没就绪就被引用（DSH 0.1.7 的插件激活顺序）
+
+插件的 `inject` 硬依赖 `webServer`，而 0.1.7 的激活顺序会让它在这条依赖还没就绪时就被求值。
+
+### 🟡 4. Minecraft 26.2 上 AuthMe 6.x 的登录过不去（上游没做这块）
+
+AuthMe 在 **configuration 阶段**就下发 `show_dialog`，要求回一个 `custom_click_action` 原始包；
+`preJoin` 开启时不可跳过，`loginCancelKicks` 开启时没回就被踢下线。
+mineflayer 不处理这个包 ⇒ 机器人根本进不去。
+
+---
+
+## 二、我们修了什么
+
+| # | 问题 | 改法 |
+|---|---|---|
+| 1 | v4 提示行投递 | 新增 `PLUGIN_SOURCE_KIND = 'plugin:whale_craft'` 与统一的 `noticeSource()` 构造器 —— `kind` 取宿主 `producerKind()` 对第三方插件的规范值 `plugin:<插件名>`；两处投递点（`index.js` 的提示行、`src/watchdog.mjs` 的看门狗唤醒）改用它 |
+| 2 | 看门狗 job owner | 新增私有 `#ownerId()`（`agent?.id ?? sess.agentId`），4 处调用点（`src/watchdog.mjs` 的 `jobs.start` / `jobs.kill`、`index.js` 的 `jobs.list` / `jobs.kill`）全部改传会话 id 字符串 |
+| 2b | 「强制停止」误杀宿主任务 | 改成只杀自己的（`j.owner === jobOwner`）；拿不到会话 id 时**不再挂"无主 job"**，直接降级为"无 job 模式"并记一行日志 |
+| 3 | `webServer` 未就绪 | `inject` 不再硬依赖它（只留 `['tools']`），两处路由注册改为 `ctx.inject(['webServer'], (scope) => scope.effect(…))` 懒注入 |
+| 4 | 自检夹具跟不上懒注入 | 两处假 ctx 的 `inject` 是空壳 / 只登记不回调 ⇒ `/api/mc` 与 `/api/whale-craft` 两条路由**从没注册**、相关断言全废，脚本还在 `callOn(undefined, …)` 上 `TypeError` 崩掉。已让夹具对 `webServer` 立刻回调，并补 8 条 jobs 回归钉子 |
+
+---
+
+## 三、我们新增了什么
+
+### ✨ AuthMe 6.x 对话框登录（Minecraft 26.2 / 协议 775）
+
+AuthMe 在 **configuration 阶段**下发 `show_dialog`（Dialog），必须用 `custom_click_action`
+原始包把密码回过去，否则 `loginCancelKicks=true` 时会被踢下线。mineflayer 不支持这一步，因此手写协议：
+
+- 自备 `writeVarInt()`；
+- 从 mineflayer 依赖树加载 `prismarine-nbt` 解析并构造 NBT；
+- 按阶段选包 id（configuration `0x08` / play `0x44`），用 `client.writeRaw()` 发出；
+- `spawn` 之后补发一条 `/login <密码>`，兼容仍走 post-join 的服务器。
+
+### 🔑 `authmePassword` 配置项（只走环境变量，密码不落盘）
+
+**密码不会出现在任何配置文件里** —— 本文件、`cordis.patch.yml`、日志里都没有。
+默认读环境变量 **`MC_AUTHME_PASSWORD`**；**不设这个变量时整段逻辑自动跳过，行为与上游完全一致**。
+
+```bash
+# 只有「离线服 + AuthMe」才需要（正版验证服不用）
+export MC_AUTHME_PASSWORD='你的密码'
+```
+
+systemd 部署建议用 `EnvironmentFile`（权限 600）：
+
+```ini
+# /etc/whale-craft/authme.env   —— chmod 600
+MC_AUTHME_PASSWORD=你的密码
+```
+
+```ini
+# 在 service 里
+EnvironmentFile=-/etc/whale-craft/authme.env
+```
+
+---
+
+## 四、怎么装
+
+### 从 Release 附件装（推荐，不用 clone）
+
+```bash
+# 下载本 fork Releases 页的 whale_craft-0.1.8.tgz
+dsh plugin --profile <你的 profile> add /path/to/whale_craft-0.1.8.tgz
+```
+
+### 从源码装
+
+```bash
+git clone -b feat/authme-26.2-dsh-0.1.7 https://github.com/swan3146/whale-craft.git
+dsh plugin --profile <你的 profile> add link:/path/to/whale-craft
+```
+
+> ⚠️ npm 上的 `whale_craft` 属于原作者（`lyricraft <yzi1b@outlook.com>`），
+> 所以本 fork **没有发到 npm**，只作为 Release 附件提供。
+
+---
+
+## 五、已知限制
+
+1. **只测过 DSH `0.1.7-alpha.1`**；其它版本的 `inject` / `jobs` 契约可能不同。
+2. **AuthMe 只覆盖 6.x 的 dialog 流程**（configuration 阶段 `show_dialog`）；
+   更老的 AuthMe 走的是插件消息那条路，本 fork 没动它，仍靠 spawn 后补发 `/login` 兜底。
+3. **`authmePassword` 只从环境变量读**，没有 UI 入口；留空即整段跳过。
+4. **看门狗拿不到会话 id 时以"无 job"模式运行**（不会挂无主 job）—— 这时还能唤醒，但 `job_list` 看不到。
+5. **自检有 5 条用例是 Windows 路径 / `minecraft-data` 版本索引问题**，在 Linux 上会 ❌，
+   与本次改动无关（`npm run check` 退出码仍为 0）。
+
+---
+
+## 六、上游的 README
+
+插件本身的功能说明（`mc_*` 工具清单、配置项、架构）以上游 README 为准。
+下面是**上游 `0.1.7` 的 README 原文（未改动）**：
+
+<details>
+<summary>点开看上游 README 原文（422 行）</summary>
 
 # Whale Craft
 
@@ -458,3 +580,5 @@ Push a `v*` tag to get a GitHub Release with the zip, plus an **npm publish** wh
 `NPM_TOKEN` secret (without it, the npm step is skipped with a notice — the workflow still succeeds).
 
 MIT licensed. Third-party notices in `THIRD_PARTY_NOTICES.md`.
+
+</details>
