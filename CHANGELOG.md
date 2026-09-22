@@ -58,6 +58,8 @@
 
 - **版本号 `0.1.7` → `0.1.8`**（`package.json` + `package-lock.json`）；
   顺手把 `package-lock.json` 里残留的 `0.1.4` 一并订正（上游 lockfile 一直没跟 `package.json` 同步）。
+- **README 顶部加 fork 横幅**：本 fork 的 `README.md` 不再与上游逐字节相同，
+  开头写明这是 fork、基线版本、相对上游改了什么、以及怎么从 Release 安装。
 
 ### 🧩 适配
 

@@ -1,3 +1,41 @@
+> ## 🍴 这是 fork：[`swan3146/whale-craft`](https://github.com/swan3146/whale-craft)
+>
+> 上游是 [yzi1b/whale-craft](https://github.com/yzi1b/whale-craft)。本分支在上游 **`0.1.7`**（commit `aac3130`）
+> 之上，适配 **DSH `0.1.7-alpha.1`（v4 会话格式）** 与 **Minecraft 26.2 / AuthMe 6.x**，版本号 **`0.1.8`**。
+> 相对上游改了 **12 个文件（+643 / -38）**，完整说明见 **[FORK-NOTES.md](./FORK-NOTES.md)**。
+>
+> ### 本 fork 加了什么
+>
+> 1. ✨ **AuthMe 6.x 对话框登录**（MC 26.2）
+>    AuthMe 在 **configuration 阶段**下发 Dialog（`show_dialog`），要求回一个 `custom_click_action` 原始包；
+>    `preJoin` 开启时不可跳过，`loginCancelKicks` 开启时没回就被踢。mineflayer 不处理这个包，所以本 fork 手写协议把它回过去。
+>    **密码只从环境变量 `MC_AUTHME_PASSWORD` 读，不落任何配置文件**；不设这个变量时整段逻辑自动跳过，行为与上游一致。
+> 2. 🔴 **提示行投递在 DSH v4 会话格式下让整轮失败**
+>    `本轮运行失败 format v4 message requires a producer-owned source kind`。
+>    根因是投递消息的 `source.kind` 用了 V3 的包装值 `'plugin'`，而 v4 的准入检查点名拒绝它。已改为 `plugin:whale_craft`。
+> 3. 🔴 **看门狗挂后台 job 失败，降级成"无 job 模式"**
+>    根因是 `jobs` 的 `owner`/`caller` 要的是**会话 id 字符串**，插件传了 agent 对象。
+>    顺带修掉一个更危险的隐患：宿主对"无主 job"不设防，原来点一次「强制停止」会误杀宿主级后台任务。
+> 4. 🔴 **webServer 懒注入**：DSH 0.1.7 的插件激活顺序会让 `webServer` 还没就绪就被引用。
+>
+> ### 装这个 fork
+>
+> 不用 clone，直接拿本 fork **Releases** 页里的 `whale_craft-0.1.8.tgz`：
+>
+> ```bash
+> dsh plugin --profile <你的 profile> add /path/to/whale_craft-0.1.8.tgz
+> # 只有「离线服 + AuthMe」才需要设这个（正版验证服不用）：
+> export MC_AUTHME_PASSWORD='你的密码'
+> ```
+>
+> ⚠️ npm 上的 `whale_craft` 属于原作者（`lyricraft <yzi1b@outlook.com>`），所以本 fork **没有发到 npm**，只作为 Release 附件提供。
+>
+> ---
+>
+> 下面是**上游的 README 原文**（未改动），插件本身的功能说明以它为准。
+
+---
+
 # Whale Craft
 
 **[English ↓](#english)** · 中文 · [![CI](https://github.com/yzi1b/whale-craft/actions/workflows/ci.yml/badge.svg)](https://github.com/yzi1b/whale-craft/actions/workflows/ci.yml)
