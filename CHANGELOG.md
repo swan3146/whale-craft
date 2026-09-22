@@ -2,10 +2,10 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布] - fork 分支 `feat/authme-26.2-dsh-0.1.7`
+## [0.1.8] - 2026-09-22
 
-> ⚠️ 这是 **fork 分支**，不是上游发布的版本。完整说明见 [FORK-NOTES.md](./FORK-NOTES.md)。
-> 基线：上游 `aac3130`（whale_craft 0.1.7）。
+> ⚠️ 这是 **fork 分支**（`feat/authme-26.2-dsh-0.1.7`），不是上游发布的版本。
+> 完整说明见 [FORK-NOTES.md](./FORK-NOTES.md)。基线：上游 `aac3130`（whale_craft 0.1.7）。
 
 ### ✨ 新增
 
@@ -56,7 +56,8 @@
 
 ### 🧹 杂项
 
-- `package-lock.json` 的版本号从 `0.1.4` 同步到 `0.1.7`，与 `package.json` 保持一致。
+- **版本号 `0.1.7` → `0.1.8`**（`package.json` + `package-lock.json`）；
+  顺手把 `package-lock.json` 里残留的 `0.1.4` 一并订正（上游 lockfile 一直没跟 `package.json` 同步）。
 
 ### 🧩 适配
 

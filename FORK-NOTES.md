@@ -1,8 +1,8 @@
 # Fork 分支说明：AuthMe 6.x 对话框登录 + DSH 0.1.7（v4 会话格式）适配
 
 > 本分支是 [yzi1b/whale-craft](https://github.com/yzi1b/whale-craft) 的 fork，
-> 基线为上游 `aac3130`（whale_craft **0.1.7**）。
-> 相对上游改了 **10 个文件（+589 / -37）**：1 处新增功能、3 处修复、1 处自检夹具、若干文档与配置注释。
+> 基线为上游 `aac3130`（whale_craft **0.1.7**），**fork 自身版本 `0.1.8`**。
+> 相对上游改了 **11 个文件（+602 / -38）**：1 处新增功能、3 处修复、1 处自检夹具、若干文档与配置。
 > **不含任何密码、账户名或服务器地址**（AuthMe 密码改由环境变量提供，见第四节）。
 
 ---
@@ -13,6 +13,7 @@
 |---|---|
 | **DSH（DeepSeek Harness）** | **`0.1.7-alpha.1`** |
 | whale_craft 上游基线 | **0.1.7**（commit `aac3130`） |
+| **whale_craft（本 fork 发布的版本）** | **`0.1.8`** |
 | Minecraft 服务端 | **EtheriumMC 26.2 / Paper 26.2**（Folia 调度器），协议号 **775** |
 | AuthMe | **6.x**（`preJoin` 对话框登录流程） |
 | mineflayer | 实测 4.39.0（上游声明 `^4.37.1`） |
@@ -155,11 +156,12 @@ systemd `EnvironmentFile`（`0600`）两种写法。文件本身仍然只有 `au
 | `src/user-message.mjs` | **+39 / -1** | `PLUGIN_SOURCE_KIND` + `noticeSource()`（v4 合规） |
 | `src/version-prompt.mjs` | **+3 / -2** | 注释订正（kind 不能是 V3 的 `'plugin'`） |
 | `cordis.patch.yml` | **+20 / -0** | 加注释说明密码走环境变量（文件本身无密码） |
-| `package-lock.json` | **+2 / -2** | 只把 lockfile 版本号从 `0.1.4` 同步到 `0.1.7` |
-| `CHANGELOG.md` | **+62 / -0** | 本分支的变更记录 |
-| `FORK-NOTES.md` | **+221 / -0** | 本文件（fork 独有，上游没有） |
+| `package.json` | **+1 / -1** | 版本号 `0.1.7` → `0.1.8` |
+| `package-lock.json` | **+2 / -2** | 同步 lockfile 版本号（`0.1.7` → `0.1.8`，并订正残留的 `0.1.4`） |
+| `CHANGELOG.md` | **+63 / -0** | 本分支的变更记录 |
+| `FORK-NOTES.md` | **+232 / -0** | 本文件（fork 独有，上游没有） |
 
-**没有改**：`package.json`、README、其余源码。**没有新增依赖。**
+**没有改**：README、其余源码。**没有新增依赖。**
 
 ---
 
@@ -172,6 +174,15 @@ systemd `EnvironmentFile`（`0600`）两种写法。文件本身仍然只有 `au
 ```bash
 dsh plugin --profile <你的 profile> add link:/path/to/whale-craft
 ```
+
+fork 也提供打包好的 tgz（见本 fork 的 **Releases** 页，附件 `whale_craft-0.1.8.tgz`）：
+
+```bash
+npm install /path/to/whale_craft-0.1.8.tgz
+```
+
+> ⚠️ npm 上的 `whale_craft` 属于原作者（`lyricraft <yzi1b@outlook.com>`），
+> 所以这个包**没有发到 npm**，只作为 Release 附件提供。
 
 ### 2. 提供 AuthMe 密码（不进配置文件）
 
