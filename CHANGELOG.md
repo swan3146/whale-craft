@@ -23,6 +23,36 @@
 - **DSH 0.1.7 插件激活顺序**：`inject` 不再硬依赖 `webServer`（只留 `['tools']`），
   两处路由注册（`/api/mc`、`/api/whale-craft`）改为
   `ctx.inject(['webServer'], (scope) => scope.effect(…))` 懒注入。
+- **🔴 提示词投递在 DSH 0.1.7（v4 会话格式）下让**整轮**失败**
+  （`本轮运行失败 format v4 message requires a producer-owned source kind`）。
+  症状很有迷惑性：**工具全都能用**，只有"注入提示行"这条通道炸 —— 看着像"插件没装提示词"。
+  根因：投递消息的 `source.kind` 写死成 V3 的包装值 `'plugin'`，而 v4 的准入检查**点名拒绝**它
+  （`@deepseek-ai/dsh-session-format-v3-to-v4/lib/index.js`：
+  `… || value["kind"] === "plugin"` → `throw new SessionFormatError(...)`）。
+  修法：新增 `PLUGIN_SOURCE_KIND = 'plugin:whale_craft'` 与统一的 `noticeSource()` 构造器
+  —— `kind` 取宿主 `producerKind()` 对第三方插件的规范值 `plugin:<插件名>`，
+  两处投递点（`index.js` 的提示行、`src/watchdog.mjs` 的看门狗唤醒）改用它。
+- **自检夹具跟不上"懒注入"那次改动**：路由注册搬进 `ctx.inject(['webServer'], …)` 之后，
+  `selfcheck.mjs` 的两处假 ctx 里 `inject` 是空壳 / 只登记不回调 ⇒
+  `/api/mc` 与 `/api/whale-craft` 两条路由**从没注册**，相关断言全废，
+  脚本还在 `callOn(undefined, …)` 上 `TypeError` 崩掉（真机不受影响：真 cordis 的 `inject` 会回调）。
+  已让夹具对 `webServer` 立刻回调，自检得以跑完全程。
+- **🔴 看门狗挂后台 job 失败，降级成"无 job 模式"**
+  （日志原文：`挂 job 失败（降级为无 job 模式）：session "[object Object]" has no live agent
+  (background job owner must be live)`）。症状是"还能唤醒，但 `job_list` 里看不到、UI 也停不掉"。
+  根因：`jobs` 这一族的 `owner` / `caller` 要的是**会话 id 字符串**，插件传的是 **agent 对象**。
+  宿主 `resolveOwner(session)`（`@deepseek-ai/dsh-jobs-local`）拿它去 `agents.get(session)` 查表，
+  而那张表**按会话 id 字符串索引**，且 `enter()` 里断言 `agent.id === agent.session.id`
+  ⇒ 传对象必然查不到，错误信息里对象被 `String()` 成了 `[object Object]`。
+  修法：新增私有 `#ownerId()`（`agent?.id ?? sess.agentId`），4 处调用点
+  （`src/watchdog.mjs` 的 `jobs.start` / `jobs.kill`，`index.js` 的 `jobs.list` / `jobs.kill`）
+  全部改传会话 id 字符串。
+  **顺带修掉一个更危险的隐患**：宿主 `assertAccess()` 对 `owner === undefined` 的
+  "无主 job"**完全不设防**，而旧代码传对象时恰好一个自己的 job 都匹配不到、
+  却把无主 job 全列出来再 `kill` 掉 —— 也就是点一次「强制停止」会顺手清掉
+  跟该会话毫无关系的宿主后台任务。现在改成只杀自己的（`j.owner === jobOwner`）。
+  另：拿不到会话 id 时**不再挂"无主 job"**（那会让它对所有会话可见），
+  直接降级为"无 job 模式"并记一行日志。
 
 ### 🧹 杂项
 

@@ -1,8 +1,9 @@
-# Fork 分支说明：AuthMe 6.x 对话框登录（适配 DSH 0.1.7）
+# Fork 分支说明：AuthMe 6.x 对话框登录 + DSH 0.1.7（v4 会话格式）适配
 
 > 本分支是 [yzi1b/whale-craft](https://github.com/yzi1b/whale-craft) 的 fork，
 > 基线为上游 `aac3130`（whale_craft **0.1.7**）。
-> 相对上游只改了两个源码文件，**不含任何密码、账户名或服务器地址**。
+> 相对上游改了 **10 个文件（+589 / -37）**：1 处新增功能、3 处修复、1 处自检夹具、若干文档与配置注释。
+> **不含任何密码、账户名或服务器地址**（AuthMe 密码改由环境变量提供，见第四节）。
 
 ---
 
@@ -21,7 +22,7 @@
 
 ## 二、新增了什么
 
-### 1. AuthMe 6.x 对话框登录（`src/core.mjs`，+91 行）
+### 1. AuthMe 6.x 对话框登录（`src/core.mjs`，+90/-1）
 
 **为什么需要**：MC 26.2 上 AuthMe 6.x 不再只靠聊天命令 `/login`。它在 **configuration 阶段**
 下发一个 Dialog（`show_dialog` 包），要求客户端回一个 `custom_click_action` 原始包；
@@ -43,7 +44,7 @@ mineflayer 不处理这个包，所以这部分是手写协议：
 - **`spawn` 之后补一条 `/login <密码>`**（`src/core.mjs:831`）：`preJoin` 已经成功时这条多余但无害
   （AuthMe 会忽略已登录玩家），用来兼容仍然走 post-join 的服务器。
 
-### 2. webServer 懒注入（`index.js`，+10/-4）
+### 2. webServer 懒注入（`index.js`）
 
 **为什么需要**：在 DSH 0.1.7 上，插件激活顺序会让 `webServer` 还没就绪就被引用，
 原来写死的 `export const inject = ['webServer', 'tools']` 会因此报错。改成：
@@ -59,18 +60,106 @@ ctx.inject(['webServer'], (scope) => {
 
 （另一处是发布区的 `/api/whale-craft` 路由，`index.js:1310`。）
 
+### 3. DSH v4 会话格式适配：提示行投递（`src/user-message.mjs` + 2 个调用点）
+
+**为什么需要**：DSH 0.1.7 的会话格式升到 **v4**，其准入检查**点名拒绝** `source.kind === 'plugin'`
+（V3 的包装值）。插件原来用它投递"提示行"，于是在 0.1.7 上**整轮运行直接失败**：
+
+```
+本轮运行失败 format v4 message requires a producer-owned source kind
+```
+
+这个 bug 的症状很有迷惑性 —— **工具全都正常**，只有"注入提示行"这条通道炸，
+看起来像是"插件没装提示词"而不是"会话写不进去"。
+
+- 新增 `PLUGIN_SOURCE_KIND = 'plugin:whale_craft'`（`src/user-message.mjs:48`）——
+  `kind` 取宿主 `producerKind()` 对第三方插件的规范值 `plugin:<插件名>`；
+- 新增统一的 `noticeSource(summary)` 构造器（`src/user-message.mjs:59`），
+  返回 `{ kind: 'plugin:whale_craft', plugin: 'whale_craft', form: 'notice', summary }`
+  （`summary` 截到 120 字，与宿主 `CONTEXT_SUMMARY_MAX_CHARS` 一致）；
+- 两处投递点改用它：`index.js:2774`（版本/规则提示行）、`src/watchdog.mjs:611`（看门狗唤醒）；
+- `src/version-prompt.mjs` 里描述这套机制的注释同步订正（避免后人照抄错的 kind）。
+
+### 4. 看门狗后台 job 的 owner 修正（`src/watchdog.mjs` + `index.js`）
+
+**为什么需要**：真机上报
+
+```
+挂 job 失败（降级为无 job 模式）：session "[object Object]" has no live agent
+(background job owner must be live)
+```
+
+看门狗因此降级成"无 job 模式"——还能唤醒，但 `job_list` 里看不到、UI 也停不掉。
+
+**根因**：`jobs` 这一族的 `owner` / `caller` 参数要的是**会话 id 字符串**，插件传的是 **agent 对象**。
+宿主 `resolveOwner(session)`（`@deepseek-ai/dsh-jobs-local/lib/index.js:526-533`）拿它去
+`agents.get(session)` 查表，而那张表**按会话 id 字符串索引**
+（`@deepseek-ai/dsh-agent`：`get(id) { return this.store.get(id)?.agent }`，
+且 `enter()` 里断言 `agent.id === agent.session.id`）⇒ 传对象必然查不到，
+错误信息里对象被 `String()` 成了 `[object Object]`。
+
+**修法**：新增私有方法 `#ownerId()`（取 `agent?.id ?? sess.agentId`，并校验是非空字符串），
+4 处调用点全部改传会话 id：
+
+| 位置 | 旧 | 新 |
+|---|---|---|
+| `src/watchdog.mjs:389` `jobs.start` | `owner: this.agent` | `owner: ownerId` |
+| `src/watchdog.mjs:312` `jobs.kill` | `kill(jobId, this.agent, reason)` | `kill(jobId, this.#ownerId(), reason)` |
+| `index.js:761` `jobs.list` | `list(agent)` | `list(jobOwner)` |
+| `index.js:765` `jobs.kill` | `kill(id, agent, reason)` | `kill(id, jobOwner, reason)` |
+
+**顺带修掉一个更危险的隐患**：宿主
+
+```js
+assertAccess(job, caller) { if (job.owner !== void 0 && job.owner.id !== caller) throw … }
+```
+
+对 `owner === undefined` 的"**无主 job**"**完全不设防**。旧代码传 agent 对象时，
+`list()` 一个自己的 job 都匹配不到，却把 `owner === undefined` 的**宿主级无主 job 全列出来**，
+再因为不设防而全 `kill` 掉 —— 也就是说：点一次「强制停止」，会顺手清掉
+跟这个会话**毫无关系**的宿主后台任务。现在改成只杀自己的（`if (j?.owner !== jobOwner) continue`），
+并且 `jobOwner` 不是非空字符串时直接跳过。
+
+**另一处防御**：拿不到会话 id 时**不再挂"无主 job"**（`owner` 缺省会让它对所有会话可见、
+也能被别的会话的"强制停止"带走），而是照旧降级为"无 job 模式"并记一行日志说明原因。
+
+### 5. 自检夹具补齐（`selfcheck.mjs`，+81/-9）
+
+- **懒注入那次改动（上游已合入的 `074d61f`）之后，自检里所有路由注册相关的断言都是死的**：
+  两处假 ctx 的 `inject` 一个是空壳、一个只登记不回调 ⇒ `/api/mc` 与 `/api/whale-craft`
+  两条路由**从没注册**，断言全废，脚本还在 `callOn(undefined, …)` 上 `TypeError` 崩掉。
+  （**真机不受影响**：真 cordis 的 `inject` 会回调。）已让夹具对 `webServer` 立刻回调。
+- 新增 **8 条回归钉子**，把这次两个真机事故钉死：
+  - `jobs.list` / `jobs.kill` 收到的必须是**会话 id 字符串**（不是 agent 对象）；
+  - 无主 job（宿主自己的）**不许**被顺手杀掉；
+  - `jobs.start` 的 `owner` 必须是会话 id 字符串，且 `kind` / `label` 元信息正确；
+  - 拿不到会话 id 时**不挂无主 job**、降级为无 job 模式并把原因记进日志。
+
+### 6. 配置示例里不再出现密码（`cordis.patch.yml`，+20）
+
+上游的 `cordis.patch.yml` 是**插件包的一部分**（会被提交、打包、备份、随手分享，
+而且模型能直接读到），里面**不该出现任何密码**。本分支在里面加了一段注释，说明
+AuthMe 密码改由环境变量 `MC_AUTHME_PASSWORD` 提供，并给出 `export` 与
+systemd `EnvironmentFile`（`0600`）两种写法。文件本身仍然只有 `autoConnect: false`。
+
 ---
 
 ## 三、相对上游改了什么
 
-| 文件 | 变化 |
-|---|---|
-| `src/core.mjs` | +91 / -1（4 处 hunk） |
-| `index.js` | +10 / -4 |
-| `package-lock.json` | +2 / -2（只把 lockfile 里的版本号从 `0.1.4` 同步到 `0.1.7`，与 `package.json` 一致） |
+| 文件 | 变化 | 说明 |
+|---|---|---|
+| `src/core.mjs` | **+90 / -1** | AuthMe 6.x 对话框登录（`writeVarInt` / NBT / 按阶段选包 id） |
+| `src/watchdog.mjs` | **+46 / -13** | `#ownerId()`、job owner/caller 修正、v4 `noticeSource` |
+| `index.js` | **+25 / -9** | webServer 懒注入、job owner/caller 修正、v4 `noticeSource` |
+| `selfcheck.mjs` | **+81 / -9** | 夹具补懒注入回调 + 8 条 jobs 回归钉子 |
+| `src/user-message.mjs` | **+39 / -1** | `PLUGIN_SOURCE_KIND` + `noticeSource()`（v4 合规） |
+| `src/version-prompt.mjs` | **+3 / -2** | 注释订正（kind 不能是 V3 的 `'plugin'`） |
+| `cordis.patch.yml` | **+20 / -0** | 加注释说明密码走环境变量（文件本身无密码） |
+| `package-lock.json` | **+2 / -2** | 只把 lockfile 版本号从 `0.1.4` 同步到 `0.1.7` |
+| `CHANGELOG.md` | **+62 / -0** | 本分支的变更记录 |
+| `FORK-NOTES.md` | **+221 / -0** | 本文件（fork 独有，上游没有） |
 
-**没有改**：`cordis.patch.yml` 保持上游默认（只有 `autoConnect: false`，**没有任何密码**）；
-`package.json`、README、其余源码都未动。**没有新增依赖。**
+**没有改**：`package.json`、README、其余源码。**没有新增依赖。**
 
 ---
 
@@ -106,12 +195,27 @@ MC_AUTHME_PASSWORD=你的密码
 **不设这个环境变量时**，对话框登录整段不会启用（`authmePassword` 为空 → 直接跳过），
 行为与上游一致。
 
+### 3. 自检
+
+```bash
+npm run check        # = node tools/check-core.mjs && node selfcheck.mjs
+```
+
 ---
 
 ## 五、已知限制
 
-- 对话框解析依赖 AuthMe 的默认 action id（`*/submit`）和输入框 key（`password`）；
+- **对话框解析**依赖 AuthMe 的默认 action id（`*/submit`）和输入框 key（`password`）；
   自定义过对话框布局的服务器可能解析不到 —— 这时日志里会写 `AuthMe 对话框提交失败：…`。
-- 只在 **EtheriumMC 26.2 / AuthMe 6.x** 上实测过。更老的 AuthMe（1.20.x 那批）走的是聊天命令
+- **只在 EtheriumMC 26.2 / AuthMe 6.x 上实测过**。更老的 AuthMe（1.20.x 那批）走的是聊天命令
   `/login`，本分支补的那条命令能覆盖，但对话框那段不会触发。
-- 需要 **DSH 0.1.7-alpha.1**（懒注入那段是为它改的）；更早的 DSH 两种写法应该都能跑，未实测。
+- **需要 DSH 0.1.7-alpha.1**：懒注入与 v4 `noticeSource` 都是为它改的。
+  更早的 DSH 两种写法应该都能跑，未实测。
+- **`selfcheck.mjs` 还有 5 条 ❌，都是平台/数据差异，与本分支无关**（`npm run check` 不因 ❌ 退出非零）：
+  3 条是夹具里写死了 Windows 路径（`D:\dsh/whale_craft`、`E:\x\README.md` 之类），
+  在 Linux 上 `path.resolve()` 会把它们当普通文件名，于是"越界拦截"用例判失败
+  （真正的越界如 `/etc/passwd`、`../../x` 仍被正确拒绝）；
+  1 条是 `minecraft-data@3.116.0` 的 `dataPaths.json` 里没有 `pc.26.2` 条目
+  （磁盘上有 `26.2/` 目录但未被索引）⇒ `#supportsPacket('26.2', …)` 返回 null，
+  被当成"不支持"；服务端实际协议号 775 映射到 `26.1`（那个条目是有的）。
+- **`jobs` 那两处修正需要在插件代码更新后重启 DSH 才生效**（Node ESM 模块缓存）。

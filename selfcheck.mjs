@@ -184,7 +184,21 @@ const fakeCtx = {
     getSectionOrder: () => 100,
   },
   // 服务迟到时走这条路
-  inject: (deps, cb) => { injectedFibers.push({ deps, cb }) },
+  // 🔴 2026-09-22：`index.js` 自 `074d61f`（"use lazy injection for webServer"）起把
+  //    **路由注册**搬进了 `ctx.inject(['webServer'], (scope) => scope.effect(() =>
+  //    scope.webServer.register(...)))`（index.js:1264 与 :1310）。本夹具原先只登记、
+  //    从不回调 ⇒ `registeredRoutes` 里 `/api/mc` 与 `/api/whale-craft` **两条都没有**
+  //    ⇒ 那一段的断言全废、还在 `callOn(undefined, …)` 上 TypeError 崩掉。
+  //    真 cordis 的 `inject` 会调回调，所以真机没事 —— 纯属夹具没跟上那次改动。
+  //    这里只对 `webServer` **立刻**回调（本夹具一开始就有它，见上面 :176）；
+  //    其余依赖（systemPrompt / agentPresets / workspaceRegistry）保持"只登记"，
+  //    由各自的用例手动触发（那些用例验的正是"服务迟到"）。
+  inject: (deps, cb) => {
+    injectedFibers.push({ deps, cb })
+    if (deps.includes('webServer') && typeof cb === 'function') {
+      try { cb(fakeCtx) } catch (e) { logs.push('[inject error] ' + e.message) }
+    }
+  },
   effect: (fn) => { try { fn() } catch (e) { logs.push('[effect error] ' + e.message) } },
   set: (k, v) => { fakeCtx[k] = v },
   // 没有 jobs 服务：验证看门狗在缺服务时报错清晰（不崩）
@@ -544,7 +558,24 @@ console.log('\n--- 强制停止：UI 路径的真实顺序（停LLM → 退游�
   const fakeAgent2 = { id: 'sess-STOP', status: 'running' }
   // 这第二套 ctx 的 agents 服务要**可替换**：下面的「MC设置」接口测试需要换成"带工作区的会话"
   let agents2 = { get: () => fakeAgent2 }
-  const jobs2 = { list: () => [{ id: 'job-watch' }, { id: 'job-other' }], kill: (id) => side.push(`kill:${id}`) }
+  // 🔴 2026-09-22：`jobs` 这一族的 `caller` 要的是**会话 id 字符串**，不是 agent 对象
+  //    （宿主 `assertAccess()` 比的是 `job.owner.id !== caller`；`list()` 返回的 view 带 `owner`）。
+  //    这里照真实契约造假：两个**自己的** job + 一个**无主 job**（`owner` 缺省 = 宿主自己的）——
+  //    后者绝不该被"强制停止某个会话"顺手带走（老代码传 agent 对象时恰好会误杀它：
+  //    对象跟任何 `owner.id` 都不相等 ⇒ 只匹配到无主 job ⇒ 再 kill 掉）。
+  const listCallers = []
+  const killCallers = []
+  const jobs2 = {
+    list: (caller) => {
+      listCallers.push(caller)
+      return [
+        { id: 'job-watch', owner: 'sess-STOP' },
+        { id: 'job-other', owner: 'sess-STOP' },
+        { id: 'job-host-unowned' },
+      ]
+    },
+    kill: (id, caller) => { killCallers.push(caller); side.push(`kill:${id}`) },
+  }
   const sc2 = { cancel: ({ sessionId }) => side.push(`cancel:${sessionId}`) }
   const ctx2 = {
     logger: { info: () => {}, warn: () => {}, debug: () => {} },
@@ -553,7 +584,13 @@ console.log('\n--- 强制停止：UI 路径的真实顺序（停LLM → 退游�
     webServer: { register: (r) => { if (r.path === '/api/mc') route2 = r; return () => {} }, port: 39999 },
     workspaceRegistry: { archiveSession: async () => {} },
     systemPrompt: { context: () => () => {}, section: () => () => {} },
-    inject: () => {},
+    // 🔴 2026-09-22：`index.js` 自 `074d61f`（"use lazy injection for webServer"）起，
+    //    路由注册搬进了 `ctx.inject(['webServer'], (scope) => scope.effect(() =>
+    //    scope.webServer.register(...)))`（index.js:1264 与 :1310）。这里原先写的是
+    //    空壳 `inject: () => {}` —— **回调永远不跑** ⇒ `route2` 恒为 null ⇒ 下面
+    //    `route2.handler` 直接 TypeError 崩掉（且两条路由的断言从来没真跑过）。
+    //    真 cordis 的 `inject` 会调回调，所以真机没事；纯属自检夹具没跟上那次改动。
+    inject: (deps, cb) => { try { if (typeof cb === 'function') cb(ctx2) } catch {} },
     effect: (fn) => { try { fn() } catch {} },
     on: () => () => {},
     get: (k) => (k === 'jobs' ? jobs2
@@ -584,6 +621,12 @@ console.log('\n--- 强制停止：UI 路径的真实顺序（停LLM → 退游�
   console.log(`  ${body.stoppedLLM === true && body.finalStopLLM === true ? '✅' : '❌'} 停了两遍 LLM（首 + 尾，避免状态异常）：首=${body.stoppedLLM} 尾=${body.finalStopLLM}`)
   console.log(`  ${body.kicked === true ? '✅' : '❌'} 先尝试退出游戏（bot.disconnect 被调用）：${JSON.stringify(body.quit)}`)
   console.log(`  ${body.killedJobs?.length === 2 ? '✅' : '❌'} 该会话后台任务被清空：${JSON.stringify(body.killedJobs)}`)
+  // 🔴🔴 2026-09-22 真机事故回归钉子：`jobs` 的 caller 必须是**会话 id 字符串**。
+  //    以前传的是 `agent` 对象，于是 `list()` 一个自己的 job 都匹配不到、
+  //    却把 `owner === undefined` 的**宿主级无主 job** 全列出来并杀掉。
+  console.log(`  ${listCallers.length > 0 && listCallers.every((c) => c === 'sess-STOP') ? '✅' : '❌'} 🔴 jobs.list 收到的是**会话 id 字符串**（不是 agent 对象）：${JSON.stringify(listCallers)}`)
+  console.log(`  ${killCallers.length === 2 && killCallers.every((c) => c === 'sess-STOP') ? '✅' : '❌'} 🔴 jobs.kill 的 caller 也是会话 id：${JSON.stringify(killCallers)}`)
+  console.log(`  ${!side.includes('kill:job-host-unowned') ? '✅' : '❌'} 🔴 无主 job（宿主自己的）**没被**顺手杀掉：${JSON.stringify(side)}`)
   const sideWant = ['cancel:sess-STOP', 'kill:job-watch', 'kill:job-other', 'cancel:sess-STOP']
   console.log(`  ${side.join(' → ') === sideWant.join(' → ') ? '✅' : '❌'} 副作用真实顺序 = 先停LLM → 清任务 → 再停LLM：${side.join(' → ')}`)
 
@@ -1372,7 +1415,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     console.log(`  ${/runtimeContextSuppressed \? \[\]/.test(src) ? '✅' : '❌'} 状态块注释里钉住了宿主那段 contexts: runtimeContextSuppressed ? [] （这是根因）`)
     console.log(`  ${/notices: sent/.test(src) && /segments: \{/.test(src) ? '✅' : '❌'} 状态块报的是**实际投出去的文件**（noticesSent，不许再撒谎）`)
     // 🔴 用户："我不要模拟用户发送啊！" —— 投递的那条必须标成 plugin/notice，且**不许** steer（空闲时会起一轮）
-    console.log(`  ${/kind: 'plugin', plugin: 'whale_craft', form: 'notice'/.test(src) ? '✅' : '❌'} 投递的消息标成 plugin/notice（插件提示行，不归到用户头上）`)
+    console.log(`  ${/noticeSource\(it\.title\)/.test(src) && !/kind: 'plugin'/.test(src) ? '✅' : '❌'} 投递的消息标成 plugin:whale_craft / notice（插件提示行，不归到用户头上）`)
     console.log(`  ${!/agent\.steer\(/.test(src) ? '✅' : '❌'} 🔴 插件里**没有** steer 兜底（steer 空闲会"起一轮"＝没问就替用户说话）`)
   }
 
@@ -1465,7 +1508,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   console.log(`  ${/export const builtinUserMessage/.test(umSrc) && /export const userMessage/.test(umSrc) ? '✅' : '❌'} 🔴 共用模块里有**自带等价实现**（不依赖任何宿主包也能注入）`)
   console.log(`  ${/role: 'user'/.test(umSrc) && /source: input\?\.source/.test(umSrc) && /crypto\.randomUUID/.test(umSrc) ? '✅' : '❌'} 兜底消息逐个对齐宿主 UserMessage 形状（role/content/source/id）`)
   console.log(`  ${/createRequire\(import\.meta\.url\)/.test(umSrc) && /req\('@deepseek-ai\/dsh-llm'\)/.test(umSrc) ? '✅' : '❌'} 仍然优先用宿主实现（形状跟得上宿主版本）`)
-  console.log(`  ${/import \{ userMessage \} from '\.\/user-message\.mjs'/.test(wdSrc) && /userMessage\(\{/.test(wdSrc) ? '✅' : '❌'} 🔴 看门狗（同一次事故的第二处）也用同一个模块，不再退化成"用户来源"消息`)
+  console.log(`  ${/import \{[^}]*\buserMessage\b[^}]*\} from '\.\/user-message\.mjs'/.test(wdSrc) && /userMessage\(\{/.test(wdSrc) && /noticeSource\(/.test(wdSrc) ? '✅' : '❌'} 🔴 看门狗（同一次事故的第二处）也用同一个模块 + noticeSource（不冒充用户发言、也不写 V3 的 kind:'plugin'）`)
 
   /* 🔴🔴 2026-09-18 **P0 事故**：0.1.4 把提示词投递挂到 `agent/pre-step`（cordis waterfall），
    *    但监听器只声明了一个形参、也没 `return next()` ⇒ **不交棒** = 否决整条链（含宿主内置行为），
@@ -1721,7 +1764,11 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     console.log(`  ${msgs.length === 3 ? '✅' : '❌'} 🔴 首次请求组装前投递 3 条（${msgs.length} 条：行事准则 + 版本提示 + 记忆索引）`)
     console.log(`  ${msgs.length === 3 && first === step1[0] ? '✅' : '❌'} 提示行排在本 step 消息的**最前面**（模型先看到规矩，再看用户那句）`)
     console.log(`  ${msgs.length === 3 && queuedAfterStep1 === 0 ? '✅' : '❌'} 🔴 提示行是**本步改写**送出去的（没有走"塞队列、下一步才领"那条晚一步的老路；队列残留 ${queuedAfterStep1} 条）`)
-    console.log(`  ${first?.source?.kind === 'plugin' && first?.source?.plugin === 'whale_craft' && first?.source?.form === 'notice' ? '✅' : '❌'} 🔴 来源是 plugin/notice（**不是**用户发言）：${JSON.stringify(first?.source ?? null)}`)
+    console.log(`  ${first?.source?.kind === 'plugin:whale_craft' && first?.source?.plugin === 'whale_craft' && first?.source?.form === 'notice' ? '✅' : '❌'} 🔴 来源是 producer-owned plugin:whale_craft / notice（**不是**用户发言）：${JSON.stringify(first?.source ?? null)}`)
+    // 🔴🔴 2026-09-22 真机事故回归钉子：kind 绝不能是 V3 的 'plugin' ——
+    //    宿主 v4 会话格式的准入会抛 `format v4 message requires a producer-owned source kind`，
+    //    **整个 step 失败**（工具全正常、只有"注入"这条通道炸，很容易误判成"没装提示词"）。
+    console.log(`  ${first?.source?.kind !== 'plugin' && String(first?.source?.kind ?? '').length > 0 ? '✅' : '❌'} 🔴 kind 不是 V3 的 'plugin'，是 producer-owned：${JSON.stringify(first?.source?.kind ?? null)}`)
     const body = (first?.content ?? []).map((c) => c.text ?? '').join('')
     console.log(`  ${/Whale Craft 行事准则/.test(body) && /Minecraft/.test(body) ? '✅' : '❌'} 第 1 条 = 行事准则（${body.length} 字），首行写明文件：${JSON.stringify(body.split('\n')[0])}`)
     console.log(`  ${/^Instructions from: \.whale-craft\/RULES\.md$/.test(body.split('\n')[0] ?? '') ? '✅' : '❌'} 正文首行是 "Instructions from: .whale-craft/RULES.md"（与 DSH 原生同形状）`)
@@ -2643,12 +2690,20 @@ console.log('\n--- 看门狗 job 结算 ---')
   const { EventEmitter } = await import('node:events')
   let hooks = null
   const kills = []
+  // 🔴🔴 2026-09-22 真机事故回归钉子：`jobs.start({ owner })` 的 owner 必须是
+  //    **会话 id 字符串**，`jobs.kill(id, caller, …)` 的 caller 也是。
+  //    以前传的是 `agent` **对象** ⇒ 宿主 `resolveOwner()` 拿它去 `agents.get()` 查表
+  //    （按会话 id 字符串索引）必然查不到 ⇒
+  //    `session "[object Object]" has no live agent (background job owner must be live)`
+  //    ⇒ 看门狗降级成"无 job 模式"（能唤醒，但 job_list 看不到、UI 也停不掉）。
+  const startSpecs = []
+  const killCallers = []
   const wdCtx = {
     logger: { info: () => {}, warn: () => {} },
     get: (k) => (k === 'jobs'
       ? {
-          start: (spec) => { hooks = spec.run(); return 'job-1' },
-          kill: (id) => { kills.push(id) },
+          start: (spec) => { startSpecs.push(spec); hooks = spec.run(); return 'job-1' },
+          kill: (id, caller) => { kills.push(id); killCallers.push(caller) },
         }
       : undefined),
   }
@@ -2662,6 +2717,9 @@ console.log('\n--- 看门狗 job 结算 ---')
   const wd = mk()
   wd.arm()
   console.log(`  ${hooks ? '✅' : '❌'} job 已挂上（${wd.jobId}）`)
+  const spec = startSpecs[0]
+  console.log(`  ${typeof spec?.owner === 'string' && spec.owner === 's' ? '✅' : '❌'} 🔴 jobs.start 的 owner 是**会话 id 字符串**（不是 agent 对象）：${JSON.stringify(spec?.owner)}`)
+  console.log(`  ${spec?.kind === 'mc-watch' && typeof spec?.label === 'string' ? '✅' : '❌'} job 元信息（kind/label）：${JSON.stringify({ kind: spec?.kind, label: spec?.label })}`)
 
   // 宿主 kill job → 我们的 cancel → 必须结算 done，且不回头再 kill 自己
   let settled = null
@@ -2684,6 +2742,7 @@ console.log('\n--- 看门狗 job 结算 ---')
   wd2.disarm('AI 主动关闭')
   await new Promise((r) => setTimeout(r, 30))
   console.log(`  ${kills.includes('job-1') ? '✅' : '❌'} AI 主动 disarm 会去 kill job（${kills.join(',') || '没调'}）`)
+  console.log(`  ${killCallers.length === 1 && killCallers[0] === 's' ? '✅' : '❌'} 🔴 jobs.kill 的 caller 也是**会话 id 字符串**：${JSON.stringify(killCallers)}`)
   console.log(`  ${settled2 ? '✅' : '❌'} 🔴 **主动** disarm 也结算了 done（否则宿主的 job 永远停在 stopping）：status=${settled2?.status}`)
 
   // 宿主随后回调 cancel()（我们 kill 之后宿主一定会走这一步）→ 幂等，不能报错也不能重复结算
@@ -2700,6 +2759,19 @@ console.log('\n--- 看门狗 job 结算 ---')
   let threw = null
   try { wd3.disarm('没在跑也要能调') } catch (e) { threw = e }
   console.log(`  ${!threw ? '✅' : '❌'} 未启动时 disarm 幂等不抛错`)
+
+  // 🔴 拿不到会话 id 时**不能**挂成"无主 job"（owner 缺省 = 对所有会话可见、
+  //    也能被别的会话的"强制停止"顺手带走），应当降级为"无 job 模式"并记一行日志。
+  const before = startSpecs.length
+  const wd4 = new Watchdog({
+    ctx: wdCtx,
+    sess: { bot: new EventEmitter(), events: [], config: {} },
+    agent: {},
+    onFire: () => {},
+  })
+  wd4.arm()
+  console.log(`  ${startSpecs.length === before && wd4.jobId === null ? '✅' : '❌'} 🔴 拿不到会话 id 时不挂"无主 job"，降级为无 job 模式（jobId=${wd4.jobId}）`)
+  console.log(`  ${wd4.log.some((e) => /拿不到会话 id/.test(e.text)) ? '✅' : '❌'} 降级原因记进了日志：${JSON.stringify(wd4.log.filter((e) => /会话 id|job/.test(e.text)).map((e) => e.text).slice(-2))}`)
 }
 
 // ── 结构不变量：会话事件队列只能有一个写入方 ──
@@ -2881,7 +2953,7 @@ console.log('\n--- 看门狗唤醒投递（提示词注入，非用户消息）-
   const msg = steerCalls[0]
   console.log(`  ${steerCalls.length === 1 ? '✅' : '❌'} 走 agent.steer（${steerCalls.length} 次）`)
   console.log(`  ${promptCalls.length === 0 ? '✅' : '❌'} **没有**走 sessionController.prompt/followup（${promptCalls.length} 次）`)
-  console.log(`  ${msg?.source?.kind === 'plugin' ? '✅' : '❌'} 来源是 plugin（不是 user）：kind=${msg?.source?.kind}`)
+  console.log(`  ${msg?.source?.kind === 'plugin:whale_craft' ? '✅' : '❌'} 来源是 producer-owned（不是 V3 的 'plugin'，也不是 user）：kind=${msg?.source?.kind}`)
   console.log(`  ${msg?.source?.form === 'notice' ? '✅' : '❌'} form=notice（渲染成折叠摘要行）`)
   console.log(`  ${msg?.source?.plugin === 'whale_craft' ? '✅' : '❌'} 标了来源插件 whale_craft`)
   console.log(`  ${/deepseek/.test(msg?.content?.[0]?.text ?? '') ? '✅' : '❌'} 正文带上原始消息`)

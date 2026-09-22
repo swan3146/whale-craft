@@ -35,7 +35,7 @@ import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPr
 import { AccountStore, parseAuthlibCard, normalizeServerUrl, dashUuid } from './src/accounts.mjs'
 import { DEFAULT_AGENTS_MD, agentsMdPath, legacyAgentsMdPath, migrateLegacyAgentsMd, readAgentsMd, writeAgentsMd, resetAgentsMd, isAgentsMdPath, syncRulesVersion, readRulesVersion } from './src/agentsmd.mjs'
 import { encodePng } from './src/png.mjs'
-import { userMessage, messageFactoryKind, pluginLoadNote } from './src/user-message.mjs'
+import { userMessage, noticeSource, messageFactoryKind, pluginLoadNote } from './src/user-message.mjs'
 import { ImageEngine, imageEngineAvailable, imageEngineError } from './src/image.mjs'
 import { listenLanBroadcast } from './src/lan.mjs'
 import { statusPing, parseAddress } from './src/ping.mjs'
@@ -747,13 +747,22 @@ export function apply(ctx, config) {
     }
 
     // ③ 再强清该会话全部后台任务
+    //
+    // 🔴 2026-09-22：`jobs` 这一族的 `caller` 参数要的是**会话 id 字符串**，不是 agent 对象
+    //    （宿主 `assertAccess()` 比的是 `job.owner.id !== caller`；见 src/watchdog.mjs#ownerId）。
+    //    以前传 `agent` 对象，`list()` 于是**一个自己的 job 都匹配不到**，
+    //    却把 `owner === undefined` 的**宿主级"无主 job"**全列出来 —— 那些 job 的
+    //    `assertAccess` 对无主任务是不设防的，于是"强制停止某个会话"会顺手杀掉
+    //    跟这个会话毫无关系的后台任务。这里两处一起改：用会话 id 查，且**只杀自己的**。
     const jobs = ctx.get('jobs')
-    if (jobs && agent) {
+    const jobOwner = agent?.id
+    if (jobs && typeof jobOwner === 'string' && jobOwner.length > 0) {
       try {
-        for (const j of jobs.list(agent) ?? []) {
+        for (const j of jobs.list(jobOwner) ?? []) {
           const id = j?.id ?? j?.jobId
           if (!id) continue
-          try { jobs.kill(id, agent, reason); out.killedJobs.push(id) } catch {}
+          if (j?.owner !== jobOwner) continue     // 无主 job（宿主自己的）不归我们管
+          try { jobs.kill(id, jobOwner, reason); out.killedJobs.push(id) } catch {}
         }
       } catch (e) { out.jobsError = String(e?.message ?? e) }
     }
@@ -2515,7 +2524,8 @@ export function apply(ctx, config) {
    *    · 两个都开时**先投工作区的，再投我们自己的**；
    *    · 每条都要让人**和 AI**一眼看出是哪个文件：折叠标题与正文首行都带**相对路径**
    *      （`AGENTS.md` 与 `.whale-craft/AGENTS.md` 是两回事）；
-   *    · `source` 写死 `{kind:'plugin', plugin:'whale_craft', form:'notice'}` → 插件提示行，不归到用户头上；
+   *    · `source` 走 `noticeSource()` = `{kind:'plugin:whale_craft', form:'notice'}` → 插件提示行，不归到用户头上；
+   *      （🔴 kind 必须是 producer-owned：v4 会话格式拒绝 V3 的 `'plugin'`，见 src/user-message.mjs 顶部）
    *    · **不做 steer 兜底**（steer 空闲会"起一轮"＝没问就替用户说话）。
    */
   /**
@@ -2768,7 +2778,9 @@ export function apply(ctx, config) {
    */
   const noticeMessagesFor = (todo) => todo.map((it) => userMessage({
     content: [{ type: 'text', text: `Instructions from: ${it.rel}\n\n${it.text}` }],
-    source: { kind: 'plugin', plugin: 'whale_craft', form: 'notice', summary: it.title },
+    // 🔴 source 必须 producer-owned（`plugin:whale_craft`），不能是 V3 的 `'plugin'` ——
+    //    见 src/user-message.mjs 顶部那段 v4 事故说明。写成 `'plugin'` 会让整个 step 失败。
+    source: noticeSource(it.title),
   }))
 
   /** 记一笔台账（投出去的那些文件名 + 正文，供诊断与"内容变了就地更新"） */
