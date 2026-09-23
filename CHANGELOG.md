@@ -2,6 +2,47 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0] - 2026-09-22
+
+> ⚠️ 这是 **fork 分支**（`feat/authme-26.2-dsh-0.1.7`），不是上游发布的版本。
+> 完整说明见 [FORK-NOTES.md](./FORK-NOTES.md)。基线：上游 `aac3130`（whale_craft 0.1.7）。
+
+### ✨ 新增（穿戴装备：盔甲 / 副手 / 指定槽位）
+
+- **现象**（用户真机）："无法穿戴装备。"
+- **根因**：`equip()` 把目标槽**硬编码成 `'hand'`**（`src/core.mjs`），于是盔甲（头盔 / 胸甲 / 护腿 / 靴子）
+  和副手**根本没法穿** —— 物品永远只会在快捷栏和主手之间挪。而 `bot.inventory.items()`
+  只覆盖槽 9–44，**不含盔甲槽 5–8 与副手 45**，所以"到底穿没穿"也不能靠它看。
+- **修法**：
+  · `equip({ name, destination, auto })` 支持 `hand / off-hand / head / torso / legs / feet`
+    （别名归一：`off-hand` / `off_hand` / `off hand` 等价，中文 `头 / 胸 / 腿 / 脚` 也认）；
+  · **不给 `destination` 就自动判槽** —— 权威依据是 minecraft-data 物品的 `enchantCategories`
+    （`armor_head` / `armor_chest` / `armor_legs` / `armor_feet`），所以 `turtle_helmet`、
+    `chainmail_chestplate` 这类名字不规则的也判得对；`elytra`→torso、`shield`→off-hand、
+    `carved_pumpkin` / `*_head` / `*_skull`→head 兜底；
+  · 新增 `mc_act { mode: "wear" }`：**一键穿全套**，同槽多件按材质挑最好的
+    （netherite > diamond > iron > chainmail > golden > leather），**鞘翅默认不穿**（它占胸槽会顶掉胸甲）；
+    缺哪件如实报出并给获取办法；
+  · `mc_inventory` 新增 **`wearing`**（读装备槽 5–8 + 副手 45），`equip` / `wear` 的回报里也带。
+- **坑**：`equip` 原先**先找物品、后校验 destination**，于是 dest 写错时会报"背包里没有 X"，
+  把真因盖掉 —— 已把校验提到前面。
+
+### ✨ 新增（使用手上的物品：吃 / 喝 / 倒水 / 点火 / 拉弓 / 丢珍珠）
+
+- **现象**（用户真机）："使用工具。" —— 原来只有 `use`，它做的是 `activateBlock` / `activateEntity`
+  （开门 / 按钮 / 拉杆 / 喂动物），**没有"用手上的物品"这一路**，所以吃不了、喝不了、倒不了水。
+- **修法**：
+  · 新增 `mc_act { mode: "useItem", name?, holdMs?, offHand? }`：可选先 equip 再 `activateItem()`；
+  · **食物走 `bot.consume()`**（等服务器 `entity_status` 确认，而不是自己数秒），
+    吃饱时给友好提示（`Food is full` → "吃饱了（food=20），现在吃 X 没效果"）；
+    数据里没有 `edible` / `foodPoints` 字段，所以食物按名字认（含 `_apple` / `_carrot` / `_potato` 等）；
+  · 非食物按类型给按下时长（弓 1200ms / 药水 1800ms / 食物 1600ms / 其余 120ms）再 `deactivateItem()`；
+  · `use` 新增 **`name`**：先把它拿到手上再对着方块右键（**骨粉催熟 / 锄头耕地 / 打火石点火**）。
+- **自检**：新增 **24 条**断言（槽位别名归一 / 自动判槽 / 自动穿头 / 真进槽 5 / `wearing` 回报 /
+  中文别名 / 乱给 dest 报错 / wear 四件 / 同槽挑好的 / 鞘翅默认不穿 / 报缺 / activate+release /
+  走 consume / 饱食度 / 吃饱友好提示 / `use`+name 先装备 / 空手报错 / 源码级断言 `mc_act` + `mc_sequence` + `wearing`）。
+  总数 **757 ✅ / 5 ❌**（那 5 条是既有的 Windows 路径夹具与 minecraft-data 索引问题，与本次无关）。
+
 ## [0.1.9] - 2026-09-22
 
 > ⚠️ 这是 **fork 分支**（`feat/authme-26.2-dsh-0.1.7`），不是上游发布的版本。

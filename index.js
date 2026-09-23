@@ -1965,7 +1965,7 @@ export function apply(ctx, config) {
 
   ctx.tools.register(asTool({
     name: 'mc_inventory',
-    description: '看背包和手持物品。',
+    description: '看背包、手持物品和身上穿着的装备（wearing 是头/胸/腿/脚/副手）。',
     parameters: {},
     output: text(),
     async execute(args, exec) {
@@ -2012,15 +2012,19 @@ export function apply(ctx, config) {
       + '· toward 看向并走近某个玩家(who)\n'
       + '· place  把背包方块放到 (x,y,z)；悬空时会先垫脚搭上去（=搭高）\n'
       + '· break  破坏 (x,y,z) 的方块\n'
-      + '· use    使用/激活方块(x,y,z)或实体(who)：开门、按按钮、拉杆、喂动物\n'
+      + '· use    使用/激活方块(x,y,z)或实体(who)：开门、按按钮、拉杆、喂动物；给了 name 会先把它拿到手上再用（骨粉/锄头/打火石/水桶）\n'
+      + '· useItem 用**手上的物品**（对着空气）：吃东西、喝药水、倒水、点火、拉弓、丢珍珠；name 可先装备，holdMs 控制按住多久\n'
       + '· attack 攻击 4.5 格内的实体（可给 who 指定名字）\n'
-      + '· equip  把背包里的物品拿到手上(name)\n'
+      + '· equip  装备物品(name)；dest 指定槽位 hand/off-hand/head/torso/legs/feet，**不给就按物品自动判槽**（盔甲会穿到对应部位）\n'
+      + '· wear   一键穿上背包里最好的全套盔甲（头/胸/腿/脚）\n'
       + '· toss   丢弃物品(name, count)',
     parameters: {
-      mode: { type: 'string', description: 'look / toward / place / break / use / attack / equip / toss' },
+      mode: { type: 'string', description: 'look / toward / place / break / use / useItem / attack / equip / wear / toss' },
       who: { type: 'string', description: '玩家或实体名（look/toward/use/attack 用）' },
       x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
-      name: { type: 'string', description: '方块或物品名（place/equip/toss 用）' },
+      name: { type: 'string', description: '方块或物品名（place/use/useItem/equip/toss 用）' },
+      dest: { type: 'string', description: 'equip 的槽位：hand / off-hand / head / torso / legs / feet（不给=自动判槽）' },
+      holdMs: { type: 'number', description: 'useItem 按住多久（毫秒；不给就按物品估，食物 1600、药水 1800、弓 1200）' },
       count: { type: 'number', description: 'toss 丢几个（默认 1）' },
       approach: { type: 'boolean', description: 'toward 是否走近（默认 true）' },
       budgetMs: { type: 'number' },
@@ -2037,10 +2041,12 @@ export function apply(ctx, config) {
         case 'place':   return { mode, ...(await bot.placeBlock(args)) }
         case 'break':   return { mode, ...(await bot.breakBlock(args)) }
         case 'use':     return { mode, ...(await bot.useBlock(args)) }
+        case 'useItem': return { mode, ...(await bot.useItem({ name: args.name, holdMs: args.holdMs })) }
         case 'attack':  return { mode, ...(await bot.attack(args)) }
-        case 'equip':   return { mode, ...(await bot.equip({ name: args.name })) }
+        case 'equip':   return { mode, ...(await bot.equip({ name: args.name, destination: args.dest ?? null })) }
+        case 'wear':    return { mode, ...(await bot.equipArmor({})) }
         case 'toss':    return { mode, ...(await bot.tossItem({ name: args.name, count: args.count })) }
-        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/break/use/attack/equip/toss）`)
+        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/break/use/useItem/attack/equip/wear/toss）`)
       }
     },
   }))
@@ -2068,8 +2074,9 @@ export function apply(ctx, config) {
     name: 'mc_sequence',
     description: '**按顺序执行一串世界交互**（替代"写脚本"）：适合"走到这里放几个方块，再走到那里放几个"这类连串动作。\n'
       + 'steps 是数组，每项 op 可为：wait(sec) / move(x,y,z,mode) / look(x,y,z 或 who) / toward(who) / '
-      + 'place(x,y,z,name) / break(x,y,z) / dig(name 或 x,y,z,count) / use(x,y,z 或 who) / attack(who) / '
-      + 'equip(name) / give(name,count) / toss(name,count) / say(text) / jump。\n'
+      + 'place(x,y,z,name) / break(x,y,z) / dig(name 或 x,y,z,count) / use(x,y,z 或 who, 可给 name) / '
+      + 'useItem(name,holdMs) / attack(who) / equip(name,dest) / wear / give(name,count) / toss(name,count) / '
+      + 'say(text) / jump。\n'
       + '逐步执行，默认遇错即停，整体有预算上限（默认 300s）。',
     parameters: {
       steps: { type: 'array', items: { type: 'object', additionalProperties: true }, description: '步骤数组（上限 64）' },

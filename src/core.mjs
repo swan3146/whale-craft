@@ -444,6 +444,77 @@ function colorOf (name) {
   return [150, 150, 150]
 }
 
+/* ───────────── 装备：槽位名归一 + 自动判槽（2026-09-22）─────────────
+ * 为什么有这一段：原来的 `equip` 把 destination 写死成 'hand'，
+ * 于是**盔甲（头/胸/腿/脚）一件都穿不上** —— 用户点名的缺口。
+ * 参照实现是 opencode 里挂的那个 mc_equip（destination: hand, head, torso, legs, feet）。
+ * ⚠️ mineflayer 认的副手槽叫 `off-hand`（**带连字符**），写成 offhand 会被 assert 拒掉。
+ */
+
+/** 别名 → mineflayer 槽位名；不认识的返回 null（调用方据此报错） */
+const EQUIP_DEST_ALIASES = {
+  hand: 'hand', main: 'hand', mainhand: 'hand', 手: 'hand', 主手: 'hand', 右手: 'hand',
+  offhand: 'off-hand', off: 'off-hand', 副手: 'off-hand', 左手: 'off-hand',
+  head: 'head', helmet: 'head', hat: 'head', 头: 'head', 头盔: 'head',
+  torso: 'torso', chest: 'torso', chestplate: 'torso', body: 'torso', 胸: 'torso', 胸甲: 'torso', 身体: 'torso',
+  legs: 'legs', leggings: 'legs', pants: 'legs', 腿: 'legs', 护腿: 'legs',
+  feet: 'feet', boots: 'feet', shoes: 'feet', 脚: 'feet', 靴子: 'feet',
+}
+
+/** 归一装备槽位名；空 → null，不认识 → null（配合 `destination != null` 判"给了但不认识"）。
+ *  `-`/`_`/空格一律吃掉，所以 off-hand / off_hand / off hand 都等价（mineflayer 认的是带连字符的 off-hand）。 */
+export function normalizeEquipDest (dest) {
+  if (dest == null) return null
+  const k = String(dest).trim().toLowerCase().replace(/[\s_-]+/g, '')
+  if (!k) return null
+  return EQUIP_DEST_ALIASES[k] ?? null
+}
+
+/** 盔甲四槽（穿全套、回报用） */
+export const ARMOR_SLOTS = ['head', 'torso', 'legs', 'feet']
+
+/** 装备槽在背包窗口里的下标（`inventory.items()` 只给 9–44，装备槽得单独看） */
+const EQUIP_SLOT_INDEX = { head: 5, torso: 6, legs: 7, feet: 8, 'off-hand': 45 }
+
+/** 同槽位有多件时挑好的：数据里没有盔甲"防御力"字段，按材质排足够用 */
+const ARMOR_MATERIALS = ['netherite', 'diamond', 'iron', 'chainmail', 'golden', 'leather', 'turtle']
+function armorRank (name) {
+  const i = ARMOR_MATERIALS.findIndex((m) => String(name).startsWith(m + '_'))
+  return i < 0 ? ARMOR_MATERIALS.length : i
+}
+
+/**
+ * 猜物品该穿哪个槽。**优先用 minecraft-data 的 `enchantCategories`**
+ * （armor_head / armor_chest / armor_legs / armor_feet）—— 这是数据里的权威字段，
+ * 比按名字后缀硬匹配可靠：turtle_helmet、chainmail_chestplate、模组盔甲都能对上。
+ * 数据里没标盔甲类别的（鞘翅、盾、南瓜头、头颅）再按名字兜底，其余一律当手持物。
+ */
+export function guessEquipDest (registry, itemName) {
+  const name = String(itemName ?? '')
+  const cats = registry?.itemsByName?.[name]?.enchantCategories ?? []
+  if (cats.includes('armor_head')) return 'head'
+  if (cats.includes('armor_chest')) return 'torso'
+  if (cats.includes('armor_legs')) return 'legs'
+  if (cats.includes('armor_feet')) return 'feet'
+  if (name === 'elytra') return 'torso'
+  if (name === 'shield') return 'off-hand'
+  if (name === 'carved_pumpkin' || /(_head|_skull)$/.test(name)) return 'head'
+  return 'hand'
+}
+
+/** 看起来像食物/药水？—— 数据里没有 edible/foodPoints 字段，只能按名字认（够用） */
+const FOOD_RE = /^(apple|golden_apple|enchanted_golden_apple|bread|carrot|golden_carrot|potato|baked_potato|poisonous_potato|beetroot|beetroot_soup|melon_slice|sweet_berries|glow_berries|dried_kelp|cookie|pumpkin_pie|mushroom_stew|rabbit_stew|suspicious_stew|chorus_fruit|honey_bottle|milk_bucket|.*_stew|.*_soup|(cooked|raw)_(beef|porkchop|chicken|mutton|rabbit|cod|salmon)|tropical_fish|pufferfish|rotten_flesh|spider_eye|poisonous_potato)$/
+const DRINK_RE = /^(potion|splash_potion|lingering_potion|milk_bucket|honey_bottle)$/
+
+/** 吃/喝/拉弓这类"按住才有用"的物品：估个按住时长（毫秒）；普通物品几乎瞬时 */
+function guessUseHoldMs (name) {
+  const n = String(name ?? '')
+  if (/^(bow|crossbow)$/.test(n)) return 1200
+  if (DRINK_RE.test(n)) return 1800
+  if (FOOD_RE.test(n)) return 1600
+  return 120
+}
+
 /**
  * 一个 Minecraft 机器人（保活、事件、世界操作）。
  * 事件（EventEmitter）：'chat'(玩家聊天) 'system'(系统消息) 'spawn' 'end' 'kicked' 'error' 'damage' 'log'
@@ -1654,7 +1725,12 @@ export class McBot extends EventEmitter {
 
   inventory () {
     const b = this.requireBot()
-    return { held: b.heldItem ? `${b.heldItem.name}x${b.heldItem.count}` : null, items: b.inventory.items().map((i) => `${i.name}x${i.count}`) }
+    return {
+      held: b.heldItem ? `${b.heldItem.name}x${b.heldItem.count}` : null,
+      // 装备槽不在 `inventory.items()` 里（它只给 9–44），单独列出来 —— 否则"我到底穿没穿"看不见
+      wearing: this.#wornArmor(b),
+      items: b.inventory.items().map((i) => `${i.name}x${i.count}`),
+    }
   }
 
   /* ───────────── 朝向（"看向我"就该用工具，不要用 /tp 指令） ───────────── */
@@ -1841,13 +1917,121 @@ export class McBot extends EventEmitter {
     throw new Error(`未知 mode：${mode}（可用 look / place / break / toward）`)
   }
 
-  /** 装备某物到手上 */
-  async equip ({ name } = {}) {
+  /**
+   * 装备某物。
+   *
+   * `destination` 不给就**按物品自己判槽**（盔甲→头/胸/腿/脚、鞘翅→胸、盾→副手、其余→手），
+   * 这正是原来缺的能力：以前写死 'hand'，盔甲一件都穿不上。
+   * 给了就用给的（hand / off-hand / head / torso / legs / feet，中英文别名都认）。
+   * auto:false 时不猜，一律装到手上（老行为）。
+   */
+  async equip ({ name, destination = null, auto = true } = {}) {
     const b = this.requireBot()
-    const item = b.inventory.items().find((i) => i.name === String(name))
-    if (!item) throw new Error(`背包里没有 ${name}（用 mc_inventory 看有什么）`)
-    await this.#t(b.equip(item, 'hand'), 'equip', `手持 ${name}`)
-    return { held: `${item.name}x${item.count}` }
+    const want = String(name ?? '').trim()
+    if (!want) throw new Error('要装备什么？给物品名（用 mc_inventory 看有什么）')
+    // 先校验 dest 再找物品：否则"背包里没有 X"会把"dest 写错了"这个真因盖掉
+    const explicit = normalizeEquipDest(destination)
+    if (destination != null && explicit == null) {
+      throw new Error(`不认识的装备位置 "${destination}"（可用 hand / off-hand / head / torso / legs / feet）`)
+    }
+    const item = b.inventory.items().find((i) => i.name === want)
+    if (!item) throw new Error(`背包里没有 ${want}（用 mc_inventory 看有什么）`)
+    const dest = explicit ?? (auto ? guessEquipDest(b.registry, item.name) : 'hand')
+    await this.#t(b.equip(item, dest), 'equip', `装备 ${item.name} → ${dest}`)
+    const label = `${item.name}x${item.count}`
+    return {
+      equipped: label,
+      destination: dest,
+      autoPicked: explicit == null,
+      held: dest === 'hand' ? label : undefined,
+      wearing: this.#wornArmor(b),
+    }
+  }
+
+  /** 当前身上穿着的盔甲 / 副手（`bot.inventory.items()` 不含 5–8 / 45 这些装备槽，得单独看） */
+  #wornArmor (b) {
+    const out = {}
+    for (const [k, s] of Object.entries(EQUIP_SLOT_INDEX)) {
+      const it = b.inventory?.slots?.[s]
+      if (it) out[k] = `${it.name}x${it.count}`
+    }
+    return out
+  }
+
+  /**
+   * 一键穿全套装备：头/胸/腿/脚各挑背包里**最好**的一件穿上。
+   *
+   * 为什么要这个：玩家说"穿上装备"不会一件件点名，而 `equip` 一次只穿一件 ——
+   * 四件套要四次调用，模型很容易漏。这里一次搞定，并回报"穿了哪些、缺哪些"。
+   * 鞘翅默认**不自动穿**（它占胸槽会顶掉胸甲），要穿就 elytra:true。
+   */
+  async equipArmor ({ include = ARMOR_SLOTS, elytra = false } = {}) {
+    const b = this.requireBot()
+    const pool = b.inventory.items()
+    const wanted = (Array.isArray(include) && include.length ? include : ARMOR_SLOTS)
+      .map((s) => normalizeEquipDest(s) ?? String(s))
+      .filter((s) => ARMOR_SLOTS.includes(s))
+    const worn = []
+    const missing = []
+    const failed = []
+    for (const slot of wanted) {
+      let cands = pool.filter((i) => guessEquipDest(b.registry, i.name) === slot)
+      if (slot === 'torso' && !elytra) cands = cands.filter((i) => i.name !== 'elytra')
+      if (!cands.length) { missing.push(slot); continue }
+      cands.sort((a, c) => armorRank(a.name) - armorRank(c.name))
+      const best = cands[0]
+      try {
+        await this.#t(b.equip(best, slot), 'equip', `穿 ${best.name} → ${slot}`)
+        worn.push(`${slot}=${best.name}`)
+      } catch (e) { failed.push(`${slot}: ${e.message}`) }
+    }
+    return {
+      worn, missing, failed,
+      nowWearing: this.#wornArmor(b),
+      note: missing.length ? `背包里没有可穿的：${missing.join(' / ')}（创造模式可用 mc_give 取）` : undefined,
+    }
+  }
+
+  /**
+   * 使用手上的物品（= 举起来用一下）：吃、喝、水桶、打火石、弓箭、末影珍珠、盾…
+   *
+   * 和 `useBlock` 的分工：`useBlock` 是"对着**世界**右键"（开门/按钮/喂动物），
+   * 这个是对着**空气**用**手上的东西** —— 以前完全没有这条路，所以机器人吃不了东西、
+   * 倒不了水、射不了箭（用户点名的第二个缺口）。
+   * 给了 name 就先拿到手上（offHand:true 拿副手）。
+   * holdMs 不给就按物品类型估（食物 1.6s、药水 1.8s、弓 1.2s、其余 0.12s）；
+   * 食物默认走 mineflayer 的 `bot.consume()`（它等服务器确认，比"自己数秒"稳）。
+   */
+  async useItem ({ name = null, offHand = false, holdMs = null, release = true, consume = null } = {}) {
+    const b = this.requireBot()
+    const hand = offHand ? 'off-hand' : 'hand'
+    if (name) await this.equip({ name, destination: hand })
+    const item = b.inventory?.slots?.[b.getEquipmentDestSlot(hand)] ?? (offHand ? null : b.heldItem)
+    if (!item) throw new Error(`${offHand ? '副手' : '主手'}上没有物品（给 name 先装备，或用 mc_inventory 看有什么）`)
+
+    const isFood = !offHand && FOOD_RE.test(item.name) && !/^(potion|splash_potion|lingering_potion)$/.test(item.name)
+    const useConsume = consume === true || (consume !== false && isFood && holdMs == null)
+    if (useConsume) {
+      if (typeof b.consume !== 'function') throw new Error('这一版 mineflayer 没有 bot.consume，请改用 holdMs 手动控制')
+      try {
+        await this.#t(b.consume(), 'act', `吃/喝 ${item.name}`)
+      } catch (e) {
+        if (/Food is full/i.test(String(e?.message))) {
+          throw new Error(`吃饱了（food=${b.food}），现在吃 ${item.name} 没效果`)
+        }
+        throw e
+      }
+      return { used: item.name, hand, mode: 'consume', food: b.food, wearing: undefined }
+    }
+
+    const ms = holdMs == null ? guessUseHoldMs(item.name) : Math.min(Math.max(Number(holdMs) || 0, 0), 10_000)
+    b.activateItem(offHand)
+    try {
+      if (ms > 0) await sleep(ms)
+    } finally {
+      if (release) b.deactivateItem()
+    }
+    return { used: item.name, hand, mode: 'activate', heldMs: ms, released: Boolean(release) }
   }
 
   /**
@@ -1941,9 +2125,16 @@ export class McBot extends EventEmitter {
     return { cleared: true }
   }
 
-  /** 使用/激活方块或实体（开门、按按钮、拉杆、喂动物…） */
-  async useBlock ({ x, y, z, who = null } = {}) {
+  /**
+   * 使用/激活方块或实体（开门、按按钮、拉杆、喂动物…）。
+   *
+   * 给了 name 就**先把它拿到手上**再右键 —— 这是"用物品对着方块用"的路子：
+   * 骨粉催熟、锄头耕地、打火石点火、水桶倒水、刷怪蛋、喂特定食物都用得上。
+   * （只用手上的东西、不对着方块，走 `useItem`。）
+   */
+  async useBlock ({ x, y, z, who = null, name = null, offHand = false } = {}) {
     const b = this.requireBot()
+    if (name) await this.equip({ name, destination: offHand ? 'off-hand' : 'hand' })
     if (who) {
       const needle = String(who).toLowerCase()
       const ent = Object.values(b.entities).find(
@@ -2002,8 +2193,8 @@ export class McBot extends EventEmitter {
    * 按顺序执行一串步骤。替代"让 AI 写脚本"——我们不给它脚本能力，
    * 而是把"走这里→放几个→再走那里"这种连串动作收进一个工具，服务端逐步跑。
    *
-   * 步骤 op：wait / move / look / turn(toward) / place / break / dig / use /
-   *          attack / equip / give / toss / say / jump
+   * 步骤 op：wait / move / look / turn(toward) / place / break / dig / use / useItem /
+   *          attack / equip / wear / give / toss / say / jump
    */
   async runSequence (steps, { stopOnError = true, budgetMs = 300_000 } = {}) {
     if (!Array.isArray(steps) || !steps.length) throw new Error('steps 必须是非空数组')
@@ -2054,12 +2245,14 @@ export class McBot extends EventEmitter {
       case 'use':     return this.useBlock(s)
       case 'attack':  return this.attack(s)
       case 'equip':   return this.equip(s)
+      case 'wear':    return this.equipArmor(s)
+      case 'useItem': return this.useItem(s)
       case 'give':    return this.giveItem(s)
       case 'toss':    return this.tossItem(s)
       case 'say':     return { said: this.chatSay(s.text ?? '') }
       case 'jump':    return this.jump()
       default:
-        throw new Error(`未知步骤 op："${op}"（可用：wait/move/look/toward/place/break/dig/use/attack/equip/give/toss/say/jump）`)
+        throw new Error(`未知步骤 op："${op}"（可用：wait/move/look/toward/place/break/dig/use/useItem/attack/equip/wear/give/toss/say/jump）`)
     }
   }
 

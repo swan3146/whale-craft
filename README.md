@@ -2,15 +2,16 @@
 
 > 🍴 这是 [yzi1b/whale-craft](https://github.com/yzi1b/whale-craft) 的 fork。
 > 在**上游 `0.1.7`** 的基础上，适配 **Minecraft 26.2 + AuthMe 6.x 对话框登录**，
-> 并修掉 **DSH `0.1.7-alpha.1`（v4 会话格式）** 下的 3 个真机问题。
+> 修掉 **DSH `0.1.7-alpha.1`（v4 会话格式）** 下的 5 个真机问题，
+> 并补上上游缺的 **穿戴装备** 与 **使用手上的物品** 两项能力。
 
 | | |
 |---|---|
 | 上游仓库 | [yzi1b/whale-craft](https://github.com/yzi1b/whale-craft) |
 | **上游版本** | **`0.1.7`**（commit `aac3130`，2026-09-20） |
-| **本 fork 版本** | **`0.1.9`** |
+| **本 fork 版本** | **`0.2.0`** |
 | 本 fork 分支 | `feat/authme-26.2-dsh-0.1.7` |
-| 相对上游改动 | **13 个文件，+888 / -47**（无新增依赖） |
+| 相对上游改动 | **13 个文件，+1407 / -68**（无新增依赖） |
 | 逐条改动说明 | [FORK-NOTES.md](./FORK-NOTES.md) |
 | 更新日志 | [CHANGELOG.md](./CHANGELOG.md) |
 
@@ -18,7 +19,7 @@
 
 ## 一、上游 `0.1.7` 有哪些问题
 
-下面 4 条都是**在真机上实测踩到的**（DSH `0.1.7-alpha.1` + EtheriumMC 26.2 / Paper + AuthMe 6.x）。
+下面 5 条都是**在真机上实测踩到的**（DSH `0.1.7-alpha.1` + EtheriumMC 26.2 / Paper + AuthMe 6.x）。
 
 ### 🔴 1. 提示词投递让整轮失败（DSH 0.1.7 / v4 会话格式）
 
@@ -125,6 +126,34 @@ MC_AUTHME_PASSWORD=你的密码
 EnvironmentFile=-/etc/whale-craft/authme.env
 ```
 
+### ✨ 穿戴装备（盔甲 / 副手 / 指定槽位）
+
+上游的 `equip` 把目标槽**硬编码成 `hand`**，所以**盔甲和副手根本穿不上** —— 物品只会在快捷栏和主手之间挪。
+本 fork 补上：
+
+- `mc_act { mode: "equip", name, dest }` —— `dest` 可给 `hand / off-hand / head / torso / legs / feet`
+  （`off-hand` / `off_hand` / `off hand` 等价，中文 `头 / 胸 / 腿 / 脚` 也认）；
+- **不给 `dest` 就自动判槽**：权威依据是 minecraft-data 物品的 `enchantCategories`
+  （`armor_head` / `armor_chest` / `armor_legs` / `armor_feet`），所以 `turtle_helmet`、
+  `chainmail_chestplate` 这类名字不规则的也判得对；`elytra`→torso、`shield`→off-hand 兜底；
+- `mc_act { mode: "wear" }` —— **一键穿全套**，同槽多件按材质挑最好的，**鞘翅默认不穿**
+  （它占胸槽会顶掉胸甲），缺哪件如实报出并给获取办法；
+- `mc_inventory` 的 **`wearing`** 报身上穿着的装备 —— 装备槽不在 `items()` 里（那只看槽 9–44），
+  所以不单独看就永远不知道穿没穿。
+
+### ✨ 使用手上的物品（吃 / 喝 / 倒水 / 点火 / 拉弓 / 丢珍珠）
+
+上游只有 `use`，做的是 `activateBlock` / `activateEntity`（开门 / 按钮 / 拉杆 / 喂动物），
+**没有"用手上的物品"这一路** —— 所以吃不了、喝不了、倒不了水。本 fork 补上：
+
+- `mc_act { mode: "useItem", name?, holdMs?, offHand? }` —— 可选先 equip 再 `activateItem()`；
+- **食物走 `bot.consume()`**（等服务器 `entity_status` 确认，而不是自己数秒）；
+  吃饱时给友好提示（`Food is full` → "吃饱了（food=20），现在吃 X 没效果"）；
+- 非食物按类型给按下时长（弓 1200ms / 药水 1800ms / 食物 1600ms / 其余 120ms）再 `deactivateItem()`；
+- `use` 新增 **`name`**：先把它拿到手上再对着方块右键（**骨粉催熟 / 锄头耕地 / 打火石点火**）。
+
+`mc_sequence` 同步认 `wear` 与 `useItem` 两个 op（`equip` 也支持 `dest`）。
+
 ---
 
 ## 四、怎么装
@@ -132,8 +161,8 @@ EnvironmentFile=-/etc/whale-craft/authme.env
 ### 从 Release 附件装（推荐，不用 clone）
 
 ```bash
-# 下载本 fork Releases 页的 whale_craft-0.1.9.tgz
-dsh plugin --profile <你的 profile> add /path/to/whale_craft-0.1.9.tgz
+# 下载本 fork Releases 页的 whale_craft-0.2.0.tgz
+dsh plugin --profile <你的 profile> add /path/to/whale_craft-0.2.0.tgz
 ```
 
 ### 从源码装

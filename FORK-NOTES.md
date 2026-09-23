@@ -1,8 +1,8 @@
 # Fork 分支说明：AuthMe 6.x 对话框登录 + DSH 0.1.7（v4 会话格式）适配
 
 > 本分支是 [yzi1b/whale-craft](https://github.com/yzi1b/whale-craft) 的 fork，
-> 基线为上游 `aac3130`（whale_craft **0.1.7**），**fork 自身版本 `0.1.9`**。
-> 相对上游改了 **13 个文件（+888 / -47）**：1 处新增功能、4 处修复、1 处自检夹具、若干文档与配置。
+> 基线为上游 `aac3130`（whale_craft **0.1.7**），**fork 自身版本 `0.2.0`**。
+> 相对上游改了 **13 个文件（+1407 / -68）**：3 处新增能力（AuthMe 登录 / 穿戴装备 / 使用手上的物品）、4 处修复、1 处自检夹具、若干文档与配置。
 > **不含任何密码、账户名或服务器地址**（AuthMe 密码改由环境变量提供，见第四节）。
 
 ---
@@ -13,7 +13,7 @@
 |---|---|
 | **DSH（DeepSeek Harness）** | **`0.1.7-alpha.1`** |
 | whale_craft 上游基线 | **0.1.7**（commit `aac3130`） |
-| **whale_craft（本 fork 发布的版本）** | **`0.1.9`** |
+| **whale_craft（本 fork 发布的版本）** | **`0.2.0`** |
 | Minecraft 服务端 | **EtheriumMC 26.2 / Paper 26.2**（Folia 调度器），协议号 **775** |
 | AuthMe | **6.x**（`preJoin` 对话框登录流程） |
 | mineflayer | 实测 4.39.0（上游声明 `^4.37.1`） |
@@ -182,25 +182,57 @@ systemd `EnvironmentFile`（`0600`）两种写法。文件本身仍然只有 `au
 **自检**：新增 4 条断言 —— 整组结构（`cordis:group` + `group: true` + 两个 `isolate` 键）、
 三个 `config` 条目齐全、`tool-result-pruner` 参数与官方一致、`MC_PRESET_SPEC === 7`。
 
+### 8. 穿戴装备 / 使用手上的物品（`src/core.mjs` + `index.js` + `selfcheck.mjs`）
+
+**问题**（用户真机）："无法穿戴装备，使用工具。" —— 两处缺口：
+
+- `equip()` 把目标槽**硬编码成 `'hand'`** ⇒ 盔甲（头盔 / 胸甲 / 护腿 / 靴子）与副手**根本穿不上**，
+  物品只会在快捷栏和主手之间挪；而且 `bot.inventory.items()` 只覆盖槽 9–44，
+  **不含盔甲槽 5–8 与副手 45**，所以"穿没穿"也看不见。
+- 只有 `use`，它做的是 `activateBlock` / `activateEntity`（开门 / 按钮 / 拉杆 / 喂动物），
+  **没有"用手上的物品"这一路** ⇒ 吃不了、喝不了、倒不了水、点不了火。
+
+**修法**：
+
+- `equip({ name, destination, auto })`：`destination` 支持 `hand / off-hand / head / torso / legs / feet`，
+  别名归一（`off-hand` / `off_hand` / `off hand` 等价，中文 `头 / 胸 / 腿 / 脚` 也认）；
+  **不给就自动判槽**，权威依据是 minecraft-data 的 `enchantCategories`
+  （`armor_head` / `armor_chest` / `armor_legs` / `armor_feet`）⇒ `turtle_helmet`、
+  `chainmail_chestplate` 这类名字不规则的也判得对，`elytra` / `shield` / `carved_pumpkin` 兜底；
+- `equipArmor()` + `mc_act { mode: "wear" }`：一键穿全套，同槽多件按材质挑最好的
+  （netherite > diamond > iron > chainmail > golden > leather），**鞘翅默认不穿**（占胸槽会顶掉胸甲），
+  缺哪件如实报出并给获取办法；
+- `useItem()` + `mc_act { mode: "useItem" }`：可选先 equip 再 `activateItem()`；
+  **食物走 `bot.consume()`**（等服务器 `entity_status`，不自己数秒），吃饱给友好提示；
+  非食物按类型给按下时长（弓 1200 / 药水 1800 / 食物 1600 / 其余 120 ms）再 `deactivateItem()`；
+- `useBlock()` 新增 `name`：先拿到手上再右键（骨粉催熟 / 锄头耕地 / 打火石点火）；
+- `inventory()` 新增 **`wearing`**（读装备槽 5–8 + 副手 45）；
+- `mc_sequence` 认 `wear` 与 `useItem` 两个新 op，`equip` 支持 `dest`。
+
+**⚠️ 顺序坑**：`equip` 原先**先找物品、后校验 destination**，dest 写错时会报"背包里没有 X"，
+把真因盖掉 —— 已把校验提到前面（自检里专门钉了这条）。
+
+**自检**：新增 **24 条**断言，总数 **757 ✅ / 5 ❌**（5 条为既有问题，与本次无关）。
+
 ---
 
 ## 三、相对上游改了什么
 
 | 文件 | 变化 | 说明 |
 |---|---|---|
-| `src/core.mjs` | **+90 / -1** | AuthMe 6.x 对话框登录（`writeVarInt` / NBT / 按阶段选包 id） |
+| `src/core.mjs` | **+295 / -13** | AuthMe 6.x 对话框登录（`writeVarInt` / NBT / 按阶段选包 id）+ 穿戴装备（`equip`/`equipArmor`）与用物品（`useItem`） |
 | `src/watchdog.mjs` | **+46 / -13** | `#ownerId()`、job owner/caller 修正、v4 `noticeSource` |
 | `src/config.mjs` | **+40 / -5** | 压缩组**整组**补进 `MC_PRESET_TOOL_GROUPS`（新增 `block` 字段）、`MC_PRESET_SPEC` 升到 7 |
-| `index.js` | **+28 / -10** | webServer 懒注入、job owner/caller 修正、v4 `noticeSource`、工具组注释订正 |
-| `selfcheck.mjs` | **+88 / -12** | 夹具补懒注入回调 + 8 条 jobs 回归钉子 + 4 条压缩组断言 |
+| `index.js` | **+44 / -19** | webServer 懒注入、job owner/caller 修正、v4 `noticeSource`、工具组注释订正 |
+| `selfcheck.mjs` | **+284 / -12** | 夹具补懒注入回调 + 8 条 jobs 回归钉子 + 4 条压缩组断言 + 24 条穿戴 / 用物品断言 |
 | `src/user-message.mjs` | **+39 / -1** | `PLUGIN_SOURCE_KIND` + `noticeSource()`（v4 合规） |
 | `src/version-prompt.mjs` | **+3 / -2** | 注释订正（kind 不能是 V3 的 `'plugin'`） |
 | `cordis.patch.yml` | **+20 / -0** | 加注释说明密码走环境变量（文件本身无密码） |
-| `package.json` | **+1 / -1** | 版本号 `0.1.7` → `0.1.9` |
-| `package-lock.json` | **+2 / -2** | 同步 lockfile 版本号（`0.1.7` → `0.1.9`，并订正残留的 `0.1.4`） |
-| `CHANGELOG.md` | **+86 / -0** | 本分支的变更记录（0.1.8 与 0.1.9 两节） |
-| `FORK-NOTES.md` | **+273 / -0** | 本文件（fork 独有，上游没有） |
-| `README.md` | **+172 / -0** | 重写为 fork 说明（上游版本 / 上游问题 / 修复 / 新增 / 安装 / 限制），上游原文折叠在文末 |
+| `package.json` | **+1 / -1** | 版本号 `0.1.7` → `0.2.0` |
+| `package-lock.json` | **+2 / -2** | 同步 lockfile 版本号（`0.1.7` → `0.2.0`，并订正残留的 `0.1.4`） |
+| `CHANGELOG.md` | **+127 / -0** | 本分支的变更记录（0.1.8 / 0.1.9 / 0.2.0 三节） |
+| `FORK-NOTES.md` | **+305 / -0** | 本文件（fork 独有，上游没有） |
+| `README.md` | **+201 / -0** | 重写为 fork 说明（上游版本 / 上游问题 / 修复 / 新增 / 安装 / 限制），上游原文折叠在文末 |
 
 **没有改**：其余源码。**没有新增依赖。**
 
@@ -216,10 +248,10 @@ systemd `EnvironmentFile`（`0600`）两种写法。文件本身仍然只有 `au
 dsh plugin --profile <你的 profile> add link:/path/to/whale-craft
 ```
 
-fork 也提供打包好的 tgz（见本 fork 的 **Releases** 页，附件 `whale_craft-0.1.8.tgz`）：
+fork 也提供打包好的 tgz（见本 fork 的 **Releases** 页，附件 `whale_craft-0.2.0.tgz`）：
 
 ```bash
-npm install /path/to/whale_craft-0.1.8.tgz
+npm install /path/to/whale_craft-0.2.0.tgz
 ```
 
 > ⚠️ npm 上的 `whale_craft` 属于原作者（`lyricraft <yzi1b@outlook.com>`），

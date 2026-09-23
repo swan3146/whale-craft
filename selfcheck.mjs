@@ -2924,6 +2924,202 @@ console.log('\n--- 无 OP 建造（创造模式自动取物）---')
   }
 }
 
+// ── 穿戴装备 / 使用物品（用户 2026-09-22：机器人穿不上盔甲、用不了东西）──
+// 参照实现是 opencode 里挂的那个 minecraft-mcp-server 的 mc_equip（destination: hand/head/torso/legs/feet）。
+// 旧版 equip 把 destination 写死 'hand'，所以盔甲一件都穿不上。
+console.log('\n--- 穿戴装备 / 使用手上的物品 ---')
+{
+  const { McBot, normalizeEquipDest, guessEquipDest } = await import('./src/core.mjs')
+
+  // ① 槽位名归一：mineflayer 认的是**带连字符**的 off-hand，写成 offhand 会被 assert 拒
+  const norm = [
+    ['offhand', 'off-hand'], ['off-hand', 'off-hand'], ['off_hand', 'off-hand'], ['副手', 'off-hand'],
+    ['helmet', 'head'], ['chestplate', 'torso'], ['leggings', 'legs'], ['boots', 'feet'],
+    ['main-hand', 'hand'], ['手', 'hand'], ['bogus', null], [null, null],
+  ]
+  const badNorm = norm.filter(([i, o]) => normalizeEquipDest(i) !== o)
+  console.log(`  ${badNorm.length === 0 ? '✅' : '❌'} 槽位别名归一（含 off-hand 连字符写法）${badNorm.length ? ' 失败：' + JSON.stringify(badNorm) : ''}`)
+
+  // ② 自动判槽：用 minecraft-data 的 enchantCategories（权威字段），不是按名字后缀硬猜
+  const reg = {
+    itemsByName: {
+      diamond_helmet: { enchantCategories: ['armor', 'armor_head'] },
+      leather_helmet: { enchantCategories: ['armor', 'armor_head'] },
+      turtle_helmet: { enchantCategories: ['armor', 'armor_head'] },
+      chainmail_chestplate: { enchantCategories: ['armor', 'armor_chest'] },
+      diamond_chestplate: { enchantCategories: ['armor', 'armor_chest'] },
+      diamond_leggings: { enchantCategories: ['armor', 'armor_legs'] },
+      diamond_boots: { enchantCategories: ['armor', 'armor_feet'] },
+      elytra: { enchantCategories: ['wearable'] },
+      shield: { enchantCategories: ['wearable'] },
+      diamond_sword: { enchantCategories: ['weapon'] },
+      bread: { enchantCategories: [] },
+      water_bucket: { enchantCategories: [] },
+      bone_meal: { enchantCategories: [] },
+    },
+  }
+  const guess = [
+    ['diamond_helmet', 'head'], ['turtle_helmet', 'head'], ['chainmail_chestplate', 'torso'],
+    ['diamond_leggings', 'legs'], ['diamond_boots', 'feet'], ['elytra', 'torso'],
+    ['shield', 'off-hand'], ['diamond_sword', 'hand'], ['bread', 'hand'],
+  ]
+  const badGuess = guess.filter(([i, o]) => guessEquipDest(reg, i) !== o)
+  console.log(`  ${badGuess.length === 0 ? '✅' : '❌'} 按物品自动判槽（turtle_helmet/chainmail 这类名字不规则的也对）${badGuess.length ? ' 失败：' + JSON.stringify(badGuess) : ''}`)
+
+  const ARMOR_IDX = { head: 5, torso: 6, legs: 7, feet: 8 }
+  const mkEquipBot = (slots) => {
+    const calls = { equip: [], activate: [], deactivate: 0, consume: 0 }
+    const DEST = { head: 5, torso: 6, legs: 7, feet: 8, 'off-hand': 45 }
+    const fake = {
+      entity: { position: null },
+      game: { gameMode: 'survival' },
+      food: 12,
+      quickBarSlot: 0,
+      inventory: {
+        slots,
+        items () { return this.slots.slice(9, 45).filter(Boolean) },
+      },
+      registry: reg,
+      getEquipmentDestSlot (d) { return d === 'hand' ? 36 + fake.quickBarSlot : DEST[d] },
+      async equip (item, dest) {
+        calls.equip.push(`${item.name}->${dest}`)
+        const from = item.slot
+        const to = fake.getEquipmentDestSlot(dest)
+        if (from != null && from !== to) { fake.inventory.slots[to] = item; fake.inventory.slots[from] = null; item.slot = to }
+      },
+      activateItem (off) { calls.activate.push(off ? 'off' : 'main') },
+      deactivateItem () { calls.deactivate++ },
+      async consume () { calls.consume++; fake.food = 20 },
+      blockAt: () => ({ name: 'wheat', position: { x: 0, y: 0, z: 0 } }),
+      activateBlock: async () => {},
+    }
+    return { fake, calls }
+  }
+  const mkSlots = (entries) => {
+    const s = new Array(46).fill(null)
+    for (const [slot, name] of entries) s[slot] = { name, count: 1, slot }
+    return s
+  }
+
+  // ③ equip 不给 dest → 盔甲自己穿到对应部位（旧版会硬塞到手上，等于穿不上）
+  {
+    const { fake, calls } = mkEquipBot(mkSlots([[36, 'diamond_helmet'], [10, 'bread']]))
+    const bot = new McBot({ instanceId: 'selftest-equip1' })
+    bot.bot = fake
+    const r = await bot.equip({ name: 'diamond_helmet' })
+    console.log(`  ${r.destination === 'head' && calls.equip[0] === 'diamond_helmet->head' ? '✅' : '❌'} equip 不给 dest 时盔甲自动穿到头（${calls.equip[0]}）`)
+    console.log(`  ${fake.inventory.slots[5]?.name === 'diamond_helmet' ? '✅' : '❌'} 真的进了装备槽 5（头盔槽），不是快捷栏`)
+    console.log(`  ${r.wearing?.head === 'diamond_helmetx1' ? '✅' : '❌'} 回报里带上"现在穿着什么"（wearing.head=${r.wearing?.head}）`)
+  }
+
+  // ④ 中文别名也要认；乱给要报错而不是默默装手上
+  {
+    const { fake, calls } = mkEquipBot(mkSlots([[10, 'diamond_chestplate']]))
+    const bot = new McBot({ instanceId: 'selftest-equip2' })
+    bot.bot = fake
+    await bot.equip({ name: 'diamond_chestplate', destination: '胸甲' })
+    console.log(`  ${calls.equip[0] === 'diamond_chestplate->torso' ? '✅' : '❌'} dest 认中文别名（胸甲 → torso）`)
+  }
+  // ④′ dest 写错时必须报"dest 错"，不能被"背包里没有 X"盖掉（校验顺序）
+  {
+    const { fake } = mkEquipBot(mkSlots([[10, 'diamond_chestplate']]))
+    const bot = new McBot({ instanceId: 'selftest-equip2b' })
+    bot.bot = fake
+    let err = null
+    try { await bot.equip({ name: 'diamond_chestplate', destination: '脑袋' }) } catch (e) { err = e }
+    console.log(`  ${/不认识的装备位置/.test(String(err?.message)) ? '✅' : '❌'} 乱给 dest 报错有指导性：${String(err?.message).slice(0, 34)}…`)
+  }
+
+  // ⑤ wear：一次穿全套，同槽多件挑好的，鞘翅默认不穿（会顶掉胸甲）
+  {
+    const { fake } = mkEquipBot(mkSlots([
+      [10, 'leather_helmet'], [11, 'diamond_helmet'], [12, 'diamond_chestplate'],
+      [13, 'diamond_leggings'], [14, 'diamond_boots'], [15, 'elytra'],
+    ]))
+    const bot = new McBot({ instanceId: 'selftest-equip3' })
+    bot.bot = fake
+    const r = await bot.equipArmor({})
+    const allFour = Object.values(ARMOR_IDX).every((i) => /^diamond_/.test(String(fake.inventory.slots[i]?.name)))
+    console.log(`  ${allFour ? '✅' : '❌'} wear 一次穿上四件（${r.worn.join(' ')}）`)
+    console.log(`  ${fake.inventory.slots[5]?.name === 'diamond_helmet' ? '✅' : '❌'} 同槽多件时挑好的（diamond 压过 leather）`)
+    console.log(`  ${!r.worn.some((w) => /elytra/.test(w)) ? '✅' : '❌'} 鞘翅默认不自动穿（会顶掉胸甲）`)
+    console.log(`  ${r.missing.length === 0 ? '✅' : '❌'} 四件齐全时不报"缺"`)
+  }
+
+  // ⑥ wear：背包里没有的槽要如实报缺（不是静默跳过）
+  {
+    const { fake } = mkEquipBot(mkSlots([[11, 'diamond_helmet']]))
+    const bot = new McBot({ instanceId: 'selftest-equip4' })
+    bot.bot = fake
+    const r = await bot.equipArmor({})
+    console.log(`  ${r.missing.length === 3 && /mc_give/.test(String(r.note)) ? '✅' : '❌'} 缺的槽如实报出并给获取办法（missing=${r.missing.join(',')}）`)
+  }
+
+  // ⑦ useItem：普通物品走 activate + release（水桶/打火石/珍珠）
+  {
+    const { fake, calls } = mkEquipBot(mkSlots([[36, 'water_bucket']]))
+    const bot = new McBot({ instanceId: 'selftest-use1' })
+    bot.bot = fake
+    const r = await bot.useItem({})
+    console.log(`  ${calls.activate.length === 1 && calls.deactivate === 1 ? '✅' : '❌'} useItem 用主手物品（activate 1 次 + release 1 次）`)
+    console.log(`  ${r.used === 'water_bucket' && r.mode === 'activate' ? '✅' : '❌'} 回报用了什么（${r.used} / ${r.mode}）`)
+  }
+
+  // ⑧ useItem：食物走 bot.consume（它等服务器确认，比自己数秒稳）
+  {
+    const { fake, calls } = mkEquipBot(mkSlots([[36, 'bread']]))
+    const bot = new McBot({ instanceId: 'selftest-use2' })
+    bot.bot = fake
+    const r = await bot.useItem({})
+    console.log(`  ${calls.consume === 1 && calls.activate.length === 0 ? '✅' : '❌'} 食物走 bot.consume（不是自己数秒）`)
+    console.log(`  ${r.mode === 'consume' && r.food === 20 ? '✅' : '❌'} 吃完回报饱食度（food=${r.food}）`)
+  }
+
+  // ⑨ 吃饱了要给友好提示，而不是把 mineflayer 的 'Food is full' 原样抛给模型
+  {
+    const { fake } = mkEquipBot(mkSlots([[36, 'bread']]))
+    fake.food = 20
+    fake.consume = async () => { throw new Error('Food is full') }
+    const bot = new McBot({ instanceId: 'selftest-use3' })
+    bot.bot = fake
+    let err = null
+    try { await bot.useItem({}) } catch (e) { err = e }
+    console.log(`  ${/吃饱了/.test(String(err?.message)) ? '✅' : '❌'} 吃饱时给友好提示：${String(err?.message).slice(0, 34)}…`)
+  }
+
+  // ⑩ use 给了 name → 先拿到手上再右键（骨粉催熟 / 锄头耕地 / 打火石点火）
+  {
+    const { fake, calls } = mkEquipBot(mkSlots([[10, 'bone_meal']]))
+    const bot = new McBot({ instanceId: 'selftest-use4' })
+    bot.bot = fake
+    const r = await bot.useBlock({ x: 0, y: 0, z: 0, name: 'bone_meal' })
+    console.log(`  ${calls.equip[0] === 'bone_meal->hand' ? '✅' : '❌'} use 给了 name 会先拿到手上再右键（${calls.equip[0]}）`)
+    console.log(`  ${r.usedBlock === 'wheat' ? '✅' : '❌'} 右键的还是目标方块（${r.usedBlock}）`)
+  }
+
+  // ⑪ 手上/副手空着时要报错，不能静默成功
+  {
+    const { fake } = mkEquipBot(mkSlots([]))
+    const bot = new McBot({ instanceId: 'selftest-use5' })
+    bot.bot = fake
+    let err = null
+    try { await bot.useItem({}) } catch (e) { err = e }
+    console.log(`  ${/没有物品/.test(String(err?.message)) ? '✅' : '❌'} 空手用物品报错有指导性`)
+  }
+
+  // ⑫ 工具入口真的挂上了新 mode/op（源码级断言，防止改了 core 忘了接 index）
+  {
+    const { readFileSync } = await import('node:fs')
+    const { fileURLToPath } = await import('node:url')
+    const idx = readFileSync(fileURLToPath(new URL('./index.js', import.meta.url)), 'utf8')
+    const core = readFileSync(fileURLToPath(new URL('./src/core.mjs', import.meta.url)), 'utf8')
+    console.log(`  ${/case 'wear':/.test(idx) && /case 'useItem':/.test(idx) ? '✅' : '❌'} mc_act 挂上了 wear / useItem 两个 mode`)
+    console.log(`  ${/destination: args\.dest/.test(idx) ? '✅' : '❌'} mc_act{equip} 把 dest 透传下去`)
+    console.log(`  ${/case 'wear':\s+return this\.equipArmor\(s\)/.test(core) && /case 'useItem': return this\.useItem\(s\)/.test(core) ? '✅' : '❌'} mc_sequence 也认 wear / useItem 这两个 op`)
+    console.log(`  ${/wearing: this\.#wornArmor\(b\)/.test(core) ? '✅' : '❌'} mc_inventory 会报身上穿着的装备（装备槽不在 items() 里）`)
+  }
+}
+
 // ── 看门狗唤醒投递：必须是**提示词注入**，不是模拟用户发言 ──
 // 用户要求：不要 followup（那会给对话插一条用户消息），要 steer + plugin 来源。
 // `steer` 的宿主文档："An idle driver starts a turn" —— 空闲也能唤醒，正合用。
