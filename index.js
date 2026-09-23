@@ -3033,7 +3033,9 @@ export function apply(ctx, config) {
    * 复制完官方 preset 之后，把**我们自己的几处**覆盖上去：
    *   ① persona（官方那句 "You are a helpful software engineer assistant." + `complete: true` 都不要）
    *   ② 关掉那个持久 shell（MC 模式的指导写着"本模式没有 shell"，两边必须一致）
-   *   ③ 补齐 MC 模式需要的工具组（tool-fs / tool-jobs / present）—— 官方 `minimal` 里一个都没有
+   *   ③ 补齐 MC 模式需要的组 —— 官方 `minimal` 里一个都没有：
+   *      · 工具组 tool-fs / tool-jobs / present
+   *      · 压缩组 compaction（`/compact` 指令 + 自动压缩；2026-09-22 用户真机投诉"压缩上下文没了"）
    * @param {string} id 目标 preset
    * @param {{key?: 'prefix'|'text'|null}} [opts] `key` = **本版本源 preset 用的那个键**（新版 prefix / 老版 text）
    * @returns {boolean} 是否改动过（false = 结构不认识 / 无需改动，日志里说明）

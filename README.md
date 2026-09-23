@@ -8,9 +8,9 @@
 |---|---|
 | 上游仓库 | [yzi1b/whale-craft](https://github.com/yzi1b/whale-craft) |
 | **上游版本** | **`0.1.7`**（commit `aac3130`，2026-09-20） |
-| **本 fork 版本** | **`0.1.8`** |
+| **本 fork 版本** | **`0.1.9`** |
 | 本 fork 分支 | `feat/authme-26.2-dsh-0.1.7` |
-| 相对上游改动 | **12 个文件，+767 / -38**（无新增依赖） |
+| 相对上游改动 | **13 个文件，+888 / -47**（无新增依赖） |
 | 逐条改动说明 | [FORK-NOTES.md](./FORK-NOTES.md) |
 | 更新日志 | [CHANGELOG.md](./CHANGELOG.md) |
 
@@ -67,6 +67,15 @@ AuthMe 在 **configuration 阶段**就下发 `show_dialog`，要求回一个 `cu
 `preJoin` 开启时不可跳过，`loginCancelKicks` 开启时没回就被踢下线。
 mineflayer 不处理这个包 ⇒ 机器人根本进不去。
 
+### 🔴 5. MC 模式 preset 里没有压缩组 ⇒ 没有 `/compact`，也没有自动压缩
+
+建 MC 模式 preset 时是照官方 **`minimal`** 复制再补的，而 `minimal` **没有压缩组**
+（官方 `standard` / `ptc` / `cordis` 都有）。上游只补了 `tool-fs` / `tool-jobs` / `present` 三个工具组，
+于是这个 preset **既没有 `/compact` 指令、也没有自动压缩**。
+
+用户真机报的原话："mc 模式 /compact 压缩上下文没了，无法压缩。"
+—— 比 `/compact` 更麻烦的是**自动压缩也没了**：上下文会一直涨到爆，中途毫无提示。
+
 ---
 
 ## 二、我们修了什么
@@ -78,6 +87,7 @@ mineflayer 不处理这个包 ⇒ 机器人根本进不去。
 | 2b | 「强制停止」误杀宿主任务 | 改成只杀自己的（`j.owner === jobOwner`）；拿不到会话 id 时**不再挂"无主 job"**，直接降级为"无 job 模式"并记一行日志 |
 | 3 | `webServer` 未就绪 | `inject` 不再硬依赖它（只留 `['tools']`），两处路由注册改为 `ctx.inject(['webServer'], (scope) => scope.effect(…))` 懒注入 |
 | 4 | 自检夹具跟不上懒注入 | 两处假 ctx 的 `inject` 是空壳 / 只登记不回调 ⇒ `/api/mc` 与 `/api/whale-craft` 两条路由**从没注册**、相关断言全废，脚本还在 `callOn(undefined, …)` 上 `TypeError` 崩掉。已让夹具对 `webServer` 立刻回调，并补 8 条 jobs 回归钉子 |
+| 5 | MC 模式没有 `/compact` / 自动压缩 | 把**压缩组整组**加进 `MC_PRESET_TOOL_GROUPS`（新增 `block` 字段，整组 YAML 逐字对齐官方），`patchToolGroupsIntoComposition()` 支持整组块追加；`MC_PRESET_SPEC` 升到 **7** ⇒ 升级时重建 6 建的 preset，顺手补上。**只补 `command-compact` 没用**：服务本体在 `compaction-basic`，`isolate` 那两个键别处不存在，必须整组加 |
 
 ---
 
@@ -122,8 +132,8 @@ EnvironmentFile=-/etc/whale-craft/authme.env
 ### 从 Release 附件装（推荐，不用 clone）
 
 ```bash
-# 下载本 fork Releases 页的 whale_craft-0.1.8.tgz
-dsh plugin --profile <你的 profile> add /path/to/whale_craft-0.1.8.tgz
+# 下载本 fork Releases 页的 whale_craft-0.1.9.tgz
+dsh plugin --profile <你的 profile> add /path/to/whale_craft-0.1.9.tgz
 ```
 
 ### 从源码装

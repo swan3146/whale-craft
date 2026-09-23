@@ -2,6 +2,27 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.9] - 2026-09-22
+
+> ⚠️ 这是 **fork 分支**（`feat/authme-26.2-dsh-0.1.7`），不是上游发布的版本。
+> 完整说明见 [FORK-NOTES.md](./FORK-NOTES.md)。基线：上游 `aac3130`（whale_craft 0.1.7）。
+
+### 🔴 修复（MC 模式里没有 `/compact`、也没有自动压缩）
+
+- **现象**（用户真机）："mc 模式 /compact 压缩上下文没了，无法压缩。"
+- **根因**：`/compact` 由 `@deepseek-ai/dsh-command-compact` 提供，而它属于 preset 里的**压缩组**
+  （`cordis:group` + `isolate: { compaction, toolResultPruner }` + 三个 config 条目：
+  `compaction-basic`（压缩服务本体）/ `command-compact`（斜杠指令）/ `tool-result-pruner`（超长工具结果裁剪））。
+  官方 `standard` / `ptc` / `cordis` 三个 preset 都有这一组，**`minimal` 没有** ——
+  而 whale_craft 建 MC 模式 preset 时正是照 `minimal` 复制的，只补了 `tool-fs` / `tool-jobs` / `present`，
+  于是这个 preset **既没有 `/compact`、也没有自动压缩**（而"自动压缩"没了更难察觉：上下文一直涨到爆）。
+- **修法**：把压缩组**整组**加进 `MC_PRESET_TOOL_GROUPS`（新增 `block` 字段，整组 YAML 逐字对齐官方那块），
+  `patchToolGroupsIntoComposition()` 支持整组块追加（老的三组输出逐字节不变）；
+  `MC_PRESET_SPEC` 升到 **7** —— 升级时会把 6 建的那些 preset 重建一遍，顺手给老环境补上压缩组。
+- **注意**：只补 `command-compact` 是**没用**的 —— 服务本体在 `compaction-basic`，
+  而 `isolate` 那两个键在别处根本不存在，**必须整组加**。
+- **自检**：新增 4 条断言（整组结构 / 三个 config 条目齐全 / pruner 参数与官方一致 / `MC_PRESET_SPEC === 7`）。
+
 ## [0.1.8] - 2026-09-22
 
 > ⚠️ 这是 **fork 分支**（`feat/authme-26.2-dsh-0.1.7`），不是上游发布的版本。

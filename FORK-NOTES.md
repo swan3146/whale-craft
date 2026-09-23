@@ -1,8 +1,8 @@
 # Fork 分支说明：AuthMe 6.x 对话框登录 + DSH 0.1.7（v4 会话格式）适配
 
 > 本分支是 [yzi1b/whale-craft](https://github.com/yzi1b/whale-craft) 的 fork，
-> 基线为上游 `aac3130`（whale_craft **0.1.7**），**fork 自身版本 `0.1.8`**。
-> 相对上游改了 **12 个文件（+767 / -38）**：1 处新增功能、3 处修复、1 处自检夹具、若干文档与配置。
+> 基线为上游 `aac3130`（whale_craft **0.1.7**），**fork 自身版本 `0.1.9`**。
+> 相对上游改了 **13 个文件（+888 / -47）**：1 处新增功能、4 处修复、1 处自检夹具、若干文档与配置。
 > **不含任何密码、账户名或服务器地址**（AuthMe 密码改由环境变量提供，见第四节）。
 
 ---
@@ -13,7 +13,7 @@
 |---|---|
 | **DSH（DeepSeek Harness）** | **`0.1.7-alpha.1`** |
 | whale_craft 上游基线 | **0.1.7**（commit `aac3130`） |
-| **whale_craft（本 fork 发布的版本）** | **`0.1.8`** |
+| **whale_craft（本 fork 发布的版本）** | **`0.1.9`** |
 | Minecraft 服务端 | **EtheriumMC 26.2 / Paper 26.2**（Folia 调度器），协议号 **775** |
 | AuthMe | **6.x**（`preJoin` 对话框登录流程） |
 | mineflayer | 实测 4.39.0（上游声明 `^4.37.1`） |
@@ -143,6 +143,45 @@ assertAccess(job, caller) { if (job.owner !== void 0 && job.owner.id !== caller)
 AuthMe 密码改由环境变量 `MC_AUTHME_PASSWORD` 提供，并给出 `export` 与
 systemd `EnvironmentFile`（`0600`）两种写法。文件本身仍然只有 `autoConnect: false`。
 
+### 7. MC 模式 preset 补上压缩组（`src/config.mjs` + `selfcheck.mjs`）
+
+**问题**：`/compact` 由 `@deepseek-ai/dsh-command-compact` 提供，它属于 preset 里的**压缩组**：
+
+```yaml
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    - id: compaction-basic            # 压缩服务本体
+      name: '@deepseek-ai/dsh-compaction-basic'
+    - id: command-compact             # /compact 这条斜杠指令
+      name: '@deepseek-ai/dsh-command-compact'
+    - id: tool-result-pruner          # 超长工具结果裁剪
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config: { thresholdChars: 8192, headChars: 4096, tailChars: 1024 }
+```
+
+官方 `standard` / `ptc` / `cordis` 三个 preset 都有这一组，**`minimal` 没有** ——
+而 whale_craft 建 MC 模式 preset 时是照 `minimal` 复制再补的，只补了 `tool-fs` / `tool-jobs` / `present`，
+于是这个 preset **既没有 `/compact`、也没有自动压缩**（用户真机投诉："压缩上下文没了"）。
+
+**修法**：
+
+- `MC_PRESET_TOOL_GROUPS` 增加第 4 个条目，带 **`block` 字段**（整组 YAML 逐字对齐官方那块）；
+- `patchToolGroupsIntoComposition()`：有 `block` 就整块追加，否则维持原来的
+  "一行 `- id` + 一行 `name`" 简单形式 ⇒ **老的三组输出逐字节不变**（幂等性断言不受影响）；
+- `MC_PRESET_SPEC` **6 → 7**：升级时会把 6 建的那些 preset 重建一遍，顺手补上压缩组
+  （和 `spec 5 → 6` 修 persona 键名走的是同一条路）。
+
+**⚠️ 关键**：只补 `command-compact` 是**没用**的 —— 压缩服务本体在 `compaction-basic`，
+`isolate` 那两个键在别处根本不存在，**必须整组加**。
+
+**自检**：新增 4 条断言 —— 整组结构（`cordis:group` + `group: true` + 两个 `isolate` 键）、
+三个 `config` 条目齐全、`tool-result-pruner` 参数与官方一致、`MC_PRESET_SPEC === 7`。
+
 ---
 
 ## 三、相对上游改了什么
@@ -151,16 +190,17 @@ systemd `EnvironmentFile`（`0600`）两种写法。文件本身仍然只有 `au
 |---|---|---|
 | `src/core.mjs` | **+90 / -1** | AuthMe 6.x 对话框登录（`writeVarInt` / NBT / 按阶段选包 id） |
 | `src/watchdog.mjs` | **+46 / -13** | `#ownerId()`、job owner/caller 修正、v4 `noticeSource` |
-| `index.js` | **+25 / -9** | webServer 懒注入、job owner/caller 修正、v4 `noticeSource` |
-| `selfcheck.mjs` | **+81 / -9** | 夹具补懒注入回调 + 8 条 jobs 回归钉子 |
+| `src/config.mjs` | **+40 / -5** | 压缩组**整组**补进 `MC_PRESET_TOOL_GROUPS`（新增 `block` 字段）、`MC_PRESET_SPEC` 升到 7 |
+| `index.js` | **+28 / -10** | webServer 懒注入、job owner/caller 修正、v4 `noticeSource`、工具组注释订正 |
+| `selfcheck.mjs` | **+88 / -12** | 夹具补懒注入回调 + 8 条 jobs 回归钉子 + 4 条压缩组断言 |
 | `src/user-message.mjs` | **+39 / -1** | `PLUGIN_SOURCE_KIND` + `noticeSource()`（v4 合规） |
 | `src/version-prompt.mjs` | **+3 / -2** | 注释订正（kind 不能是 V3 的 `'plugin'`） |
 | `cordis.patch.yml` | **+20 / -0** | 加注释说明密码走环境变量（文件本身无密码） |
-| `package.json` | **+1 / -1** | 版本号 `0.1.7` → `0.1.8` |
-| `package-lock.json` | **+2 / -2** | 同步 lockfile 版本号（`0.1.7` → `0.1.8`，并订正残留的 `0.1.4`） |
-| `CHANGELOG.md` | **+65 / -0** | 本分支的变更记录 |
-| `FORK-NOTES.md` | **+233 / -0** | 本文件（fork 独有，上游没有） |
-| `README.md` | **+162 / -0** | 重写为 fork 说明（上游版本 / 上游问题 / 修复 / 新增 / 安装 / 限制），上游原文折叠在文末 |
+| `package.json` | **+1 / -1** | 版本号 `0.1.7` → `0.1.9` |
+| `package-lock.json` | **+2 / -2** | 同步 lockfile 版本号（`0.1.7` → `0.1.9`，并订正残留的 `0.1.4`） |
+| `CHANGELOG.md` | **+86 / -0** | 本分支的变更记录（0.1.8 与 0.1.9 两节） |
+| `FORK-NOTES.md` | **+273 / -0** | 本文件（fork 独有，上游没有） |
+| `README.md` | **+172 / -0** | 重写为 fork 说明（上游版本 / 上游问题 / 修复 / 新增 / 安装 / 限制），上游原文折叠在文末 |
 
 **没有改**：其余源码。**没有新增依赖。**
 
