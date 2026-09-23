@@ -232,7 +232,7 @@ console.log('\n--- 工具面（share 移除 / present 接入）---')
   const { readFileSync } = await import('node:fs')
   const idx = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
   console.log(`  ${!tools.has('mc_kit_share') ? '✅' : '❌'} 🔴 mc_kit_share 已移除（它只是在调宿主**另装**的 dsh-file-host，插件本身没有文件服务器）`)
-  console.log(`  ${tools.size === 29 ? '✅' : '❌'} 工具数 29（实际 ${tools.size}）：mc_* 25 + mc_kit_* 3 + mc_admin_* 1`)
+  console.log(`  ${tools.size === 30 ? '✅' : '❌'} 工具数 30（实际 ${tools.size}）：mc_* 26 + mc_kit_* 3 + mc_admin_* 1`)
   // 只看**代码**，不看注释：注释里留着"为什么删"的说明（那是要留的）
   const codeOnly = idx.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
   console.log(`  ${!/uploadToFileHost|dsh-file-host|\/serve\/file-host|mc_kit_share/.test(codeOnly) ? '✅' : '❌'} 源码里没有上传/文件服务器残留（注释里保留"为什么删"的说明）`)
@@ -526,6 +526,37 @@ for (const [label, args, want] of [
   const first = r.results[0]
   const stopped = r.results.length === 1
   console.log(`  ${first?.ok === false && /可用：/.test(first.error) && stopped ? '✅' : '❌'} 未知 op 报错+列可用值+遇错即停：${String(first?.error).slice(0, 60)}…`)
+}
+
+// ── mc_hunt：自动攻击（参考 opencode 配的 mineflayer-pathfinder 项目）──
+{
+  console.log(`  ${tools.get('mc_hunt') ? '✅' : '❌'} mc_hunt 已注册`)
+
+  // 不在线 / 没装 pathfinder 都要清晰报错（不是崩溃、不是 TypeError）
+  try {
+    await tools.get('mc_hunt').execute({ who: '僵尸' }, A)
+    console.log('  ❌ mc_hunt 未连服竟然成功')
+  } catch (e) {
+    console.log(`  ${/不在线|连接|pathfinder/.test(e.message) ? '✅' : '❌'} mc_hunt 未连服清晰报错：${e.message.slice(0, 44)}…`)
+  }
+
+  // 缺 who 要在碰连接之前就被拦下（schema 必填层 或 hunt() 参数层，两条路都要清晰）
+  try {
+    await tools.get('mc_hunt').execute({}, A)
+    console.log('  ❌ mc_hunt 缺 who 竟然成功')
+  } catch (e) {
+    console.log(`  ${/who 必填|missing required property "who"/.test(e.message) ? '✅' : '❌'} mc_hunt 缺 who 校验：${e.message.slice(0, 55)}…`)
+  }
+
+  // 源码级断言：pathfinder 挂载 + GoalFollow 锁定单体 + 自动挖 + 序列 op 接线
+  const { readFileSync } = await import('node:fs')
+  const coreSrcHunt = readFileSync(new URL('./src/core.mjs', import.meta.url), 'utf8')
+  const idxSrcHunt = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+  console.log(`  ${/mineflayer-pathfinder/.test(coreSrcHunt) && /loadPlugin\(pathfinderPlugin\)/.test(coreSrcHunt) ? '✅' : '❌'} core.mjs 挂载 pathfinder 插件（createBot 后 loadPlugin，参考 bot.ts:136）`)
+  console.log(`  ${/GoalFollow\(target, followRange\)/.test(coreSrcHunt) && /setGoal\(goal, true\)/.test(coreSrcHunt) ? '✅' : '❌'} hunt 用 GoalFollow + dynamic goal 锁定单一目标持续追击`)
+  console.log(`  ${/mv\.canDig = true/.test(coreSrcHunt) ? '✅' : '❌'} hunt 打开 canDig（追击自动挖挡路方块；垫脚靠 toPlace + 背包方块）`)
+  console.log(`  ${/case 'hunt'/.test(coreSrcHunt) && /hunt\(who,durationSec/.test(idxSrcHunt) ? '✅' : '❌'} mc_sequence 接入 hunt op（#runStep 分支 + 工具描述）`)
+  console.log(`  ${/hpFloor/.test(coreSrcHunt) && /aborted/.test(coreSrcHunt) && /clearControlStates/.test(coreSrcHunt) ? '✅' : '❌'} hunt 有撤退线（hpFloor）+ 用户中断 + 收尾清控制位`)
 }
 
 // ── 强制停止：语义与**顺序**（用户 2026-09-16：移除普通停止，只剩强制停止）──

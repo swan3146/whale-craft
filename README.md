@@ -3,15 +3,15 @@
 > 🍴 这是 [yzi1b/whale-craft](https://github.com/yzi1b/whale-craft) 的 fork。
 > 在**上游 `0.1.7`** 的基础上，适配 **Minecraft 26.2 + AuthMe 6.x 对话框登录**，
 > 修掉 **DSH `0.1.7-alpha.1`（v4 会话格式）** 下的 5 个真机问题，
-> 并补上上游缺的 **穿戴装备** 与 **使用手上的物品** 两项能力。
+> 并补上上游缺的 **穿戴装备**、**使用手上的物品** 与 **自动攻击（`mc_hunt`）** 三项能力。
 
 | | |
 |---|---|
 | 上游仓库 | [yzi1b/whale-craft](https://github.com/yzi1b/whale-craft) |
 | **上游版本** | **`0.1.7`**（commit `aac3130`，2026-09-20） |
-| **本 fork 版本** | **`0.2.0`** |
+| **本 fork 版本** | **`0.3.0`** |
 | 本 fork 分支 | `feat/authme-26.2-dsh-0.1.7` |
-| 相对上游改动 | **13 个文件，+1407 / -68**（无新增依赖） |
+| 相对上游改动 | **13 个文件，+1701 / -70**（新增依赖 `mineflayer-pathfinder@^2.4.5`） |
 | 逐条改动说明 | [FORK-NOTES.md](./FORK-NOTES.md) |
 | 更新日志 | [CHANGELOG.md](./CHANGELOG.md) |
 
@@ -154,6 +154,22 @@ EnvironmentFile=-/etc/whale-craft/authme.env
 
 `mc_sequence` 同步认 `wear` 与 `useItem` 两个 op（`equip` 也支持 `dest`）。
 
+### ✨ 自动攻击（`mc_hunt`：追着打 + 自动挖 + 自动垫脚）
+
+上游只有 `attack`（打 **4.5 格内**一次），要追着打就得一步步调工具、**费 token**。
+本 fork 新增独立工具 `mc_hunt`（也可作 `mc_sequence` 的 `hunt` 步骤），
+参考 opencode 配置里配的 `mineflayer-pathfinder` 项目实现：
+
+- `mc_hunt { who, durationSec?, range?, hpFloor?, reacquire? }` —— 按名字子串锁定**一个**实体，
+  `GoalFollow(target, range)` + **dynamic goal** 持续追击（目标移动自动重规划），进 4 格按
+  ~600ms 攻击冷却连打；
+- **自动挖挡路方块**：`Movements.canDig = true`（astar 生成 toBreak → pathfinder 自动换最快工具
+  并 `bot.dig`）；**自动垫脚**：astar 的 `toPlace` + 背包方块 —— 所以背包带点方块才垫得了脚过沟；
+- 开战自动把背包**最强武器**换到手（剑 > 斧，netherite > diamond > iron > stone > golden/wooden）；
+- 收场带回战报：目标死/跑丢（宽限 `reacquire` 秒）/ 血量 ≤ `hpFloor` 撤 / 超时 `durationSec`
+  （默认 45s，上限 120）/ 用户中断 / 断线；收尾必定清 goal + 清控制位；
+- 新增依赖 `mineflayer-pathfinder@^2.4.5`，`createBot` 返回后 `loadPlugin`（官方 README 同款时机）。
+
 ---
 
 ## 四、怎么装
@@ -161,8 +177,8 @@ EnvironmentFile=-/etc/whale-craft/authme.env
 ### 从 Release 附件装（推荐，不用 clone）
 
 ```bash
-# 下载本 fork Releases 页的 whale_craft-0.2.0.tgz
-dsh plugin --profile <你的 profile> add /path/to/whale_craft-0.2.0.tgz
+# 下载本 fork Releases 页的 whale_craft-0.3.0.tgz
+dsh plugin --profile <你的 profile> add /path/to/whale_craft-0.3.0.tgz
 ```
 
 ### 从源码装

@@ -2014,7 +2014,7 @@ export function apply(ctx, config) {
       + '· break  破坏 (x,y,z) 的方块\n'
       + '· use    使用/激活方块(x,y,z)或实体(who)：开门、按按钮、拉杆、喂动物；给了 name 会先把它拿到手上再用（骨粉/锄头/打火石/水桶）\n'
       + '· useItem 用**手上的物品**（对着空气）：吃东西、喝药水、倒水、点火、拉弓、丢珍珠；name 可先装备，holdMs 控制按住多久\n'
-      + '· attack 攻击 4.5 格内的实体（可给 who 指定名字）\n'
+      + '· attack 攻击 4.5 格内的实体（可给 who 指定名字）；**要追着打就换 mc_hunt**（自动寻路追上+连续打+自动挖/垫脚）\n'
       + '· equip  装备物品(name)；dest 指定槽位 hand/off-hand/head/torso/legs/feet，**不给就按物品自动判槽**（盔甲会穿到对应部位）\n'
       + '· wear   一键穿上背包里最好的全套盔甲（头/胸/腿/脚）\n'
       + '· toss   丢弃物品(name, count)',
@@ -2075,7 +2075,7 @@ export function apply(ctx, config) {
     description: '**按顺序执行一串世界交互**（替代"写脚本"）：适合"走到这里放几个方块，再走到那里放几个"这类连串动作。\n'
       + 'steps 是数组，每项 op 可为：wait(sec) / move(x,y,z,mode) / look(x,y,z 或 who) / toward(who) / '
       + 'place(x,y,z,name) / break(x,y,z) / dig(name 或 x,y,z,count) / use(x,y,z 或 who, 可给 name) / '
-      + 'useItem(name,holdMs) / attack(who) / equip(name,dest) / wear / give(name,count) / toss(name,count) / '
+      + 'useItem(name,holdMs) / attack(who) / hunt(who,durationSec,range,hpFloor,reacquire) / equip(name,dest) / wear / give(name,count) / toss(name,count) / '
       + 'say(text) / jump。\n'
       + '逐步执行，默认遇错即停，整体有预算上限（默认 300s）。',
     parameters: {
@@ -2136,6 +2136,33 @@ export function apply(ctx, config) {
         maxDistance: args.maxDistance, count: args.count,
       })
       return { result: lines }
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_hunt',
+    description: '**自动攻击（追着打）**：决定打谁之后一次调用即可 —— 自动寻路追上去、锁定**这一个**实体连续打，'
+      + '途中**自动挖挡路方块、自动垫脚**（靠 mineflayer-pathfinder），不必一步步调 mc_act（省 token）。\n'
+      + '开战自动换背包最强武器到手；目标死/跑丢/自己血量 ≤ hpFloor/超时/被中断都会收场并返回战报。'
+      + '背包带些方块（脚手架类）才能垫脚过沟，没带遇到沟只能绕路。也可作为 mc_sequence 的 hunt 步骤。',
+    parameters: {
+      who: { type: 'string', required: true, description: '目标名字（子串匹配；先用 mc_entities 看附近有谁）' },
+      durationSec: { type: 'number', description: '最多追打多少秒（默认 45，上限 120）' },
+      range: { type: 'number', description: '追到多近算跟上（默认 2，1-8）' },
+      hpFloor: { type: 'number', description: '自己血量低于此值就撤（默认 10）' },
+      reacquire: { type: 'number', description: '目标丢失后宽限几秒再收场（默认 4，可能只是过区块边界）' },
+    },
+    output: text(),
+    timeoutMs: 180_000,
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      return sess.bot.hunt({
+        who: args.who,
+        durationSec: args.durationSec,
+        range: args.range,
+        hpFloor: args.hpFloor,
+        reacquire: args.reacquire,
+      })
     },
   }))
 

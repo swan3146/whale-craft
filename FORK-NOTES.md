@@ -1,8 +1,8 @@
 # Fork 分支说明：AuthMe 6.x 对话框登录 + DSH 0.1.7（v4 会话格式）适配
 
 > 本分支是 [yzi1b/whale-craft](https://github.com/yzi1b/whale-craft) 的 fork，
-> 基线为上游 `aac3130`（whale_craft **0.1.7**），**fork 自身版本 `0.2.0`**。
-> 相对上游改了 **13 个文件（+1407 / -68）**：3 处新增能力（AuthMe 登录 / 穿戴装备 / 使用手上的物品）、4 处修复、1 处自检夹具、若干文档与配置。
+> 基线为上游 `aac3130`（whale_craft **0.1.7**），**fork 自身版本 `0.3.0`**。
+> 相对上游改了 **13 个文件（+1701 / -70）**：4 处新增能力（AuthMe 登录 / 穿戴装备 / 使用手上的物品 / 自动攻击 `mc_hunt`）、4 处修复、1 处自检夹具、若干文档与配置。
 > **不含任何密码、账户名或服务器地址**（AuthMe 密码改由环境变量提供，见第四节）。
 
 ---
@@ -13,7 +13,7 @@
 |---|---|
 | **DSH（DeepSeek Harness）** | **`0.1.7-alpha.1`** |
 | whale_craft 上游基线 | **0.1.7**（commit `aac3130`） |
-| **whale_craft（本 fork 发布的版本）** | **`0.2.0`** |
+| **whale_craft（本 fork 发布的版本）** | **`0.3.0`** |
 | Minecraft 服务端 | **EtheriumMC 26.2 / Paper 26.2**（Folia 调度器），协议号 **775** |
 | AuthMe | **6.x**（`preJoin` 对话框登录流程） |
 | mineflayer | 实测 4.39.0（上游声明 `^4.37.1`） |
@@ -216,25 +216,51 @@ systemd `EnvironmentFile`（`0600`）两种写法。文件本身仍然只有 `au
 
 ---
 
+### 9. 自动攻击：mc_hunt（`src/core.mjs` + `index.js` + `selfcheck.mjs` + `README.md` + 依赖）
+
+- **背景**（用户 2026-09-22）：上游 `attack` 只能打 4.5 格内一次，追着打要一步步调工具、费 token；
+  要求"**自动寻路追上去、锁定这一个实体连续打，途中自动挖挡路方块、自动垫脚**"，
+  并指定参考 opencode 配置里的 `/www/minecraft-mcp-server`（深研结论：其 `brain.mjs` 用
+  `mineflayer-pathfinder` 的 `Movements + setMovements + GoalNear` 寻路，`canDig = false`）。
+- **实现**：
+  · **新增依赖** `mineflayer-pathfinder@^2.4.5`（lockfile 同步）；`createBot` 返回后 `loadPlugin`
+    （官方 README 与参考项目 `bot.ts:136` 同款时机，挂失败降级、`hunt()` 里再检查并清晰报错）；
+  · `hunt()`：名字子串锁定单体 → `new GoalFollow(target, range)` + `setGoal(goal, true)`（dynamic）
+    持续追击 → 进 4 格按 600ms 攻击冷却 `bot.attack`；250ms 决策 tick，
+    寻路 / 挖 / 垫脚全由 pathfinder 在 physicsTick 里自己跑；
+  · **自动挖** = `Movements.canDig = true`（astar toBreak → 自动换最快工具 + `bot.dig`）；
+    **自动垫脚** = astar `toPlace` + 背包方块（无方块时战报注明"垫不了脚"）；
+  · 开战自动换最强武器（`#bestWeapon`：剑 > 斧；netherite > diamond > iron > stone > golden/wooden）；
+  · 收场：`target_gone`（宽限 `reacquire` 秒）/ `retreated`（血量 ≤ `hpFloor`）/
+    `timeout`（`durationSec` 1–120s，默认 45）/ `aborted` / `disconnected`；
+    收尾必定 `setGoal(null)` + `clearControlStates()`，不把移动状态留在场上；
+  · `mc_sequence` 新 op `hunt`（`#runStep` 分支 + 工具描述 + 报错 op 列表同步）；
+    `mc_act{attack}` 描述指向 `mc_hunt`；README 工具表 29→30、mc_* 25→26。
+- **坑**：目标丢失重搜到**新实体对象**时必须**重建 `GoalFollow`** —— 旧引用 `isValid()` 恒真，
+  pathfinder 会追着一个不再更新的残留坐标跑。
+- **自检**：新增 **8 条**断言，总数 **770 ✅ / 5 ❌**（5 条 ❌ 仍为既有平台差异）。
+
+---
+
 ## 三、相对上游改了什么
 
 | 文件 | 变化 | 说明 |
 |---|---|---|
-| `src/core.mjs` | **+295 / -13** | AuthMe 6.x 对话框登录（`writeVarInt` / NBT / 按阶段选包 id）+ 穿戴装备（`equip`/`equipArmor`）与用物品（`useItem`） |
+| `src/core.mjs` | **+438 / -13** | AuthMe 6.x 对话框登录 + 穿戴装备（`equip`/`equipArmor`）与用物品（`useItem`）+ **自动攻击 `mc_hunt`**（pathfinder 挂载、追击循环、`#bestWeapon`） |
 | `src/watchdog.mjs` | **+46 / -13** | `#ownerId()`、job owner/caller 修正、v4 `noticeSource` |
 | `src/config.mjs` | **+40 / -5** | 压缩组**整组**补进 `MC_PRESET_TOOL_GROUPS`（新增 `block` 字段）、`MC_PRESET_SPEC` 升到 7 |
-| `index.js` | **+44 / -19** | webServer 懒注入、job owner/caller 修正、v4 `noticeSource`、工具组注释订正 |
-| `selfcheck.mjs` | **+284 / -12** | 夹具补懒注入回调 + 8 条 jobs 回归钉子 + 4 条压缩组断言 + 24 条穿戴 / 用物品断言 |
+| `index.js` | **+72 / -20** | webServer 懒注入、job owner/caller 修正、v4 `noticeSource`、**`mc_hunt` 工具注册**、工具组注释订正 |
+| `selfcheck.mjs` | **+316 / -13** | 夹具补懒注入回调 + 8 条 jobs 回归钉子 + 4 条压缩组断言 + 24 条穿戴 / 用物品断言 + **8 条 `mc_hunt` 断言** |
 | `src/user-message.mjs` | **+39 / -1** | `PLUGIN_SOURCE_KIND` + `noticeSource()`（v4 合规） |
 | `src/version-prompt.mjs` | **+3 / -2** | 注释订正（kind 不能是 V3 的 `'plugin'`） |
 | `cordis.patch.yml` | **+20 / -0** | 加注释说明密码走环境变量（文件本身无密码） |
-| `package.json` | **+1 / -1** | 版本号 `0.1.7` → `0.2.0` |
-| `package-lock.json` | **+2 / -2** | 同步 lockfile 版本号（`0.1.7` → `0.2.0`，并订正残留的 `0.1.4`） |
-| `CHANGELOG.md` | **+127 / -0** | 本分支的变更记录（0.1.8 / 0.1.9 / 0.2.0 三节） |
-| `FORK-NOTES.md` | **+305 / -0** | 本文件（fork 独有，上游没有） |
-| `README.md` | **+201 / -0** | 重写为 fork 说明（上游版本 / 上游问题 / 修复 / 新增 / 安装 / 限制），上游原文折叠在文末 |
+| `package.json` | **+2 / -1** | 版本号 `0.1.7` → `0.3.0`；**新增依赖** `mineflayer-pathfinder@^2.4.5` |
+| `package-lock.json` | **+18 / -2** | 同步 lockfile 版本号 + `mineflayer-pathfinder` 依赖树 |
+| `CHANGELOG.md` | **+159 / -0** | 本分支的变更记录（0.1.8 / 0.1.9 / 0.2.0 / 0.3.0 四节） |
+| `FORK-NOTES.md` | **+331 / -0** | 本文件（fork 独有，上游没有） |
+| `README.md` | **+217 / -0** | 重写为 fork 说明（上游版本 / 上游问题 / 修复 / 新增 / 安装 / 限制），上游原文折叠在文末 |
 
-**没有改**：其余源码。**没有新增依赖。**
+**没有改**：其余源码。**新增依赖**：`mineflayer-pathfinder@^2.4.5`（`mc_hunt` 的寻路引擎）。
 
 ---
 
@@ -248,10 +274,10 @@ systemd `EnvironmentFile`（`0600`）两种写法。文件本身仍然只有 `au
 dsh plugin --profile <你的 profile> add link:/path/to/whale-craft
 ```
 
-fork 也提供打包好的 tgz（见本 fork 的 **Releases** 页，附件 `whale_craft-0.2.0.tgz`）：
+fork 也提供打包好的 tgz（见本 fork 的 **Releases** 页，附件 `whale_craft-0.3.0.tgz`）：
 
 ```bash
-npm install /path/to/whale_craft-0.2.0.tgz
+npm install /path/to/whale_craft-0.3.0.tgz
 ```
 
 > ⚠️ npm 上的 `whale_craft` 属于原作者（`lyricraft <yzi1b@outlook.com>`），

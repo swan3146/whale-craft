@@ -62,6 +62,23 @@ try {
 }
 
 /**
+ * 尝试加载 mineflayer-pathfinder —— mc_hunt 自动攻击的寻路引擎。
+ * 能力全在它身上：GoalFollow 动态追击、自动挖挡路方块（Movements.canDig）、
+ * 自动垫脚/搭桥（astar toPlace + 背包方块）。
+ * 可选依赖：没装不影响连接与其它工具，只是 mc_hunt 会明确报"没装"。
+ * （参考 /www/minecraft-mcp-server —— opencode 里配置的 MCP 项目，实测同款用法。）
+ */
+let pathfinderPlugin = null
+let PathfinderMovements = null
+let PathGoals = null
+try {
+  const pf = createRequire(import.meta.url)('mineflayer-pathfinder')
+  pathfinderPlugin = pf.pathfinder
+  PathfinderMovements = pf.Movements
+  PathGoals = pf.goals
+} catch {}
+
+/**
  * 从 mineflayer **自己的**依赖树里解析包（同一份 node_modules）。
  * 用途：创造模式取物要 new 一个 prismarine-item 的 Item 实例塞进槽位。
  * ⚠️ 用"解析到的 mineflayer 实际路径"当锚点，**不写死目录** —— 这样插件装在哪儿都成立。
@@ -818,6 +835,13 @@ export class McBot extends EventEmitter {
         },
       })
       b._createdAt = Date.now()
+
+      // ──── 挂 pathfinder（mc_hunt 自动追击：寻路 + 自动挖挡路方块 + 自动垫脚）────
+      // 官方 README 与参考项目 bot.ts:136 都是 createBot 返回后立刻 loadPlugin。
+      // 挂失败不致命：hunt() 里会再检查 bot.pathfinder 并给出清晰报错。
+      if (pathfinderPlugin) {
+        try { b.loadPlugin(pathfinderPlugin) } catch {}
+      }
 
       // ──── AuthMe 6.x 对话框登录（26.2 Paper + Dialog API） ────
       // AuthMe preJoin 对话框在 configuration 阶段下发，必须用 custom_click_action 回复密码，
@@ -2171,6 +2195,124 @@ export class McBot extends EventEmitter {
     return { attacked: label, distance: d, health: b.health }
   }
 
+  /**
+   * 自动攻击：锁定**一个**实体，自动寻路追上去连续打 —— 一次调用跑完整场战斗，
+   * 不用一步步调 mc_act（省 token）。追击途中**自动挖挡路方块、自动垫脚**：
+   * 全部交给 mineflayer-pathfinder（GoalFollow 动态追 + canDig + toPlace 自动放方块）。
+   *
+   * 参考 /www/minecraft-mcp-server（opencode 配置里的 MCP 项目）：
+   *   mc_equip=背包找名再 bot.equip；mc_attack=先解析实体再 bot.attack；
+   *   brain.mjs 的 goto 用 Movements+setMovements+GoalNear —— 追移动目标用 GoalFollow+dynamic。
+   *
+   * 收场条件（outcome）：
+   *   target_gone 目标死/离开加载范围（宽限 reacquire 秒，可能只是过区块边界）
+   *   retreated   自己血量 ≤ hpFloor，撤
+   *   timeout     durationSec 用尽
+   *   aborted     用户中断；disconnected 断线
+   */
+  async hunt ({ who, durationSec = 45, range = 2, hpFloor = 10, reacquire = 4 } = {}) {
+    if (!who) throw new Error('who 必填：要追打的目标名字（子串匹配；先用 mc_entities 看附近有谁）')
+    const b = this.requireBot()
+    if (!pathfinderPlugin || !PathGoals || typeof b.pathfinder?.setGoal !== 'function') {
+      throw new Error('未安装/未挂载 mineflayer-pathfinder（npm i mineflayer-pathfinder@^2.4.5 后重启 dsh-web）')
+    }
+    const needle = String(who).toLowerCase()
+    const findTarget = () => Object.values(b.entities)
+      .filter((e) => e !== b.entity && String(e.username ?? e.name ?? '').toLowerCase().includes(needle))
+      .sort((a, c) => a.position.distanceTo(b.entity.position) - c.position.distanceTo(b.entity.position))[0] ?? null
+    let target = findTarget()
+    if (!target) throw new Error(`全图找不到名字含 "${who}" 的实体（先用 mc_entities 看看；它可能不在已加载范围）`)
+
+    const label = target.username ?? target.name ?? target.type
+    const durMs = Math.min(Math.max(Number(durationSec) || 45, 1), 120) * 1000
+    const followRange = Math.min(Math.max(Number(range) || 2, 1), 8)
+    const hpLimit = Number.isFinite(Number(hpFloor)) ? Number(hpFloor) : 10
+    const lostGraceMs = Math.min(Math.max(Number(reacquire) || 4, 0), 30) * 1000
+
+    // 开战前把背包最强武器换到手（参考挖矿时自动换最快工具的先例；失败不拦开战）
+    try {
+      const weapon = this.#bestWeapon(b)
+      if (weapon && b.heldItem?.name !== weapon.name) {
+        await this.#t(b.equip(weapon, 'hand'), 'equip', `手持 ${weapon.name}`)
+      }
+    } catch {}
+
+    const mv = new PathfinderMovements(b)
+    mv.canDig = true                     // 挡路方块自动挖（astar 生成 toBreak → monitorMovement 自动换最快工具+dig）
+    b.pathfinder.setMovements(mv)
+    const scaffolding = typeof mv.countScaffoldingItems === 'function' ? mv.countScaffoldingItems() : 0
+    let goal = new PathGoals.GoalFollow(target, followRange)
+    b.pathfinder.setGoal(goal, true)     // dynamic：目标移动就重新规划（=持续追击；等价 follow）
+
+    const ATTACK_REACH = 4.0             // 比 attack() 的 4.5 留一点余量，减少打空
+    const ATTACK_COOLDOWN_MS = 600       // 近似近战基础攻击冷却
+    const t0 = Date.now()
+    const deadline = t0 + durMs
+    let hits = 0
+    let lastAttackAt = 0
+    let lostAt = null
+    let outcome = 'timeout'
+
+    while (Date.now() < deadline) {
+      if (this.abortSignal?.aborted) { outcome = 'aborted'; break }
+      if (!b.entity || b._client?.ended) { outcome = 'disconnected'; break }
+      if (b.health <= hpLimit) { outcome = 'retreated'; break }
+
+      if (!target || !b.entities[target.id]) {
+        // 目标从实体表消失：先宽限重搜（可能只是过区块边界），宽限耗尽才收场
+        if (lostAt === null) lostAt = Date.now()
+        const found = findTarget()
+        if (found) {
+          target = found
+          lostAt = null
+          goal = new PathGoals.GoalFollow(target, followRange)   // 换了实体对象必须重建 goal（旧引用 isValid 恒真）
+          b.pathfinder.setGoal(goal, true)
+        } else if (Date.now() - lostAt > lostGraceMs) { outcome = 'target_gone'; break }
+      } else {
+        lostAt = null
+      }
+
+      if (target && b.entity && target.position.distanceTo(b.entity.position) <= ATTACK_REACH
+        && Date.now() - lastAttackAt >= ATTACK_COOLDOWN_MS) {
+        try { b.attack(target); hits++; lastAttackAt = Date.now() } catch {}   // 目标恰好死亡消失
+      }
+      await sleep(250)                   // ~10 tick 一次决策：寻路/挖掘/垫脚都由 pathfinder 在 physicsTick 里自己跑
+    }
+
+    // 收尾：清 goal + 停控制位，绝不把移动状态留在场上
+    try { b.pathfinder.setGoal(null) } catch {}
+    try { b.clearControlStates?.() } catch {}
+
+    const endDist = target && b.entity && b.entities[target.id]
+      ? Number(target.position.distanceTo(b.entity.position).toFixed(1)) : null
+    let notes
+    if (outcome === 'target_gone') notes = `目标消失（可能死亡或离开加载范围），最后宽限 ${lostGraceMs / 1000}s`
+    else if (outcome === 'retreated') notes = `血量 ${b.health} ≤ hpFloor ${hpLimit}，撤了`
+    else if (outcome === 'timeout' && scaffolding === 0) notes = '超时；背包无垫脚方块（垫不了脚，遇沟/悬崖只能绕或卡住）'
+    return {
+      target: label, hits, outcome, distanceEnd: endDist,
+      health: b.health, held: b.heldItem?.name ?? null, scaffolding,
+      elapsedMs: Date.now() - t0, ...(notes ? { notes } : {}),
+    }
+  }
+
+  /** 背包里最强的武器：剑 > 斧，材料 netherite > diamond > iron > stone > golden/wooden；没有返回 null */
+  #bestWeapon (b) {
+    const tier = { netherite: 5, diamond: 4, iron: 3, stone: 2, golden: 1, wooden: 1 }
+    const score = (i) => {
+      const m = String(i.name).match(/^(\w+)_(sword|axe)$/)
+      if (!m) return -1
+      return (tier[m[1]] ?? 1) * 10 + (m[2] === 'sword' ? 5 : 3)
+    }
+    let best = null
+    let bestScore = 0
+    for (const i of b.inventory.items()) {
+      const s = score(i)
+      if (s > bestScore) { best = i; bestScore = s }
+    }
+    return best
+  }
+
   /** 丢弃手上的物品 */
   async tossItem ({ name = null, count = 1 } = {}) {
     const b = this.requireBot()
@@ -2194,7 +2336,7 @@ export class McBot extends EventEmitter {
    * 而是把"走这里→放几个→再走那里"这种连串动作收进一个工具，服务端逐步跑。
    *
    * 步骤 op：wait / move / look / turn(toward) / place / break / dig / use / useItem /
-   *          attack / equip / wear / give / toss / say / jump
+   *          attack / hunt / equip / wear / give / toss / say / jump
    */
   async runSequence (steps, { stopOnError = true, budgetMs = 300_000 } = {}) {
     if (!Array.isArray(steps) || !steps.length) throw new Error('steps 必须是非空数组')
@@ -2244,6 +2386,7 @@ export class McBot extends EventEmitter {
       case 'dig':     return { result: await this.dig(s) }
       case 'use':     return this.useBlock(s)
       case 'attack':  return this.attack(s)
+      case 'hunt':    return this.hunt(s)
       case 'equip':   return this.equip(s)
       case 'wear':    return this.equipArmor(s)
       case 'useItem': return this.useItem(s)
@@ -2252,7 +2395,7 @@ export class McBot extends EventEmitter {
       case 'say':     return { said: this.chatSay(s.text ?? '') }
       case 'jump':    return this.jump()
       default:
-        throw new Error(`未知步骤 op："${op}"（可用：wait/move/look/toward/place/break/dig/use/useItem/attack/equip/wear/give/toss/say/jump）`)
+        throw new Error(`未知步骤 op："${op}"（可用：wait/move/look/toward/place/break/dig/use/useItem/attack/hunt/equip/wear/give/toss/say/jump）`)
     }
   }
 

@@ -2,6 +2,38 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] - 2026-09-22
+
+> ⚠️ 这是 **fork 分支**（`feat/authme-26.2-dsh-0.1.7`），不是上游发布的版本。
+> 完整说明见 [FORK-NOTES.md](./FORK-NOTES.md)。基线：上游 `aac3130`（whale_craft 0.1.7）。
+
+### ✨ 新增（自动攻击：mc_hunt 追着打 + 自动挖 + 自动垫脚）
+
+- **需求**（用户真机）：上游只有 `attack`（打 4.5 格内一次），追着打要一步步调工具、**费 token**；
+  要求"决定打谁之后**自动寻路追上去、锁定这一个实体连续打**，追击途中**自动挖挡路方块、
+  自动垫脚**"，并参考 opencode 配置里配的 `/www/minecraft-mcp-server` 项目。
+- **参考项目结论**：那是个 mineflayer MCP server（`mc_equip` / `mc_attack` 直调 `bot.equip` /
+  `bot.attack`），其调试脚本 `brain.mjs` 用 `mineflayer-pathfinder` 的
+  `Movements + setMovements + GoalNear` 寻路（`canDig = false`，不挖方块）。
+- **修法（新增独立工具 `mc_hunt`，也可作 `mc_sequence` 的 `hunt` 步骤）**：
+  · 新依赖 `mineflayer-pathfinder@^2.4.5`，`createBot` 返回后 `loadPlugin`
+    （官方 README 与参考项目 `bot.ts:136` 同款时机）；
+  · `mc_hunt { who, durationSec?, range?, hpFloor?, reacquire? }`：名字子串锁定**一个**实体 →
+    `GoalFollow(target, range)` + **dynamic goal** 持续追击（目标移动自动重规划，等价 follow）→
+    进 4 格按 ~600ms 攻击冷却连打（250ms 决策 tick）；
+  · **自动挖**：`Movements.canDig = true` —— astar 生成 toBreak，pathfinder 自动换最快工具并 `bot.dig`；
+    **自动垫脚**：astar 的 `toPlace` + 背包方块（`getScaffoldingItem`），没方块会绕路并注明；
+  · 开战自动把背包**最强武器**换到手（剑 > 斧；netherite > diamond > iron > stone > golden/wooden）；
+  · 收场带回战报：目标死/跑丢（宽限 `reacquire` 秒，防过区块边界误判）/ 血量 ≤ `hpFloor` 撤 /
+    超时 `durationSec`（默认 45s，上限 120）/ 用户中断 / 断线；收尾必定
+    `setGoal(null)` + `clearControlStates()`，不把移动状态留在场上；
+  · `mc_act { mode: "attack" }` 描述里加了指向 `mc_hunt` 的提示。
+- **坑**：目标丢失后重搜到**新的实体对象**时必须**重建 `GoalFollow`** —— 旧引用 `isValid()` 恒真，
+  pathfinder 会一直追一个不再更新的残留坐标。
+- **自检**：+8 条断言（注册 / 未连服与缺参清晰报错 / loadPlugin / GoalFollow+dynamic /
+  canDig / `case 'hunt'` 接线 / hpFloor+中断+清控制位），`npm run check` = **770 ✅ / 5 ❌**
+  （5 条 ❌ 仍是既有平台差异）。
+
 ## [0.2.0] - 2026-09-22
 
 > ⚠️ 这是 **fork 分支**（`feat/authme-26.2-dsh-0.1.7`），不是上游发布的版本。
