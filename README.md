@@ -9,7 +9,7 @@
 |---|---|
 | 上游仓库 | [yzi1b/whale-craft](https://github.com/yzi1b/whale-craft) |
 | **上游版本** | **`0.1.7`**（commit `aac3130`，2026-09-20） |
-| **本 fork 版本** | **`0.3.0`** |
+| **本 fork 版本** | **`0.4.0`** |
 | 本 fork 分支 | `feat/authme-26.2-dsh-0.1.7` |
 | 相对上游改动 | **13 个文件，+1701 / -70**（新增依赖 `mineflayer-pathfinder@^2.4.5`） |
 | 逐条改动说明 | [FORK-NOTES.md](./FORK-NOTES.md) |
@@ -170,6 +170,24 @@ EnvironmentFile=-/etc/whale-craft/authme.env
   （默认 45s，上限 120）/ 用户中断 / 断线；收尾必定清 goal + 清控制位；
 - 新增依赖 `mineflayer-pathfinder@^2.4.5`，`createBot` 返回后 `loadPlugin`（官方 README 同款时机）。
 
+### ⚔️ 战斗升级与真机修复（0.4.0）
+
+以 **Wurst v7.54 客户端**为设计基准（FightBot / NukerLegit / AutoEat / Killaura / Criticals / AutoTotem / BowAimbot）：
+
+- **PVP 套装**：~625ms 攻速 + **高斯 ±100ms 抖动**（Killaura speedRandMS，防节奏被预判）；
+  **下落段跳劈暴击**（起跳后轮询到真在下落才出手，Criticals FULL_JUMP 合法版 ×1.5）；
+  血量 ≤10 **自动图腾换副手**（AutoTotem）；**6–22 格弓箭抛物线 + 移动提前量**（原版箭
+  v0=3.0/重力 0.05/阻力 0.99 逐 tick 解算，BowAimbot/Trajectories 风格）；推进带 sprint；
+- **前方障碍五方向弧扫 × 两档距离**（正前 ±45° ±90°、0.55/1.05 格）：脚挡头空=正面跳台阶
+  （先转向台阶再跳）、脚头都挡=直接挖、低顶=挖头那格 —— 修"被一格方块挡住不跳不挖"；
+  逃跑路上同样能跳台阶；位置停滞 450ms 即脉冲跳（FightBot 撞墙当拍就跳的手动版）；
+- **目标锁定规则**：就近锁；**非玩家目标**初距 >60 格不追、追丢后拉开 >60 格持续 4s →
+  `too_far` 取消锁定；**玩家目标不设距离限制，锁到死**（durationSec 内）；
+- **挖掘修复**：`digTime` 带效率附魔计算（不把 1 秒的活误判成硬墙）、挖前方块先 `lookAt` 中心
+  （NukerLegit faceVector）、挖掘失败改 5 秒时间窗（被怪打断不再一票否决），挂死仍立即永久放弃；
+- **吃喝修复**（AutoEat 对齐）：吃前强制清 goal + 控制位（移动中不吃）、装备后验手持是食物再 consume；
+  低血三段式不变：跑开 → 吃食物回血 → 再锁定追上来。
+
 ---
 
 ## 四、怎么装
@@ -177,8 +195,8 @@ EnvironmentFile=-/etc/whale-craft/authme.env
 ### 从 Release 附件装（推荐，不用 clone）
 
 ```bash
-# 下载本 fork Releases 页的 whale_craft-0.3.0.tgz
-dsh plugin --profile <你的 profile> add /path/to/whale_craft-0.3.0.tgz
+# 下载本 fork Releases 页的 whale_craft-0.4.0.tgz
+dsh plugin --profile <你的 profile> add /path/to/whale_craft-0.4.0.tgz
 ```
 
 ### 从源码装

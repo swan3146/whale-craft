@@ -240,6 +240,29 @@ systemd `EnvironmentFile`（`0600`）两种写法。文件本身仍然只有 `au
   pathfinder 会追着一个不再更新的残留坐标跑。
 - **自检**：新增 **8 条**断言，总数 **770 ✅ / 5 ❌**（5 条 ❌ 仍为既有平台差异）。
 
+### 10. 战斗升级与真机修复（0.4.0，`src/core.mjs` + `index.js` + `selfcheck.mjs` + 文档）
+
+- **背景**（用户 2026-09-24）：① "pvp功能还是不够好"；② 目标锁定要"就近锁、非玩家太远达不到
+  就取消锁定、玩家锁到死"；③ "现在吃东西、攻击、挖东西，还有被一个方块挡住，全有问题"，
+  并要求"**仔细分析** `/www/Wurst-Client-v7.54-MC26.1.2.jar`"（长期基准：所有打怪功能以 Wurst 为准）。
+- **实现**（全部对照 Wurst 源码逐行核过）：
+  · **PVP 套装**：攻速 625ms + 高斯 ±100ms（Killaura speedRandMS）；**下落段跳劈**（轮询位置真在
+    下落才出手，Criticals FULL_JUMP 合法版）；血量 ≤10 自动图腾换副手（AutoTotem）；6–22 格弓箭
+    抛物线 + 移动提前量（BowAimbot/Trajectories：v0=3.0/重力 0.05/阻力 0.99 逐 tick 解算）；推进 sprint；
+  · **前方障碍**：`frontObstacle` 五方向弧扫（正前 ±45° ±90°）× 两档距离（0.55/1.05 格）——
+    脚挡头空=台阶（`stepJump` **先转向**台阶再跳）、脚头都挡=挖、低顶=挖头那格；**逃跑段**同样接
+    台阶跳；停滞判定 700 → **450ms**（FightBot 撞墙当拍就跳）；
+  · **目标锁定**：就近锁；非玩家初距 >60 格直接不追（报错）、追丢后拉开 >60 格持续 4s →
+    收场 `too_far` **取消锁定**；**玩家目标不设距离限制，锁到死**（durationSec 内）；
+  · **挖掘**：`digTime` **带效率附魔**（prismarine-nbt simplify 传 Enchantments，不再把 1 秒的活
+    误判成硬墙）；挖前 `lookAt` 方块中心（NukerLegit faceVector）；失败黑名单改 **5 秒时间窗**
+    （`failOf`，被怪打断不再一票否决），挂死仍 99 立即永久放弃；
+  · **吃喝**（AutoEat 对齐）：吃前 `setGoal(null)` + 清控制位（**移动中不吃**）、装备后验手持是
+    `FOOD_RE` 食物再 `consume`；
+- **坑**：Edit 工具的 `old_string` 在中文全角/缩进上极易不中（doc 头/README 多次失败）——
+  改用 python 锚定行首正则插入，一次成功；
+- **自检**：新增 3 条断言，总数 **781 ✅ / 5 ❌**（5 条 ❌ 仍为既有平台差异，`npm run check` rc=0）。
+
 ---
 
 ## 三、相对上游改了什么
@@ -254,9 +277,9 @@ systemd `EnvironmentFile`（`0600`）两种写法。文件本身仍然只有 `au
 | `src/user-message.mjs` | **+39 / -1** | `PLUGIN_SOURCE_KIND` + `noticeSource()`（v4 合规） |
 | `src/version-prompt.mjs` | **+3 / -2** | 注释订正（kind 不能是 V3 的 `'plugin'`） |
 | `cordis.patch.yml` | **+20 / -0** | 加注释说明密码走环境变量（文件本身无密码） |
-| `package.json` | **+2 / -1** | 版本号 `0.1.7` → `0.3.0`；**新增依赖** `mineflayer-pathfinder@^2.4.5` |
+| `package.json` | **+2 / -1** | 版本号 `0.1.7` → `0.4.0`；**新增依赖** `mineflayer-pathfinder@^2.4.5` |
 | `package-lock.json` | **+18 / -2** | 同步 lockfile 版本号 + `mineflayer-pathfinder` 依赖树 |
-| `CHANGELOG.md` | **+159 / -0** | 本分支的变更记录（0.1.8 / 0.1.9 / 0.2.0 / 0.3.0 四节） |
+| `CHANGELOG.md` | **+159 / -0** | 本分支的变更记录（0.1.8 / 0.1.9 / 0.2.0 / 0.3.0 / 0.4.0 五节） |
 | `FORK-NOTES.md` | **+331 / -0** | 本文件（fork 独有，上游没有） |
 | `README.md` | **+217 / -0** | 重写为 fork 说明（上游版本 / 上游问题 / 修复 / 新增 / 安装 / 限制），上游原文折叠在文末 |
 
@@ -274,10 +297,10 @@ systemd `EnvironmentFile`（`0600`）两种写法。文件本身仍然只有 `au
 dsh plugin --profile <你的 profile> add link:/path/to/whale-craft
 ```
 
-fork 也提供打包好的 tgz（见本 fork 的 **Releases** 页，附件 `whale_craft-0.3.0.tgz`）：
+fork 也提供打包好的 tgz（见本 fork 的 **Releases** 页，附件 `whale_craft-0.4.0.tgz`）：
 
 ```bash
-npm install /path/to/whale_craft-0.3.0.tgz
+npm install /path/to/whale_craft-0.4.0.tgz
 ```
 
 > ⚠️ npm 上的 `whale_craft` 属于原作者（`lyricraft <yzi1b@outlook.com>`），

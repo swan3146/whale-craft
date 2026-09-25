@@ -557,6 +557,21 @@ for (const [label, args, want] of [
   console.log(`  ${/mv\.canDig = true/.test(coreSrcHunt) ? '✅' : '❌'} hunt 打开 canDig（追击自动挖挡路方块；垫脚靠 toPlace + 背包方块）`)
   console.log(`  ${/case 'hunt'/.test(coreSrcHunt) && /hunt\(who,durationSec/.test(idxSrcHunt) ? '✅' : '❌'} mc_sequence 接入 hunt op（#runStep 分支 + 工具描述）`)
   console.log(`  ${/hpFloor/.test(coreSrcHunt) && /aborted/.test(coreSrcHunt) && /clearControlStates/.test(coreSrcHunt) ? '✅' : '❌'} hunt 有撤退线（hpFloor）+ 用户中断 + 收尾清控制位`)
+  // v2（2026-09-23 Wurst 基准重写）：视线挖墙 / 卡住跳 / 低血三段式（跑开→吃→再锁定）
+  console.log(`  ${/b\.world\.raycast/.test(coreSrcHunt) && /bestHarvestTool/.test(coreSrcHunt) ? '✅' : '❌'} hunt v2 视线受阻 → raycast 找挡路方块 + bestHarvestTool 换最快工具挖穿（NukerLegit 风格）`)
+  console.log(`  ${/stallAt/.test(coreSrcHunt) && /setControlState\('jump'/.test(coreSrcHunt) ? '✅' : '❌'} hunt v2 位置停滞 700ms → 脉冲跳（修"差一格既不跳也不挖"，FightBot 撞墙跳手动版）`)
+  console.log(`  ${/GoalInvert/.test(coreSrcHunt) && /retreats/.test(coreSrcHunt) && /b\.consume/.test(coreSrcHunt) ? '✅' : '❌'} hunt v2 低血三段式：GoalInvert 反向跑开 → consume 吃食物 → 回血后 relock 再追（hpFloor 语义从直接收场改为撤退回血）`)
+  console.log(`  ${/digFails/.test(coreSrcHunt) && /stopDigging/.test(coreSrcHunt) && /const w = this\.#bestWeapon\(b\)/.test(coreSrcHunt) ? '✅' : '❌'} hunt v2 挖不动的方块挂死竞速+2 次即放弃（真机：领地保护 b.dig 挂死 25s）+ 出手前把最强武器拿回手（寻路垫脚会换手）`)
+  // v3 智能前方检测（2026-09-23 用户反馈："总被墙挡不挖；前面一格方块也不跳不挖"→ 视线 ray 从方块顶掠过判"没挡"）
+  console.log(`  ${/frontObstacle/.test(coreSrcHunt) && /kind: 'step'/.test(coreSrcHunt) && /stepJump/.test(coreSrcHunt) ? '✅' : '❌'} hunt v3 主动前方采样（脚面/头顶各探一格）：脚挡头空=台阶正面跳 / 脚头都挡=直接挖 / 低顶=挖头那格（不等视线/卡死）`)
+  console.log(`  ${/miningStreak/.test(coreSrcHunt) && /MINING_HANG_MS/.test(coreSrcHunt) && /unstickDig/.test(coreSrcHunt) ? '✅' : '❌'} hunt v3 挖掘挂死看门狗：连续在挖 >8s → stopDigging + 重挂 goal 重规划（领地方块卡死救援）`)
+  // PVP 套装（2026-09-24 用户"pvp功能还是不够好"）：跳劈暴击 / 高斯攻速 / 自动图腾 / 弓箭抛物线
+  console.log(`  ${/gaussMs\(\)/.test(coreSrcHunt) && /ATTACK_JITTER_MS/.test(coreSrcHunt) && /await sleep\(300\)/.test(coreSrcHunt) ? '✅' : '❌'} hunt PVP 攻速 625ms+高斯±100ms 抖动（Killaura speedRandMS）+ 300ms 下落段跳劈（Criticals FULL_JUMP 合法暴击）`)
+  console.log(`  ${/autoTotem/.test(coreSrcHunt) && /totem_of_undying/.test(coreSrcHunt) && /simArrow/.test(coreSrcHunt) && /BOW_MAX/.test(coreSrcHunt) ? '✅' : '❌'} hunt PVP 自动图腾（血量≤TOTEM_HP 换副手，AutoTotem）+ 6-22 格弓箭抛物线+提前量压制（BowAimbot/Trajectories：v0=3.0/重力0.05/阻力0.99）`)
+  // 目标锁定 + 前方弧扫 + 吃/挖健壮化（2026-09-24 用户"吃东西/攻击/挖东西/被一格方块挡住全有问题"）
+  console.log(`  ${/CHASE_FAR/.test(coreSrcHunt) && /too_far/.test(coreSrcHunt) && /isPlayer/.test(coreSrcHunt) ? '✅' : '❌'} hunt 目标锁定：就近锁 / 非玩家初距>60 不追+拉开>60 持续 4s 取消 / 玩家不设限锁到死`)
+  console.log(`  ${/dirs = \[0, 0\.78/.test(coreSrcHunt) && /0\.55, 1\.05/.test(coreSrcHunt) && /stepJump\(o\)/.test(coreSrcHunt) ? '✅' : '❌'} hunt v3.1 前方弧扫五方向×两档距离（修"被一格方块挡住"侧向漏检）+ stepJump 先转向台阶`)
+  console.log(`  ${/failOf/.test(coreSrcHunt) && /Enchantments/.test(coreSrcHunt) && /FOOD_RE\.test\(b\.heldItem/.test(coreSrcHunt) ? '✅' : '❌'} hunt 挖掘失败 5s 时间窗（不再一票否决）+ digTime 带效率附魔 + 吃前验手持/清移动（AutoEat）`)
 }
 
 // ── 强制停止：语义与**顺序**（用户 2026-09-16：移除普通停止，只剩强制停止）──
